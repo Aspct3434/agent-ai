@@ -4,7 +4,9 @@ import logging
 import os
 import shutil
 import sqlite3
+import time
 import uuid
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +23,45 @@ from evaluator import SkillDistiller
 from tools import ToolManager
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_RPM = int(os.getenv("GATEWAY_RATE_LIMIT_RPM", "60"))
+_RATE_LIMIT_WINDOW = 60  # seconds
+
+
+class _SlidingWindowRateLimiter:
+    """Per-key sliding-window rate limiter (requests per 60-second window).
+
+    Safe for concurrent coroutines via an asyncio.Lock. Set
+    ``GATEWAY_RATE_LIMIT_RPM=0`` to disable (unlimited).
+    """
+
+    def __init__(self, calls_per_minute: int) -> None:
+        self._limit = calls_per_minute
+        self._windows: dict[str, list[float]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+
+    async def check(self, key: str) -> None:
+        """Raise HTTP 429 if *key* has exceeded its per-minute quota."""
+        if self._limit == 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            cutoff = now - _RATE_LIMIT_WINDOW
+            bucket = [t for t in self._windows[key] if t > cutoff]
+            if len(bucket) >= self._limit:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded: max {self._limit} requests/min per session.",
+                )
+            bucket.append(now)
+            self._windows[key] = bucket
+
+
+_rate_limiter = _SlidingWindowRateLimiter(_RATE_LIMIT_RPM)
 
 _STOP = object()
 
@@ -415,6 +456,7 @@ def _rewrite_proxy_html(content: bytes, content_type: str, port: int) -> bytes:
 
 @app.post("/webhook", response_model=WebhookResponse)
 async def webhook(payload: WebhookPayload) -> WebhookResponse:
+    await _rate_limiter.check(payload.chat_id)
     result = await app.state.gateway.send(
         payload.chat_id,
         {
@@ -477,6 +519,11 @@ async def ws_stream(websocket: WebSocket) -> None:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
+            try:
+                await _rate_limiter.check(data.get("session_id", "__anon__"))
+            except HTTPException as exc:
+                await websocket.send_text(json.dumps({"type": "error", "detail": exc.detail}))
+                continue
             msg = NormalizedMessage(
                 session_id=data["session_id"],
                 role="user",

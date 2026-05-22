@@ -57,6 +57,19 @@ from tools import ToolManager
 
 logger = logging.getLogger(__name__)
 
+
+def _llm_first_choice(response: Any) -> Any:
+    """Return ``response.choices[0]`` without mypy union-attr noise.
+
+    litellm's return type is ``ModelResponse | TextCompletionResponse | None``.
+    In agent code we always guard for None before calling this; the
+    ``TextCompletionResponse`` variant is only returned for legacy /completions
+    endpoints which we never call. This wrapper isolates the unsafe cast so
+    type: ignore comments don't scatter across business logic.
+    """
+    return response.choices[0]  # type: ignore[union-attr]
+
+
 MAX_REACT_ITERATIONS = int(os.getenv("AGENT_MAX_REACT_ITERATIONS", "16"))
 
 # Action tasks that change the host (install a runtime, download artifacts, write
@@ -665,8 +678,8 @@ class AgentEngine:
                     )
                 else:
                     response = completion_result
-                choice = response.choices[0]  # type: ignore[union-attr]
-                assistant_msg = choice.message  # type: ignore[union-attr]
+                choice = _llm_first_choice(response)
+                assistant_msg = choice.message
 
                 if choice.finish_reason != "tool_calls" or not assistant_msg.tool_calls:
                     final_response = assistant_msg.content or ""
@@ -755,73 +768,14 @@ class AgentEngine:
                 for tc in tool_calls:
                     args = json.loads(tc.function.arguments)
                     yield {"type": "tool_call", "tool": tc.function.name, "params": args}
-                    calls.append((tc.id, tc.function.name, args))  # type: ignore[arg-type]
+                    calls.append((str(tc.id), str(tc.function.name), args))
 
-                # Read-only calls run concurrently; side-effecting ones (terminal,
-                # background, delegate, MCP writes) stay serial in their original
-                # order so cwd mutations and write ordering remain deterministic.
-                results: dict[str, tuple[str, bool, str | None]] = {}
-                parallel = [c for c in calls if c[1] in _PARALLEL_SAFE_TOOLS]
-                serial = [c for c in calls if c[1] not in _PARALLEL_SAFE_TOOLS]
-
-                if parallel:
-                    gathered = await asyncio.gather(
-                        *(
-                            self._execute_single_tool(name, args, messages, tool_index)
-                            for (_, name, args) in parallel
-                        )
-                    )
-                    for (tc_id, _, _), res in zip(parallel, gathered, strict=False):
-                        results[tc_id] = res
-                # Track the most recent host command so an immediately-repeated,
-                # identical one is short-circuited instead of re-run -- the real
-                # anti-spin guard (e.g. the model issuing `mkdir -p x` twice).
-                last_host_cmd = _last_host_command(steps)
-                for tc_id, name, args in serial:
-                    cmd = _normalize_command(args.get("command")) if name in _HOST_EXECUTION_TOOLS else ""
-                    if _should_block_tool_for_action_task(
-                        _latest_task_contract(messages), messages, steps, name
-                    ):
-                        results[tc_id] = (
-                            _blocked_action_tool_message(name),
-                            True,
-                            "__builtin__",
-                        )
-                    elif cmd and cmd == last_host_cmd:
-                        results[tc_id] = (
-                            _duplicate_command_message(name),
-                            False,
-                            "__builtin__",
-                        )
-                    else:
-                        results[tc_id] = await self._execute_single_tool(
-                            name, args, messages, tool_index
-                        )
-                        if cmd:
-                            last_host_cmd = cmd
-
-                # Record steps and tool messages in the original call order.
-                iter_error_count = 0
-                for tc_id, tool_name, arguments in calls:
-                    content, is_error, server = results[tc_id]
-                    if is_error:
-                        iter_error_count += 1
-                    steps.append(
-                        ExecutionStep(
-                            kind="tool_result",
-                            content=content,
-                            metadata={
-                                "tool_name": tool_name,
-                                "tool_call_id": tc_id,
-                                "server": server,
-                                "arguments": arguments,
-                                "is_error": is_error,
-                            },
-                        )
-                    )
-                    messages.append(
-                        {"role": "tool", "tool_call_id": tc_id, "content": content}
-                    )
+                iter_error_count = await self._dispatch_tool_calls(
+                    calls=calls,
+                    messages=messages,
+                    steps=steps,
+                    tool_index=tool_index,
+                )
 
                 # Escalate to the strong model when the fast one keeps failing.
                 if tool_calls and iter_error_count == len(tool_calls):
@@ -838,7 +792,7 @@ class AgentEngine:
                         "Escalating to strong model %s for session %s after repeated errors",
                         active_model, session_id,
                     )
-                    yield {"type": "status", "message": f"Escalating to {active_model}â€¦"}
+                    yield {"type": "status", "message": f"Escalating to {active_model}…"}
 
                 # Checkpoint on the first iteration and then every Nth, rather than
                 # every iteration, to cut redundant full-history writes. Replay
@@ -970,7 +924,7 @@ class AgentEngine:
                 )
             else:
                 final = summary_result
-            final_response = final.choices[0].message.content or ""  # type: ignore[union-attr]
+            final_response = _llm_first_choice(final).message.content or ""
             messages.append({"role": "assistant", "content": final_response})
             yield _make_final_answer("iteration_limit", final_response)
 
@@ -1046,6 +1000,76 @@ class AgentEngine:
                 self._distiller.submit(trajectory),
                 name=f"distill:{session_id}",
             )
+
+    async def _dispatch_tool_calls(
+        self,
+        *,
+        calls: list[tuple[str, str, dict[str, Any]]],
+        messages: list[dict[str, Any]],
+        steps: list[ExecutionStep],
+        tool_index: dict[str, str],
+    ) -> int:
+        """Execute one iteration's tool calls and record results.
+
+        Read-only tools run concurrently via ``asyncio.gather``; side-effecting
+        tools (terminal, background, MCP writes) run serially in call order so
+        filesystem mutations and write ordering stay deterministic.
+
+        Returns the number of calls that returned an error in this batch.
+        """
+        results: dict[str, tuple[str, bool, str | None]] = {}
+        parallel = [c for c in calls if c[1] in _PARALLEL_SAFE_TOOLS]
+        serial = [c for c in calls if c[1] not in _PARALLEL_SAFE_TOOLS]
+
+        if parallel:
+            gathered = await asyncio.gather(
+                *(
+                    self._execute_single_tool(name, args, messages, tool_index)
+                    for (_, name, args) in parallel
+                )
+            )
+            for (tc_id, _, _), res in zip(parallel, gathered, strict=False):
+                results[tc_id] = res
+
+        # Track the most recent host command so an immediately-repeated,
+        # identical one is short-circuited -- the real anti-spin guard
+        # (e.g. the model issuing `mkdir -p x` twice).
+        last_host_cmd = _last_host_command(steps)
+        for tc_id, name, args in serial:
+            cmd = _normalize_command(args.get("command")) if name in _HOST_EXECUTION_TOOLS else ""
+            if _should_block_tool_for_action_task(
+                _latest_task_contract(messages), messages, steps, name
+            ):
+                results[tc_id] = (_blocked_action_tool_message(name), True, "__builtin__")
+            elif cmd and cmd == last_host_cmd:
+                results[tc_id] = (_duplicate_command_message(name), False, "__builtin__")
+            else:
+                results[tc_id] = await self._execute_single_tool(name, args, messages, tool_index)
+                if cmd:
+                    last_host_cmd = cmd
+
+        # Record steps and tool messages in the original call order.
+        iter_error_count = 0
+        for tc_id, tool_name, arguments in calls:
+            content, is_error, server = results[tc_id]
+            if is_error:
+                iter_error_count += 1
+            steps.append(
+                ExecutionStep(
+                    kind="tool_result",
+                    content=content,
+                    metadata={
+                        "tool_name": tool_name,
+                        "tool_call_id": tc_id,
+                        "server": server,
+                        "arguments": arguments,
+                        "is_error": is_error,
+                    },
+                )
+            )
+            messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})
+
+        return iter_error_count
 
     async def _execute_single_tool(
         self,

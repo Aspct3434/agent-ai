@@ -29,7 +29,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install fastapi mcp-server-sqlite aiosqlite httpx litellm pydantic \
-                      pytest pytest-asyncio pytest-cov
+                      pytest pytest-asyncio pytest-cov hypothesis
 
       - name: Verify all source files parse (encoding check)
         run: |
@@ -60,6 +60,7 @@ jobs:
                  tests/test_contract_planning.py \
                  tests/test_gateway_unit.py \
                  tests/test_coverage_boost.py \
+                 tests/test_property.py \
                  -v --tb=short
         env:
           PYTHONPATH: src
