@@ -9,14 +9,19 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
+import logging
+
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, PaginatedRequestParams
+
+logger = logging.getLogger(__name__)
 
 # Project root is one level above this file (src/../)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -37,21 +42,74 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _TERMINAL_TIMEOUT_SECONDS = max(5, int(os.getenv("AGENT_TERMINAL_TIMEOUT_SECONDS", "300")))
 
 # Combined stdout/stderr of every background service is appended here.
-_BACKGROUND_LOG_PATH = "/tmp/background_task.log"
+# Uses the OS temp dir so it works on Windows (no /tmp) and Linux/macOS.
+_BACKGROUND_LOG_PATH = str(Path(tempfile.gettempdir()) / "background_task.log")
+
+
+def _detect_posix_shell() -> list[str] | None:
+    """Return a POSIX shell argv prefix for Windows hosts, or None on POSIX systems.
+
+    On Linux/macOS, ``asyncio.create_subprocess_shell`` already uses ``/bin/sh``.
+    On Windows it uses ``cmd.exe``, which breaks POSIX commands (``mkdir -p``,
+    ``cat >``, path separators, etc.).  We look for ``bash`` (Git Bash or WSL)
+    and return ``["bash", "-c"]`` so callers can use
+    ``create_subprocess_exec(*_POSIX_SHELL, command, ...)`` instead.
+    """
+    if platform.system() != "Windows":
+        return None
+    bash = shutil.which("bash")
+    if bash:
+        logger.info("Windows: using POSIX shell %s for terminal commands", bash)
+        return [bash, "-c"]
+    logger.warning(
+        "Windows: no bash found on PATH -- POSIX commands (mkdir -p, cat, etc.) "
+        "will fail under cmd.exe. Install Git for Windows or WSL to get bash."
+    )
+    return None
+
+
+# Resolved once at import time; None means the OS already provides a POSIX shell.
+_POSIX_SHELL: list[str] | None = _detect_posix_shell()
 
 _PROBED_RUNTIMES = ("java", "python", "python3", "node", "curl", "git", "docker")
 
-# Commands that are unconditionally dangerous regardless of context.
-# The list is intentionally small and high-confidence to avoid over-blocking.
-_BLOCKED_COMMAND_PATTERNS = (
-    "rm -rf /",
-    "rm -rf /*",
-    "dd if=/dev/zero of=/dev/",
-    ":(){ :|:& };:",   # fork bomb
-    "> /etc/passwd",
-    "> /etc/shadow",
-    "chmod 777 /etc",
-    "chmod 777 /bin",
+# ---------------------------------------------------------------------------
+# Security: command safety gate
+#
+# Docker + a non-root user is the real security boundary for production.
+# This regex-based gate is a defence-in-depth layer that blocks the most
+# obviously catastrophic shell commands regardless of argument spacing or
+# flag ordering, so an accidental (or adversarial) prompt can't wipe the
+# filesystem in a local-dev session.
+#
+# Design: each pattern is anchored to the specific dangerous *effect*
+# (destroying the root fs, forking unboundedly, overwriting /etc auth files)
+# rather than a single literal string, so simple bypasses like extra spaces,
+# doubled slashes, or reordered flags are still caught.
+# ---------------------------------------------------------------------------
+
+_DANGEROUS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # rm targeting the filesystem root (/ or /* or /.) -- NOT /tmp/..., /var/...
+    # Matches: rm -rf /, rm -fr /*, rm --recursive --force /, etc.
+    # The path must be exactly '/' optionally followed by '*' or '.' to avoid
+    # blocking legitimate subdirectory removals like rm -rf /tmp/work.
+    re.compile(
+        r"\brm\s+(-[a-z]*rf[a-z]*|-[a-z]*fr[a-z]*|--recursive\s+--force|--force\s+--recursive)"
+        r"\s+['\"]?/['\"/\*\.]*['\"]?\s*$",
+        re.IGNORECASE,
+    ),
+    # dd writing to block devices
+    re.compile(r"\bdd\b.{0,60}\bof=/dev/(sd|hd|nvme|xvd|vd)[a-z]", re.IGNORECASE),
+    re.compile(r"\bdd\b.{0,60}\bof=/dev/zero\b", re.IGNORECASE),
+    # Fork bomb
+    re.compile(r":\(\)\s*\{.*:\|:", re.DOTALL),
+    # Overwriting /etc auth files
+    re.compile(r">\s*/etc/(passwd|shadow|sudoers)", re.IGNORECASE),
+    # Wiping whole partition / boot sector
+    re.compile(r"\bmkfs\b.{0,40}/dev/(sd|hd|nvme|xvd|vd)[a-z]", re.IGNORECASE),
+    re.compile(r"\bshred\b.{0,40}/dev/(sd|hd|nvme|xvd|vd)[a-z]", re.IGNORECASE),
+    # chmod 777 on system directories
+    re.compile(r"\bchmod\s+777\s+/(etc|bin|sbin|lib|usr)\b", re.IGNORECASE),
 )
 
 # Matches the target of any `cd` call in a shell command string.
@@ -838,12 +896,23 @@ class ToolManager:
         cwd_snapshot = self.current_cwd
 
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd_snapshot,
-            )
+            # On Windows use bash (Git Bash / WSL) when available so POSIX
+            # commands (mkdir -p, cat, etc.) work correctly.  On POSIX systems
+            # create_subprocess_shell already uses /bin/sh.
+            if _POSIX_SHELL is not None:
+                proc = await asyncio.create_subprocess_exec(
+                    *_POSIX_SHELL, command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd_snapshot,
+                )
+            else:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd_snapshot,
+                )
         except (FileNotFoundError, NotADirectoryError) as exc:
             return {
                 "exit_code": -1,
@@ -941,15 +1010,28 @@ class ToolManager:
             }
 
         try:
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                cwd=self.current_cwd,
-                start_new_session=True,
-            )
+            # Use bash on Windows so POSIX commands work (same logic as
+            # execute_terminal_command).  shell=True on Windows invokes cmd.exe.
+            if _POSIX_SHELL is not None:
+                proc = subprocess.Popen(
+                    [*_POSIX_SHELL, command],
+                    shell=False,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    cwd=self.current_cwd,
+                    start_new_session=True,
+                )
+            else:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    cwd=self.current_cwd,
+                    start_new_session=True,
+                )
         except (OSError, ValueError) as exc:
             return {
                 "pid": None,
@@ -1008,9 +1090,16 @@ class ToolManager:
 # ---------------------------------------------------------------------------
 
 def _is_dangerous_command(command: str) -> bool:
-    """Return True when the command matches a known-destructive pattern."""
-    normalized = " ".join(command.strip().split()).lower()
-    return any(pattern in normalized for pattern in _BLOCKED_COMMAND_PATTERNS)
+    """Return True when *command* matches a known-destructive regex pattern.
+
+    Collapses whitespace before matching so extra spaces can't bypass a rule.
+    Each pattern targets the dangerous *effect* (wipe filesystem, fork bomb,
+    corrupt auth files) rather than a single literal string, catching common
+    spelling variants (flag reordering, doubled slashes, quoting).
+    """
+    # Collapse internal whitespace to defeat space-padding bypasses.
+    normalized = re.sub(r"\s+", " ", command.strip())
+    return any(pat.search(normalized) is not None for pat in _DANGEROUS_PATTERNS)
 
 
 def _resolve_cd_target(command: str, current_cwd: str) -> str | None:
@@ -1071,6 +1160,16 @@ def _collect_system_environment() -> str:
 
     runtimes = {name: shutil.which(name) is not None for name in _PROBED_RUNTIMES}
 
+    # Report the shell used by execute_terminal_command so the model knows
+    # which syntax is safe. On Windows without bash, POSIX commands will fail.
+    if _POSIX_SHELL is not None:
+        shell_info = {"shell": _POSIX_SHELL[0], "shell_args": _POSIX_SHELL[1:], "posix": True}
+    elif system == "Windows":
+        shell_info = {"shell": "cmd.exe", "posix": False,
+                      "warning": "No bash on PATH; POSIX commands unavailable"}
+    else:
+        shell_info = {"shell": "/bin/sh", "posix": True}
+
     return json.dumps(
         {
             "os": os_label,
@@ -1079,6 +1178,7 @@ def _collect_system_environment() -> str:
             "python_executable": sys.executable,
             "disk_cwd": disk,
             "runtimes": runtimes,
+            "shell": shell_info,
         },
         indent=2,
     )
@@ -1288,7 +1388,6 @@ SKILLS_DIR = Path(__file__).parent
 # Allow skills to import the _skill decorator via `from _skill import skill`
 sys.path.insert(0, str(SKILLS_DIR))
 
-logger = logging.getLogger(__name__)
 mcp = FastMCP("skills")
 
 
