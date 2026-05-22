@@ -334,9 +334,11 @@ def _can_stream_text_before_final(
         return False
     if contract.get("mode") == "answer":
         return True
-    return _contract_completion_status(
-        contract, messages, steps, contract_required=False
-    )["complete"]
+    return bool(
+        _contract_completion_status(
+            contract, messages, steps, contract_required=False
+        )["complete"]
+    )
 
 
 # ---------------------------------------------------------------------------

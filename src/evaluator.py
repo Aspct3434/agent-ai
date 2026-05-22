@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -23,10 +22,13 @@ logger = logging.getLogger(__name__)
 
 _MIN_SIDE_EFFECT_STEPS = 2
 
+# Tools that produce observable side effects (filesystem, network, db).
+# Single source of truth — planning.py imports this set rather than redeclaring.
 _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
     {
         "execute_terminal_command",
         "execute_background_service",
+        "write_text_file",
         "publish_static_site",
         "expose_local_http_service",
         "create_table",

@@ -4,16 +4,16 @@ import asyncio
 import json
 import logging
 import sys
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-import agent as agent_module
-from agent import NormalizedMessage, TypeSafeAgentEngine
-from tools import ToolManager
+import agent as agent_module  # noqa: E402
+from agent import NormalizedMessage, TypeSafeAgentEngine  # noqa: E402
+from tools import ToolManager  # noqa: E402
 
 PROMPT = (
     "Write an optimized SQL query to pull the top users, then spawn a sub-agent "

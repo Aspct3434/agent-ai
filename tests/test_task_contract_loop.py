@@ -3,16 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, AsyncIterator
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-import agent as agent_module
-from agent import AgentEngine, ExecutionStep, NormalizedMessage
-from tools import (
+import agent as agent_module  # noqa: E402
+from agent import AgentEngine, ExecutionStep, NormalizedMessage  # noqa: E402
+from tools import (  # noqa: E402
     EXECUTE_TERMINAL_COMMAND_TOOL,
     PUBLISH_STATIC_SITE_TOOL,
     SET_TASK_CONTRACT_TOOL,

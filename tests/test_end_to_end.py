@@ -12,10 +12,10 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-import agent as agent_module
-from agent import AgentEngine, NormalizedMessage
-from gateway import Gateway, Message
-from tools import ToolManager
+import agent as agent_module  # noqa: E402
+from agent import AgentEngine, NormalizedMessage  # noqa: E402
+from gateway import Gateway, Message  # noqa: E402
+from tools import ToolManager  # noqa: E402
 
 SERVER_NAME = "sqlite"
 USER_QUESTION = "What tables exist in the database?"

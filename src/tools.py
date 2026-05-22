@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import platform
 import re
@@ -14,8 +15,6 @@ import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
-
-import logging
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -933,7 +932,7 @@ class ToolManager:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 proc.communicate(), timeout=_TERMINAL_TIMEOUT_SECONDS
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # wait_for only cancels the communicate() await -- the spawned shell
             # keeps running and would otherwise leak and hold the event loop.
             # Physically kill it, then reap so it does not become a zombie.
@@ -1151,6 +1150,7 @@ def _collect_system_environment() -> str:
         system, system
     )
 
+    disk: dict[str, Any]
     try:
         usage = shutil.disk_usage(os.getcwd())
         disk = {

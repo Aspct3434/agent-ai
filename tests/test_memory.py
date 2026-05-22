@@ -12,8 +12,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-import memory as memory_module
-
+import memory as memory_module  # noqa: E402
 
 RAW_TEXT = "Deployed a Python script that monitors API endpoints"
 ENTITIES = {

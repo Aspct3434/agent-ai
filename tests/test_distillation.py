@@ -11,8 +11,8 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-import evaluator as evaluator_module
-from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller
+import evaluator as evaluator_module  # noqa: E402
+from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller  # noqa: E402
 
 
 def _trajectory() -> ExecutionTrajectory:

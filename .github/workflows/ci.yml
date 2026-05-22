@@ -58,6 +58,8 @@ jobs:
                  tests/test_task_contract_loop.py \
                  tests/test_shell_platform.py \
                  tests/test_contract_planning.py \
+                 tests/test_gateway_unit.py \
+                 tests/test_coverage_boost.py \
                  -v --tb=short
         env:
           PYTHONPATH: src
@@ -104,5 +106,5 @@ jobs:
           cache: pip
       - run: pip install mypy fastapi pydantic litellm mcp aiosqlite
       - name: mypy
-        run: mypy src/checkpointer.py src/evaluator.py src/memory.py src/gateway.py
+        run: mypy src/checkpointer.py src/evaluator.py src/memory.py src/gateway.py src/llm_utils.py src/contract.py src/planning.py
         continue-on-error: true  # incremental; full strict is a separate effort

@@ -7,41 +7,30 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import contract as contract_mod
-import planning as planning_mod
-import llm_utils as llm_mod
 from contract import (
-    _normalise_task_contract,
-    _run_set_task_contract,
-    _is_continuation_signal,
-    _current_task_start_index,
-    _current_task_messages,
-    _latest_plan,
-    _plan_has_open_steps,
-    _coerce_plan_steps,
-    _filter_tool_schemas,
-    _tool_names_for_contract_status,
     _build_task_contract_instruction,
+    _filter_tool_schemas,
+    _is_continuation_signal,
+    _latest_plan,
+    _normalise_task_contract,
     _normalize_command,
-    _attempted_tool_names,
-)
-from planning import (
-    _render_plan,
-    _classify_tool_result,
-    _build_executive_summary,
-    _run_update_plan,
-    _count_done_plan_steps,
-    _build_plan_continuation_instruction,
-    _build_contract_execution_instruction,
-    _SIDE_EFFECT_TOOLS,
+    _plan_has_open_steps,
+    _run_set_task_contract,
 )
 from llm_utils import (
-    _make_final_answer,
-    _is_rate_limit_error,
-    _sanitize_messages_for_llm,
     _is_async_iterable,
+    _is_rate_limit_error,
+    _make_final_answer,
+    _sanitize_messages_for_llm,
 )
-
+from planning import (
+    _build_contract_execution_instruction,
+    _build_executive_summary,
+    _classify_tool_result,
+    _count_done_plan_steps,
+    _render_plan,
+    _run_update_plan,
+)
 
 # ---------------------------------------------------------------------------
 # llm_utils

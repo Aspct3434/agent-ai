@@ -5,9 +5,10 @@ import os
 import shutil
 import sqlite3
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -199,7 +200,7 @@ def _build_memory() -> Any:
             neo4j_password=os.getenv("NEO4J_PASSWORD", "neo4j"),
             chroma_path=os.getenv("CHROMA_PATH", "./chroma_db"),
         )
-    except Exception as exc:  # noqa: BLE001 - any failure should degrade gracefully
+    except Exception as exc:
         logger.warning("HybridMemory unavailable (%s); falling back to empty memory.", exc)
         return _EmptyMemory()
 
@@ -304,7 +305,7 @@ async def lifespan(app: FastAPI):
         if hasattr(memory, "close"):
             try:
                 memory.close()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning("Memory close failed: %s", exc)
 
 
@@ -432,7 +433,7 @@ async def webhook(payload: WebhookPayload) -> WebhookResponse:
 
 @app.get("/api/sessions/{session_id}/checkpoints")
 async def list_session_checkpoints(session_id: str) -> list[dict[str, Any]]:
-    return await app.state.checkpointer.list_checkpoints(session_id)
+    return list(await app.state.checkpointer.list_checkpoints(session_id))
 
 
 @app.post("/api/checkpoints/{checkpoint_id}/replay")

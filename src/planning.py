@@ -13,36 +13,14 @@ import logging
 import os
 from typing import Any
 
-from evaluator import ExecutionStep
 from contract import (
     _attempted_tool_names,
-    _contract_completion_status,
-    _current_task_messages,
     _is_continuation_signal,
     _latest_plan,
-    _latest_task_contract,
-    _plan_has_open_steps,
 )
+from evaluator import _SIDE_EFFECT_TOOLS, ExecutionStep
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# Host-changing tools whose successful calls are recorded in the ledger so the
-# model does not redo finished work (reinstall, re-download, etc.).
-_SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
-    {
-        "execute_terminal_command",
-        "execute_background_service",
-        "write_text_file",
-        "publish_static_site",
-        "expose_local_http_service",
-        "create_table",
-        "write_query",
-    }
-)
 
 _LEDGER_MAX_ITEMS = int(os.getenv("AGENT_LEDGER_MAX_ITEMS", "12"))
 _PLAN_MAX_RENDER = int(os.getenv("AGENT_PLAN_MAX_RENDER", "25"))

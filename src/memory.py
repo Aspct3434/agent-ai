@@ -62,7 +62,7 @@ class HybridMemory:
                 neo4j_uri, auth=(neo4j_user, neo4j_password)
             )
             self._neo4j.verify_connectivity()
-        except Exception:  # noqa: BLE001
+        except Exception:
             import logging
             logging.getLogger(__name__).warning(
                 "Neo4j unavailable at %s; graph storage disabled.", neo4j_uri
@@ -175,14 +175,14 @@ class HybridMemory:
                 "distance": dist,
                 "session_id": meta.get("session_id"),
             }
-            for event_id, text, dist, meta in zip(ids, docs, distances, metas)
+            for event_id, text, dist, meta in zip(ids, docs, distances, metas, strict=False)
         ]
 
     def _factual_query(self, cypher: str) -> list[dict[str, Any]]:
         # execute_read enforces a read-only transaction; writes in the Cypher
         # will raise a ClientError from the driver.
         with self._neo4j.session() as session:
-            return session.execute_read(lambda tx: tx.run(cypher).data())
+            return list(session.execute_read(lambda tx: tx.run(cypher).data()))
 
     @staticmethod
     def _write_graph(

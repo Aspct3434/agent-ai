@@ -9,7 +9,6 @@ from typing import Any
 
 import aiosqlite
 
-
 DEFAULT_DB_PATH = Path("checkpoints.db")
 
 # Keep at most this many checkpoints per session; older ones are pruned on each
@@ -96,7 +95,7 @@ class StateCheckpointer:
         if row is None:
             raise KeyError(f"Checkpoint not found: {checkpoint_id!r}")
 
-        return json.loads(row["state_payload"])
+        return dict(json.loads(row["state_payload"]))
 
     async def list_checkpoints(self, session_id: str) -> list[dict[str, Any]]:
         """Return all saved checkpoint rows for *session_id* in step order."""

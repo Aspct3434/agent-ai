@@ -1,7 +1,6 @@
 """Tests for platform-aware shell detection and command safety gate."""
 from __future__ import annotations
 
-import platform
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -11,7 +10,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import tools as tools_module
 from tools import _detect_posix_shell, _is_dangerous_command
-
 
 # ---------------------------------------------------------------------------
 # Shell detection

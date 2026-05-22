@@ -4,79 +4,56 @@ import asyncio
 import json
 import logging
 import os
-import re
 import uuid
-from pathlib import Path
-from typing import Any, AsyncGenerator, Literal
+from collections.abc import AsyncGenerator
+from typing import Any, Literal
 
 import litellm
 from mcp.types import CallToolResult
 from pydantic import BaseModel
 
 from checkpointer import StateCheckpointer
-from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller
-from memory import HybridMemory
-from tools import ToolManager
-
 from contract import (
-    _TASK_CONTRACT_TOOL,
-    _TASK_CONTRACT_EVIDENCE,
     _HOST_EXECUTION_TOOLS,
-    _CONTRACT_CONTROL_TOOLS,
-    _CONTRACT_EVIDENCE_TOOLS,
-    _is_continuation_signal,
-    _current_task_start_index,
-    _current_task_messages,
-    _coerce_plan_steps,
-    _latest_plan,
-    _plan_has_open_steps,
-    _filter_tool_schemas,
-    _tool_names_for_contract_status,
-    _run_set_task_contract,
-    _normalise_task_contract,
-    _latest_task_contract,
-    _contract_completion_status,
-    _can_stream_text_before_final,
-    _evidence_requirement_satisfied,
-    _successful_command_output_evidence,
-    _publish_static_site_evidence_is_positive,
-    _write_text_file_evidence_is_positive,
-    _expose_local_http_service_evidence_is_positive,
-    _filesystem_process_evidence_is_positive,
-    _normalize_command,
-    _last_host_command,
-    _duplicate_command_message,
-    _should_block_tool_for_action_task,
-    _blocked_action_tool_message,
+    _TASK_CONTRACT_TOOL,
     _attempted_tool_names,
-    _build_task_contract_instruction,
+    _blocked_action_tool_message,
     _build_incomplete_contract_cap_message,
+    _build_task_contract_instruction,
+    _can_stream_text_before_final,
+    _contract_completion_status,
+    _duplicate_command_message,
+    _filter_tool_schemas,
+    _last_host_command,
+    _latest_task_contract,
+    _normalize_command,
+    _run_set_task_contract,
+    _should_block_tool_for_action_task,
+    _tool_names_for_contract_status,
 )
+from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller
 from llm_utils import (
-    _make_final_answer,
-    _acompletion_with_retry,
     _acompletion_stream_with_retry,
-    _is_rate_limit_error,
-    _rate_limit_user_message,
     _is_async_iterable,
+    _is_rate_limit_error,
+    _make_final_answer,
     _prepare_llm_request_messages,
+    _rate_limit_user_message,
     _sanitize_messages_for_llm,
 )
+from memory import HybridMemory
 from planning import (
-    _SIDE_EFFECT_TOOLS,
-    _run_update_plan,
+    _build_contract_continuation_instruction,
+    _build_contract_execution_instruction,
+    _build_executive_summary,
+    _classify_tool_result,
     _count_done_plan_steps,
     _count_successful_side_effects,
-    _render_plan,
-    _build_plan_continuation_instruction,
-    _build_contract_execution_instruction,
-    _build_contract_continuation_instruction,
-    _classify_tool_result,
-    _build_executive_summary,
-    _store_iteration_cap_memory,
     _prune_message_window,
-    _build_history_compaction_summary,
+    _run_update_plan,
+    _store_iteration_cap_memory,
 )
+from tools import ToolManager
 
 logger = logging.getLogger(__name__)
 
@@ -626,6 +603,7 @@ class AgentEngine:
                         tool_schemas, {_TASK_CONTRACT_TOOL}
                     )
                 elif needs_execution:
+                    assert contract is not None  # needs_execution implies contract is set
                     request_messages = [
                         *request_messages,
                         {
@@ -687,8 +665,8 @@ class AgentEngine:
                     )
                 else:
                     response = completion_result
-                choice = response.choices[0]
-                assistant_msg = choice.message
+                choice = response.choices[0]  # type: ignore[union-attr]
+                assistant_msg = choice.message  # type: ignore[union-attr]
 
                 if choice.finish_reason != "tool_calls" or not assistant_msg.tool_calls:
                     final_response = assistant_msg.content or ""
@@ -777,7 +755,7 @@ class AgentEngine:
                 for tc in tool_calls:
                     args = json.loads(tc.function.arguments)
                     yield {"type": "tool_call", "tool": tc.function.name, "params": args}
-                    calls.append((tc.id, tc.function.name, args))
+                    calls.append((tc.id, tc.function.name, args))  # type: ignore[arg-type]
 
                 # Read-only calls run concurrently; side-effecting ones (terminal,
                 # background, delegate, MCP writes) stay serial in their original
@@ -793,7 +771,7 @@ class AgentEngine:
                             for (_, name, args) in parallel
                         )
                     )
-                    for (tc_id, _, _), res in zip(parallel, gathered):
+                    for (tc_id, _, _), res in zip(parallel, gathered, strict=False):
                         results[tc_id] = res
                 # Track the most recent host command so an immediately-repeated,
                 # identical one is short-circuited instead of re-run -- the real
@@ -970,7 +948,7 @@ class AgentEngine:
             summary_kwargs: dict[str, Any] = {
                 "model": active_model,
                 "messages": _prepare_llm_request_messages(
-                    self._compact_context_window(messages + [cap_instruction]),
+                    self._compact_context_window([*messages, cap_instruction]),
                     original_prompt,
                 ),
                 "max_tokens": _LLM_FINAL_MAX_TOKENS,
@@ -992,7 +970,7 @@ class AgentEngine:
                 )
             else:
                 final = summary_result
-            final_response = final.choices[0].message.content or ""
+            final_response = final.choices[0].message.content or ""  # type: ignore[union-attr]
             messages.append({"role": "assistant", "content": final_response})
             yield _make_final_answer("iteration_limit", final_response)
 
@@ -1064,7 +1042,7 @@ class AgentEngine:
                     "available_tools": [t["name"] for t in all_tools],
                 },
             )
-            asyncio.create_task(
+            asyncio.create_task(  # noqa: RUF006 - fire-and-forget; distillation runs after the session
                 self._distiller.submit(trajectory),
                 name=f"distill:{session_id}",
             )
