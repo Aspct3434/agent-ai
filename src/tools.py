@@ -98,16 +98,19 @@ _DANGEROUS_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"\s+['\"]?/['\"/\*\.]*['\"]?\s*$",
         re.IGNORECASE,
     ),
-    # dd writing to block devices
-    re.compile(r"\bdd\b.{0,60}\bof=/dev/(sd|hd|nvme|xvd|vd)[a-z]", re.IGNORECASE),
+    # dd writing to block devices (sda/hdb style) or NVMe (nvme0n1 style)
+    re.compile(r"\bdd\b.{0,60}\bof=/dev/(sd|hd|xvd|vd)[a-z]", re.IGNORECASE),
+    re.compile(r"\bdd\b.{0,60}\bof=/dev/nvme\d", re.IGNORECASE),
     re.compile(r"\bdd\b.{0,60}\bof=/dev/zero\b", re.IGNORECASE),
     # Fork bomb
     re.compile(r":\(\)\s*\{.*:\|:", re.DOTALL),
     # Overwriting /etc auth files
     re.compile(r">\s*/etc/(passwd|shadow|sudoers)", re.IGNORECASE),
     # Wiping whole partition / boot sector
-    re.compile(r"\bmkfs\b.{0,40}/dev/(sd|hd|nvme|xvd|vd)[a-z]", re.IGNORECASE),
-    re.compile(r"\bshred\b.{0,40}/dev/(sd|hd|nvme|xvd|vd)[a-z]", re.IGNORECASE),
+    re.compile(r"\bmkfs\b.{0,40}/dev/(sd|hd|xvd|vd)[a-z]", re.IGNORECASE),
+    re.compile(r"\bmkfs\b.{0,40}/dev/nvme\d", re.IGNORECASE),
+    re.compile(r"\bshred\b.{0,40}/dev/(sd|hd|xvd|vd)[a-z]", re.IGNORECASE),
+    re.compile(r"\bshred\b.{0,40}/dev/nvme\d", re.IGNORECASE),
     # chmod 777 on system directories
     re.compile(r"\bchmod\s+777\s+/(etc|bin|sbin|lib|usr)\b", re.IGNORECASE),
 )

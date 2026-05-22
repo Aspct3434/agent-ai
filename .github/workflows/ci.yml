@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi mcp-server-sqlite aiosqlite httpx litellm pydantic \
+                      pytest pytest-asyncio pytest-cov
+
+      - name: Verify all source files parse (encoding check)
+        run: |
+          python -c "
+          import ast, pathlib, sys
+          errors = []
+          for f in pathlib.Path('src').glob('*.py'):
+              try:
+                  ast.parse(f.read_text(encoding='utf-8'))
+              except SyntaxError as e:
+                  errors.append(f'{f.name}: {e}')
+          if errors:
+              for e in errors: print(e, file=sys.stderr)
+              sys.exit(1)
+          print(f'All {sum(1 for _ in pathlib.Path(\"src\").glob(\"*.py\"))} source files parse OK')
+          "
+
+      - name: Run eval harness self-test (no API key required)
+        run: python src/eval_harness.py --self-test
+
+      - name: Run unit tests
+        run: |
+          pytest tests/test_gateway.py \
+                 tests/test_distillation.py \
+                 tests/test_tools.py \
+                 tests/test_task_contract_loop.py \
+                 -v --tb=short
+        env:
+          PYTHONPATH: src
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v --tb=short \
+            --ignore=tests/test_end_to_end.py \
+            --ignore=tests/test_memory.py \
+            --ignore=tests/test_swarm.py \
+            --cov=src --cov-report=term-missing --cov-report=xml
+        env:
+          PYTHONPATH: src
+        continue-on-error: true  # memory/neo4j tests need real backends
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: coverage.xml
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ruff
+      - name: Ruff check
+        run: ruff check src/ tests/ --output-format=github
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install mypy fastapi pydantic litellm mcp aiosqlite
+      - name: mypy
+        run: mypy src/checkpointer.py src/evaluator.py src/memory.py src/gateway.py
+        continue-on-error: true  # incremental; full strict is a separate effort
