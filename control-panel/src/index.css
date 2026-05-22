@@ -1,0 +1,75 @@
+@import 'tailwindcss';
+
+/* ── Scrollbar — WebKit (Chrome, Edge, Safari) ─────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: #3f3f46; /* zinc-700 */
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #52525b; /* zinc-600 */
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.agent-markdown {
+  overflow-wrap: anywhere;
+}
+
+.agent-markdown > * + * {
+  margin-top: 0.65rem;
+}
+
+.agent-markdown strong {
+  font-weight: 700;
+  color: #ffffff;
+}
+
+.agent-markdown ul,
+.agent-markdown ol {
+  padding-left: 1.15rem;
+}
+
+.agent-markdown ul {
+  list-style: disc;
+}
+
+.agent-markdown ol {
+  list-style: decimal;
+}
+
+.agent-markdown li + li {
+  margin-top: 0.25rem;
+}
+
+.agent-markdown code {
+  border-radius: 0.375rem;
+  background: #18181b;
+  padding: 0.08rem 0.3rem;
+  color: #e4e4e7;
+  font-size: 0.92em;
+}
+
+.agent-markdown pre {
+  overflow-x: auto;
+  border-radius: 0.5rem;
+  background: #18181b;
+  padding: 0.75rem;
+}
+
+.agent-markdown pre code {
+  background: transparent;
+  padding: 0;
+}

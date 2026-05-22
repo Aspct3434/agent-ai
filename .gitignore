@@ -1,0 +1,74 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+*.whl
+
+# ── Virtual environments ──────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ── Runtime data (generated, not source) ─────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+chroma_data/
+neo4j_data/
+neo4j_logs/
+
+# ── Published / generated sites ──────────────────────────────────────────
+published_sites/
+generated_sites/
+sleep-website/
+
+# ── Logs ─────────────────────────────────────────────────────────────────
+*.log
+*.stderr.log
+*.stdout.log
+
+# ── Scratch / experiment files ────────────────────────────────────────────
+real_sleep_run_events*.jsonl
+*_run_events*.jsonl
+
+# ── Secrets / environment ────────────────────────────────────────────────
+.env
+*.env
+an-api.env
+
+# ── OS artifacts ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Coverage / test artifacts ────────────────────────────────────────────
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node (control-panel) ─────────────────────────────────────────────────
+control-panel/node_modules/
+control-panel/dist/
+control-panel/.vite/
+
+# ── Accidental mkdir artifacts ────────────────────────────────────────────
+-p/
