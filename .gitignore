@@ -70,5 +70,12 @@ control-panel/node_modules/
 control-panel/dist/
 control-panel/.vite/
 
+# ── Runtime skill volume (agent-generated; not source) ───────────────────
+# src/builtin_skills/ IS committed; the writable skills/ volume is not.
+skills/
+
+# ── Claude Code session data ──────────────────────────────────────────────
+.claude/
+
 # ── Accidental mkdir artifacts ────────────────────────────────────────────
 -p/
