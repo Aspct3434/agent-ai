@@ -716,7 +716,7 @@ class AgentEngine:
                         {
                             "role": "system",
                             "content": _build_contract_execution_instruction(
-                                contract, completion_status, messages
+                                contract, completion_status, messages, steps
                             ),
                         },
                     ]

@@ -65,7 +65,12 @@ def _run_update_plan(arguments: dict[str, Any]) -> tuple[str, bool]:
     tail = (
         "All steps are done/failed -- you may give your final answer."
         if open_left == 0
-        else "Now execute the next not-done step."
+        else (
+            "Now execute the next not-done step. "
+            "Do NOT call update_plan again in this same turn — proceed "
+            "immediately with write_text_file, execute_terminal_command, "
+            "or publish_static_site to do the actual work."
+        )
     )
     return (
         f"Plan updated: {total} step(s) -- {counts['done']} done, "
@@ -126,32 +131,61 @@ def _build_contract_execution_instruction(
     contract: dict[str, Any],
     status: dict[str, Any],
     messages: list[dict[str, Any]],
+    steps: list[ExecutionStep] | None = None,
 ) -> str:
+    attempted = set(_attempted_tool_names(steps or []))
     plan = _latest_plan(messages)
     plan_guidance = (
         "No update_plan checklist exists yet; call update_plan before continuing."
         if plan is None
-        else "Your update_plan checklist still has open steps; update it as work completes."
+        else "Your update_plan checklist still has open steps; execute the work now, then update it when done."
         if status.get("plan_open")
         else "Your update_plan checklist is closed."
     )
     missing = set(status.get("missing", []))
     if "plan" in missing:
-        next_action = "Call update_plan now with the concrete checklist."
+        next_action = "Call update_plan now with the concrete checklist of steps."
     else:
         evidence_missing = [
             item for item in status.get("missing", [])
             if item not in {"plan", "plan_open_steps"}
         ]
         if evidence_missing:
-            next_action = (
-                "The available tools have been narrowed to tools that can produce "
-                "the missing structured evidence. Call one of those tools now. "
-                "Use write_text_file for concrete text artifacts, publish_static_site "
-                "for static-site URLs, and get_filesystem_process_evidence for "
-                "verification. Do not call update_plan again until after the missing "
-                "evidence is produced."
-            )
+            if "published_static_site_url" in evidence_missing:
+                if "write_text_file" not in attempted:
+                    next_action = (
+                        "IMMEDIATE ACTION — call write_text_file RIGHT NOW.\n"
+                        "  • path: '/workspace/index.html'\n"
+                        "  • content: the full, complete, self-contained HTML file "
+                        "(embed all CSS and JavaScript inside the single file).\n"
+                        "Do NOT call update_plan before writing the file. "
+                        "After write_text_file succeeds, call publish_static_site "
+                        "with path='/workspace'."
+                    )
+                elif "publish_static_site" not in attempted:
+                    next_action = (
+                        "The file has been written. "
+                        "Call publish_static_site NOW with path='/workspace' "
+                        "(or wherever index.html was written). "
+                        "Do NOT call update_plan before publishing."
+                    )
+                else:
+                    next_action = (
+                        "publish_static_site was attempted but the URL evidence is "
+                        "not yet confirmed. Check the result — if it succeeded, call "
+                        "update_plan to close the remaining steps. If it failed, retry "
+                        "publish_static_site or use get_filesystem_process_evidence "
+                        "to check the file system."
+                    )
+            else:
+                next_action = (
+                    "The available tools have been narrowed to tools that can produce "
+                    "the missing structured evidence. Call one of those tools now. "
+                    "Use write_text_file for concrete text artifacts, publish_static_site "
+                    "for static-site URLs, and get_filesystem_process_evidence for "
+                    "verification. Do not call update_plan again until after the missing "
+                    "evidence is produced."
+                )
         elif "plan_open_steps" in missing:
             next_action = (
                 "All structured evidence is present; call update_plan now to close "
@@ -165,6 +199,7 @@ def _build_contract_execution_instruction(
         f"Summary: {contract.get('summary')}\n"
         f"Success criteria: {json.dumps(contract.get('success_criteria', []))}\n"
         f"Missing evidence: {', '.join(status.get('missing', [])) or 'none'}\n"
+        f"Tools called so far: {', '.join(sorted(attempted)) or 'none'}\n"
         f"{plan_guidance}\n"
         f"{next_action}\n"
         "Do not emit final plain text until the contract is complete."

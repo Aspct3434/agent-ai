@@ -23,6 +23,7 @@ from llm_utils import (
     _make_final_answer,
     _sanitize_messages_for_llm,
 )
+from evaluator import ExecutionStep
 from planning import (
     _build_contract_execution_instruction,
     _build_executive_summary,
@@ -426,7 +427,23 @@ class TestBuildTaskContractInstruction:
         assert "set_task_contract" in instruction
 
 
+def _tool_result_step(tool_name: str, is_error: bool = False) -> ExecutionStep:
+    return ExecutionStep(
+        kind="tool_result",
+        content="ok",
+        metadata={"tool_name": tool_name, "is_error": is_error},
+    )
+
+
 class TestBuildContractExecutionInstruction:
+    _PUBLISH_CONTRACT = {
+        "mode": "execute",
+        "summary": "build sleep website",
+        "success_criteria": ["site published"],
+        "evidence_requirements": ["published_static_site_url"],
+    }
+    _MSGS = [{"role": "user", "content": "build site"}]
+
     def test_incomplete_status_has_next_action(self):
         contract = {
             "mode": "execute",
@@ -438,3 +455,65 @@ class TestBuildContractExecutionInstruction:
         messages = [{"role": "user", "content": "build site"}]
         instruction = _build_contract_execution_instruction(contract, status, messages)
         assert "update_plan" in instruction.lower()
+
+    def test_write_text_file_immediate_when_not_yet_called(self):
+        """When published_static_site_url is missing and write_text_file hasn't
+        been called yet, the instruction must say to call write_text_file immediately.
+        This was the root cause of the agent stalling after update_plan."""
+        status = {
+            "complete": False,
+            "missing": ["plan_open_steps", "published_static_site_url"],
+            "plan_open": True,
+        }
+        steps = [_tool_result_step("set_task_contract"), _tool_result_step("update_plan")]
+        instruction = _build_contract_execution_instruction(
+            self._PUBLISH_CONTRACT, status, self._MSGS, steps
+        )
+        low = instruction.lower()
+        assert "write_text_file" in low
+        assert "immediate" in low or "right now" in low
+        # Must NOT suggest update_plan again at this point
+        assert "do not call update_plan" in low or "not call update_plan" in low
+
+    def test_publish_static_site_next_when_file_already_written(self):
+        """Once write_text_file has been called, the instruction must point to
+        publish_static_site as the next step."""
+        status = {
+            "complete": False,
+            "missing": ["plan_open_steps", "published_static_site_url"],
+            "plan_open": True,
+        }
+        steps = [
+            _tool_result_step("set_task_contract"),
+            _tool_result_step("update_plan"),
+            _tool_result_step("write_text_file"),
+        ]
+        instruction = _build_contract_execution_instruction(
+            self._PUBLISH_CONTRACT, status, self._MSGS, steps
+        )
+        low = instruction.lower()
+        assert "publish_static_site" in low
+        assert "do not call update_plan" in low or "not call update_plan" in low
+
+    def test_tools_called_so_far_appears_in_instruction(self):
+        """The instruction should surface which tools have been called so the
+        model can see its own progress without re-reading the full history."""
+        status = {
+            "complete": False,
+            "missing": ["plan_open_steps", "published_static_site_url"],
+            "plan_open": True,
+        }
+        steps = [_tool_result_step("update_plan")]
+        instruction = _build_contract_execution_instruction(
+            self._PUBLISH_CONTRACT, status, self._MSGS, steps
+        )
+        assert "update_plan" in instruction
+
+    def test_update_plan_response_discourages_repeat_call(self):
+        """_run_update_plan must tell the model not to call update_plan again
+        in the same turn when there are still open steps."""
+        result, is_error = _run_update_plan(
+            {"steps": [{"title": "Build", "status": "in_progress"}]}
+        )
+        assert not is_error
+        assert "do not call update_plan" in result.lower()
