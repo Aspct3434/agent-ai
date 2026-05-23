@@ -741,6 +741,17 @@ class AgentEngine:
                 else:
                     completion_kwargs.pop("tool_choice", None)
 
+                # Disable parallel tool calls during contract-enforced iterations.
+                # When the contract gate narrows tools to a single option (e.g.
+                # only update_plan is allowed), the model sometimes emits two calls
+                # to the same tool in one turn — the second call overwrites the
+                # first (collapsing a 3-step plan to 1 step) before any result is
+                # seen. Forcing sequential calls (one per turn) eliminates this.
+                if must_set_contract or needs_execution:
+                    completion_kwargs["parallel_tool_calls"] = False
+                else:
+                    completion_kwargs.pop("parallel_tool_calls", None)
+
                 # Stream answer-mode text immediately. For execute-mode text,
                 # buffer until evidence checks prove the final answer is valid;
                 # rejected prose never reaches the UI.

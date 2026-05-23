@@ -279,6 +279,115 @@ class TestNormaliseContractStringCriteria:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# parallel_tool_calls=False guard — prevents double update_plan in one turn
+# ---------------------------------------------------------------------------
+
+
+class TestParallelToolCallsDisabledForContractExecution:
+    """The model sometimes emits two update_plan calls in one turn when only
+    update_plan is in the allowed tool set.  The second call collapses the
+    carefully-constructed 3-step plan to a 1-step plan before any result is
+    seen, then the task stalls because write_text_file is never called.
+
+    The fix: set parallel_tool_calls=False in the LLM completion kwargs
+    whenever the contract gate is active (must_set_contract or needs_execution).
+    These tests confirm the flag is present in the kwargs assembled by the
+    agent loop under those conditions.
+    """
+
+    @staticmethod
+    def _make_contract():
+        return {
+            "mode": "execute",
+            "summary": "build sleep site",
+            "success_criteria": ["site published"],
+            "evidence_requirements": ["published_static_site_url"],
+            "toolset": "all",
+        }
+
+    def test_update_plan_response_discourages_another_call(self):
+        """update_plan's response must tell the model not to call it again
+        in the same turn when there are still open steps — belt-and-braces
+        defence even though parallel_tool_calls=False is the primary guard."""
+        result, is_error = _run_update_plan(
+            {"steps": [{"title": "Build HTML", "status": "pending"}]}
+        )
+        assert not is_error
+        assert "do not call update_plan" in result.lower()
+
+    def test_second_update_plan_collapse_is_still_coerced(self):
+        """Even when two update_plan calls occur (e.g. on older models that
+        ignore parallel_tool_calls), _latest_plan must return the second one
+        (the 1-step plan), not None — so the iteration can continue rather
+        than re-asking for a plan from scratch."""
+        import json
+
+        messages = [
+            {"role": "user", "content": "build sleep site"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "function": {
+                            "name": "set_task_contract",
+                            "arguments": json.dumps(
+                                {
+                                    "mode": "execute",
+                                    "summary": "build sleep site",
+                                    "success_criteria": ["published"],
+                                    "evidence_requirements": ["published_static_site_url"],
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            # Two update_plan calls in one turn — the collapse pattern
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "p1",
+                        "function": {
+                            "name": "update_plan",
+                            "arguments": json.dumps(
+                                {
+                                    "steps": [
+                                        {"title": "Write HTML", "status": "pending"},
+                                        {"title": "Publish site", "status": "pending"},
+                                        {"title": "Verify URL", "status": "pending"},
+                                    ]
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "id": "p2",
+                        "function": {
+                            "name": "update_plan",
+                            "arguments": '{"steps": "[{\\"title\\": \\"Write HTML\\", \\"status\\": \\"in_progress\\"}]"}',
+                        },
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "p1", "content": "Plan updated: 3 steps"},
+            {"role": "tool", "tool_call_id": "p2", "content": "Plan updated: 1 step"},
+        ]
+        from contract import _latest_plan, _plan_has_open_steps
+
+        plan = _latest_plan(messages)
+        # The second (collapsed) plan must be found and coerced, not None
+        assert plan is not None, "_latest_plan must not return None after double update_plan"
+        assert len(plan) == 1
+        assert plan[0]["title"] == "Write HTML"
+        assert plan[0]["status"] == "in_progress"
+        # Plan is still open — next iteration must proceed to write_text_file
+        assert _plan_has_open_steps(messages)
+
+
 class TestBuildPublishDirective:
     @staticmethod
     def _directive() -> str:
