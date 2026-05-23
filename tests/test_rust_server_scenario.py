@@ -265,7 +265,30 @@ class TestBuiltinSkillDeployment:
 # Integration: actually build if cargo is available (skipped otherwise)
 # ---------------------------------------------------------------------------
 
-CARGO_AVAILABLE = shutil.which("cargo") is not None
+def _cargo_runnable() -> bool:
+    """Return True only when cargo can actually be executed, not just found on PATH.
+
+    On Windows, cargo may appear in PATH via a WSL shim or a broken install that
+    shutil.which() sees but CreateProcess cannot launch (WinError 50).  A quick
+    probe run catches that before the test attempts a full build.
+    """
+    import subprocess
+
+    if shutil.which("cargo") is None:
+        return False
+    try:
+        subprocess.run(
+            ["cargo", "--version"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+CARGO_AVAILABLE = _cargo_runnable()
 
 
 @pytest.mark.skipif(not CARGO_AVAILABLE, reason="cargo not on PATH — skipping live build")
