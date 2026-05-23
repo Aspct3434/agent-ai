@@ -127,13 +127,26 @@ def _build_plan_continuation_instruction(messages: list[dict[str, Any]]) -> str:
 # Cross-domain instruction builders (need both contract and plan state)
 # ---------------------------------------------------------------------------
 
+def _successful_tool_names(steps: list[ExecutionStep]) -> set[str]:
+    """Names of tools that have produced at least one non-error result."""
+    return {
+        str(step.metadata.get("tool_name"))
+        for step in steps
+        if step.kind == "tool_result"
+        and step.metadata.get("tool_name")
+        and not step.metadata.get("is_error")
+    }
+
+
 def _build_contract_execution_instruction(
     contract: dict[str, Any],
     status: dict[str, Any],
     messages: list[dict[str, Any]],
     steps: list[ExecutionStep] | None = None,
 ) -> str:
-    attempted = set(_attempted_tool_names(steps or []))
+    _steps = steps or []
+    attempted = set(_attempted_tool_names(_steps))     # all attempts (inc. errors)
+    succeeded = _successful_tool_names(_steps)          # only successful results
     plan = _latest_plan(messages)
     plan_guidance = (
         "No update_plan checklist exists yet; call update_plan before continuing."
@@ -152,7 +165,9 @@ def _build_contract_execution_instruction(
         ]
         if evidence_missing:
             if "published_static_site_url" in evidence_missing:
-                if "write_text_file" not in attempted:
+                file_written = "write_text_file" in succeeded
+                site_published = "publish_static_site" in attempted
+                if not file_written:
                     next_action = (
                         "IMMEDIATE ACTION — call write_text_file RIGHT NOW.\n"
                         "  • path: '/workspace/index.html'\n"
@@ -162,9 +177,9 @@ def _build_contract_execution_instruction(
                         "After write_text_file succeeds, call publish_static_site "
                         "with path='/workspace'."
                     )
-                elif "publish_static_site" not in attempted:
+                elif not site_published:
                     next_action = (
-                        "The file has been written. "
+                        "The file was written successfully. "
                         "Call publish_static_site NOW with path='/workspace' "
                         "(or wherever index.html was written). "
                         "Do NOT call update_plan before publishing."
@@ -173,9 +188,9 @@ def _build_contract_execution_instruction(
                     next_action = (
                         "publish_static_site was attempted but the URL evidence is "
                         "not yet confirmed. Check the result — if it succeeded, call "
-                        "update_plan to close the remaining steps. If it failed, retry "
-                        "publish_static_site or use get_filesystem_process_evidence "
-                        "to check the file system."
+                        "update_plan to close the remaining steps. If it failed, "
+                        "re-check the file (write_text_file if needed), then retry "
+                        "publish_static_site or use get_filesystem_process_evidence."
                     )
             else:
                 next_action = (
