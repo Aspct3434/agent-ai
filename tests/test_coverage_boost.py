@@ -18,6 +18,7 @@ from contract import (
     _blocked_action_tool_message,
     _build_incomplete_contract_cap_message,
     _can_stream_text_before_final,
+    _contract_completion_status,
     _duplicate_command_message,
     _evidence_requirement_satisfied,
     _expose_local_http_service_evidence_is_positive,
@@ -68,6 +69,17 @@ class TestPublishStaticSiteEvidence:
         content = json.dumps({"published": False, "index_exists": True, "url": "http://x"})
         assert not _publish_static_site_evidence_is_positive(content)
 
+    def test_placeholder_quality_rejected(self):
+        content = json.dumps(
+            {
+                "published": True,
+                "index_exists": True,
+                "url": "http://x",
+                "artifact_quality": {"placeholder_detected": True},
+            }
+        )
+        assert not _publish_static_site_evidence_is_positive(content)
+
 
 class TestWriteTextFileEvidence:
     def test_positive(self):
@@ -80,6 +92,66 @@ class TestWriteTextFileEvidence:
 
     def test_invalid_json(self):
         assert not _write_text_file_evidence_is_positive("{bad")
+
+    def test_placeholder_quality_rejected(self):
+        content = json.dumps(
+            {
+                "written": True,
+                "exists": True,
+                "size_bytes": 42,
+                "artifact_quality": {"placeholder_detected": True},
+            }
+        )
+        assert not _write_text_file_evidence_is_positive(content)
+
+    def test_highly_interactive_contract_requires_interaction_signals(self):
+        contract = {
+            "mode": "execute",
+            "summary": "Create a highly interactive website about sleep.",
+            "success_criteria": ["Highly interactive website is published"],
+            "evidence_requirements": ["published_static_site_url"],
+        }
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "update_plan",
+                            "arguments": json.dumps(
+                                {"steps": [{"title": "Publish", "status": "done"}]}
+                            ),
+                        }
+                    }
+                ],
+            }
+        ]
+        steps = [
+            ExecutionStep(
+                kind="tool_result",
+                content=json.dumps(
+                    {
+                        "published": True,
+                        "index_exists": True,
+                        "url": "http://x",
+                        "artifact_quality": {
+                            "placeholder_detected": False,
+                            "interactive_signal_count": 0,
+                            "style_rule_count": 1,
+                            "content_word_count": 12,
+                        },
+                    }
+                ),
+                metadata={"tool_name": "publish_static_site", "is_error": False},
+            )
+        ]
+
+        status = _contract_completion_status(
+            contract, messages, steps, contract_required=True
+        )
+
+        assert status["complete"] is False
+        assert "artifact_quality" in status["missing"]
 
 
 class TestExposeLocalHttpServiceEvidence:

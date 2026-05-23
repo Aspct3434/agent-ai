@@ -34,7 +34,7 @@ tests/              -- Pytest suite (scripted streaming model, contract tests)
 ## Quick start
 
 ```bash
-# Copy and fill in your API key
+# Copy and fill in your Kimi / Moonshot API key
 cp an-api.env.example an-api.env
 
 # Run with Docker (recommended — correct POSIX shell, isolated filesystem)
@@ -51,7 +51,9 @@ Open `http://localhost:8000` for the API. Open `control-panel/` for the chat UI 
 
 | Variable | Default | Description |
 |---|---|---|
-| `AGENT_MODEL` | `anthropic/claude-haiku-4-5-20251001` | Main model |
+| `MOONSHOT_API_KEY` | required | Kimi / Moonshot API key used by LiteLLM |
+| `MOONSHOT_API_BASE` | `https://api.moonshot.ai/v1` | Kimi / Moonshot API base URL |
+| `AGENT_MODEL` | `moonshot/kimi-k2.5` | Main model |
 | `FAST_AGENT_MODEL` | `AGENT_MODEL` | Routine iterations |
 | `STRONG_AGENT_MODEL` | `AGENT_MODEL` | Escalated iterations / sub-agents |
 | `AGENT_MAX_REACT_ITERATIONS` | `16` | Q&A iteration cap |

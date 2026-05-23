@@ -6,7 +6,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncGenerator
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import litellm
 from mcp.types import CallToolResult
@@ -41,7 +41,6 @@ from llm_utils import (
     _rate_limit_user_message,
     _sanitize_messages_for_llm,
 )
-from memory import HybridMemory
 from planning import (
     _build_contract_continuation_instruction,
     _build_contract_execution_instruction,
@@ -56,6 +55,9 @@ from planning import (
 from tools import ToolManager
 from toolsets import filter_tools_by_toolset
 
+if TYPE_CHECKING:
+    from memory import HybridMemory
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,275 @@ def _llm_first_choice(response: Any) -> Any:
     type: ignore comments don't scatter across business logic.
     """
     return response.choices[0]  # type: ignore[union-attr]
+
+
+def _successful_tool_result_names(steps: list[ExecutionStep]) -> set[str]:
+    return {
+        str(step.metadata.get("tool_name"))
+        for step in steps
+        if step.kind == "tool_result"
+        and step.metadata.get("tool_name")
+        and not step.metadata.get("is_error")
+    }
+
+
+def _contract_request_text(contract: dict[str, Any] | None, original_prompt: str) -> str:
+    if not contract:
+        return original_prompt
+    pieces = [
+        original_prompt,
+        str(contract.get("summary") or ""),
+        *[str(item) for item in contract.get("success_criteria") or []],
+    ]
+    return " ".join(piece for piece in pieces if piece).lower()
+
+
+def _load_json_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _short_evidence_value(value: str, max_chars: int = 700) -> str:
+    cleaned = " ".join(value.split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def _evidence_items_from_payload(
+    content: str,
+    *,
+    tool_name: str | None = None,
+    arguments: dict[str, Any] | None = None,
+) -> list[tuple[str, str]]:
+    payload = _load_json_object(content)
+    if not payload:
+        return []
+
+    items: list[tuple[str, str]] = []
+    url = payload.get("url")
+    if payload.get("published") and payload.get("index_exists"):
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            items.append(("URL", url))
+        published_path = payload.get("published_path")
+        if isinstance(published_path, str) and published_path:
+            items.append(("Published path", published_path))
+    if payload.get("exposed") and payload.get("connectable"):
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            items.append(("Service URL", url))
+        port = payload.get("port")
+        if port:
+            items.append(("Port", str(port)))
+
+    if payload.get("written") and payload.get("exists"):
+        path = payload.get("path")
+        if isinstance(path, str) and path:
+            items.append(("File", path))
+
+    if tool_name == "execute_terminal_command" and payload.get("exit_code") == 0:
+        command = (arguments or {}).get("command")
+        stdout = payload.get("stdout")
+        if isinstance(command, str) and command:
+            items.append(("Command", command))
+        if isinstance(stdout, str) and stdout.strip():
+            items.append(("Command output", _short_evidence_value(stdout)))
+
+    if payload.get("status") == "launched" and payload.get("pid"):
+        items.append(("Process", f"PID {payload['pid']}"))
+        log_file = payload.get("log_file")
+        if isinstance(log_file, str) and log_file:
+            items.append(("Log", log_file))
+
+    paths = payload.get("paths")
+    if isinstance(paths, list):
+        for path_info in paths:
+            if not isinstance(path_info, dict) or not path_info.get("exists"):
+                continue
+            path = path_info.get("path")
+            if isinstance(path, str) and path:
+                items.append(("Path", path))
+
+    return items
+
+
+def _successful_evidence_items(
+    steps: list[ExecutionStep],
+    messages: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+
+    for step in steps:
+        if step.kind != "tool_result" or step.metadata.get("is_error"):
+            continue
+        for item in _evidence_items_from_payload(
+            step.content,
+            tool_name=str(step.metadata.get("tool_name") or ""),
+            arguments=step.metadata.get("arguments") or {},
+        ):
+            if item not in items:
+                items.append(item)
+
+    # Follow-up turns start with a fresh ExecutionStep list, but durable session
+    # history still contains prior tool outputs. Recover concrete evidence from
+    # those tool messages so "give me the URL/path/output" can be answered literally.
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        for item in _evidence_items_from_payload(content):
+            if item not in items:
+                items.append(item)
+
+    return items
+
+
+def _should_include_evidence_summary(
+    contract: dict[str, Any] | None,
+    original_prompt: str,
+) -> bool:
+    evidence = set((contract or {}).get("evidence_requirements") or [])
+    if evidence - {"none"}:
+        return True
+
+    text = original_prompt.lower()
+    return any(
+        token in text
+        for token in (
+            "url",
+            "link",
+            "published",
+            "site",
+            "website",
+            "open",
+            "view",
+            "file",
+            "path",
+            "where",
+            "output",
+            "result",
+            "service",
+            "port",
+        )
+    )
+
+
+def _ensure_evidence_in_final_response(
+    final_response: str,
+    *,
+    contract: dict[str, Any] | None,
+    original_prompt: str,
+    steps: list[ExecutionStep],
+    messages: list[dict[str, Any]],
+) -> str:
+    if not _should_include_evidence_summary(contract, original_prompt):
+        return final_response
+
+    missing_items = [
+        (label, value)
+        for label, value in _successful_evidence_items(steps, messages)
+        if value not in final_response
+    ]
+    if not missing_items:
+        return final_response
+
+    prefix = final_response.rstrip()
+    evidence_block = "Evidence:\n" + "\n".join(
+        f"- {label}: {value}" for label, value in missing_items
+    )
+    return f"{prefix}\n\n{evidence_block}" if prefix else evidence_block
+
+
+def _uses_moonshot_provider(model: str) -> bool:
+    return model.startswith("moonshot/") or model.startswith("kimi-")
+
+
+def _moonshot_required_tool_instruction(tool_schemas: list[dict[str, Any]]) -> str:
+    names = [
+        str(tool.get("function", {}).get("name"))
+        for tool in tool_schemas
+        if tool.get("function", {}).get("name")
+    ]
+    if len(names) == 1:
+        return (
+            f"Call the `{names[0]}` tool now. Return a tool call only; do not "
+            "answer in prose, do not explain, and do not say the task is in progress."
+        )
+    return (
+        "Call exactly one of these tools now: "
+        f"{', '.join(f'`{name}`' for name in names)}. Return a tool call only; "
+        "do not answer in prose, do not explain, and do not say the task is in progress."
+    )
+
+
+def _preferred_recovery_tool_name(
+    contract: dict[str, Any] | None,
+    status: dict[str, Any],
+    steps: list[ExecutionStep],
+    original_prompt: str,
+    available_tool_names: set[str],
+) -> str | None:
+    """Choose one tool to force after the model emits prose before completion."""
+    if contract is None or contract.get("mode") != "execute":
+        return None
+
+    missing = set(status.get("missing") or [])
+    if "plan" in missing and "update_plan" in available_tool_names:
+        return "update_plan"
+
+    evidence_missing = [item for item in missing if item not in {"plan", "plan_open_steps"}]
+    if not evidence_missing:
+        if "plan_open_steps" in missing and "update_plan" in available_tool_names:
+            return "update_plan"
+        return None
+
+    succeeded = _successful_tool_result_names(steps)
+    text = _contract_request_text(contract, original_prompt)
+
+    for requirement in evidence_missing:
+        if requirement == "artifact_quality":
+            if "write_text_file" in available_tool_names:
+                return "write_text_file"
+
+        if requirement == "published_static_site_url":
+            if "write_text_file" not in succeeded and "write_text_file" in available_tool_names:
+                return "write_text_file"
+            if "publish_static_site" in available_tool_names:
+                return "publish_static_site"
+
+        if requirement == "running_http_service":
+            if (
+                "execute_background_service" not in succeeded
+                and "execute_background_service" in available_tool_names
+            ):
+                return "execute_background_service"
+            if "expose_local_http_service" in available_tool_names:
+                return "expose_local_http_service"
+
+        if requirement == "database_mutation":
+            for name in ("write_query", "create_table"):
+                if name in available_tool_names:
+                    return name
+
+        if requirement == "command_output" and "execute_terminal_command" in available_tool_names:
+            return "execute_terminal_command"
+
+        if requirement == "filesystem_artifact":
+            if any(name in succeeded for name in _HOST_EXECUTION_TOOLS):
+                if "get_filesystem_process_evidence" in available_tool_names:
+                    return "get_filesystem_process_evidence"
+            if any(token in text for token in ("install", "build", "download", "run", "compile")):
+                if "execute_terminal_command" in available_tool_names:
+                    return "execute_terminal_command"
+            for name in ("write_text_file", "execute_terminal_command", "get_filesystem_process_evidence"):
+                if name in available_tool_names:
+                    return name
+
+    return None
 
 
 MAX_REACT_ITERATIONS = int(os.getenv("AGENT_MAX_REACT_ITERATIONS", "16"))
@@ -99,11 +370,11 @@ _MAX_AUTO_CONTINUE_BATCHES = max(1, int(os.getenv("AGENT_MAX_AUTO_CONTINUE_BATCH
 # consecutive iterations whose every tool call errored (only when the tiers differ).
 _ESCALATE_AFTER_CONSECUTIVE_ERROR_ITERS = 2
 
-_LLM_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "1024"))
+_LLM_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "32768"))
 
 # Larger budget for the final synthesised answer (e.g. the progress summary on a
 # cap hit), which is prose rather than tool-call arguments and can need more room.
-_LLM_FINAL_MAX_TOKENS = int(os.getenv("AGENT_FINAL_MAX_TOKENS", "2048"))
+_LLM_FINAL_MAX_TOKENS = int(os.getenv("AGENT_FINAL_MAX_TOKENS", "8192"))
 
 # Persist a checkpoint on the first iteration and then every Nth, instead of on
 # every iteration, to cut redundant full-history writes.
@@ -274,6 +545,19 @@ SYSTEM_DIRECTIVE = (
     "confirm node/npm exist via get_system_environment, then follow the build recipe "
     "below. Do NOT default to a heavy toolchain the user did not ask for, and do not "
     "scaffold a React/Vite project for a request that never mentioned React. "
+    # ── Website quality bar ──────────────────────────────────────────────────
+    "CRITICAL QUALITY RULE for every website you create: a bare skeleton with "
+    "unstyled HTML tags is NEVER acceptable. Every website deliverable MUST have: "
+    "(1) a complete CSS design with a colour palette, typography (font-family, "
+    "font-size, line-height), spacing (margins, padding), and responsive layout; "
+    "(2) realistic, substantive content -- real headings, paragraphs, descriptions, "
+    "feature lists -- not placeholder text or one-liners; (3) visual polish: "
+    "background colours/gradients, border-radius, box-shadow, hover/transition "
+    "effects, and a cohesive visual hierarchy; (4) at minimum 100+ words of visible "
+    "content. Think of the output as a page you would show a client, not a code "
+    "snippet. Generate ALL content yourself — do not leave blank sections or TODOs. "
+    "If the file is getting large, that is FINE — write the complete content in a "
+    "single write_text_file call. The tool supports large content payloads. "
     "If the user asks to host, publish, serve, or get a browser URL for a static "
     "website, use publish_static_site instead of starting python http.server on "
     "container-only ports. The public URL must use the backend's exposed /sites path. "
@@ -662,6 +946,9 @@ class AgentEngine:
         # Routine work runs on the fast tier; escalate to strong on repeated failure.
         active_model = self._fast_model
         consecutive_error_iters = 0
+        forced_recovery_tool: str | None = None
+        contract_text_rejections = 0
+        available_tool_names = {tool["name"] for tool in all_tools}
         # Contract negotiation costs one model turn up front. Use the larger cap
         # whenever contracts are enabled so execute-mode tasks do not stop one
         # step short, while answer-mode tasks still terminate early.
@@ -711,18 +998,34 @@ class AgentEngine:
                     )
                 elif needs_execution:
                     assert contract is not None  # needs_execution implies contract is set
+                    allowed_tool_names = _tool_names_for_contract_status(
+                        contract, completion_status
+                    )
+                    if forced_recovery_tool in allowed_tool_names:
+                        allowed_tool_names = {str(forced_recovery_tool)}
+                        recovery_note = (
+                            "\nRECOVERY MODE: The previous assistant turn emitted "
+                            "plain text while the task contract was still incomplete. "
+                            f"The only available tool now is {forced_recovery_tool}; "
+                            "call it with the arguments needed to produce or verify "
+                            "the missing evidence. Do not answer in prose."
+                        )
+                    else:
+                        forced_recovery_tool = None
+                        recovery_note = ""
                     request_messages = [
                         *request_messages,
                         {
                             "role": "system",
                             "content": _build_contract_execution_instruction(
                                 contract, completion_status, messages, steps
-                            ),
+                            )
+                            + recovery_note,
                         },
                     ]
                     request_tool_schemas = _filter_tool_schemas(
                         tool_schemas,
-                        _tool_names_for_contract_status(contract, completion_status),
+                        allowed_tool_names,
                     )
                 request_messages = _prepare_llm_request_messages(
                     request_messages, original_prompt
@@ -732,11 +1035,26 @@ class AgentEngine:
                     completion_kwargs["tools"] = request_tool_schemas
                 else:
                     completion_kwargs.pop("tools", None)
-                # Force only the one-time contract declaration. After that the
-                # model chooses tools normally and final text is gated by evidence.
-                if must_set_contract and request_tool_schemas:
-                    completion_kwargs["tool_choice"] = "required"
-                elif needs_execution and request_tool_schemas:
+                requires_tool_call = bool(
+                    (must_set_contract or needs_execution) and request_tool_schemas
+                )
+                # Moonshot/Kimi does not natively support OpenAI's
+                # tool_choice="required". LiteLLM approximates it with a generic
+                # final user message; make that provider shim explicit and exact
+                # so contract-gated tasks do not drift through slow prose retries.
+                if requires_tool_call and _uses_moonshot_provider(active_model):
+                    request_messages = [
+                        *request_messages,
+                        {
+                            "role": "user",
+                            "content": _moonshot_required_tool_instruction(
+                                request_tool_schemas
+                            ),
+                        },
+                    ]
+                    completion_kwargs["messages"] = request_messages
+                    completion_kwargs.pop("tool_choice", None)
+                elif requires_tool_call:
                     completion_kwargs["tool_choice"] = "required"
                 else:
                     completion_kwargs.pop("tool_choice", None)
@@ -795,6 +1113,30 @@ class AgentEngine:
                         contract_required=contract_required,
                     )
                     if not final_status["complete"]:
+                        contract_text_rejections += 1
+                        forced_recovery_tool = _preferred_recovery_tool_name(
+                            _latest_task_contract(messages),
+                            final_status,
+                            steps,
+                            original_prompt,
+                            available_tool_names,
+                        )
+
+                        if (
+                            active_model != self._strong_model
+                            and contract_text_rejections >= 1
+                        ):
+                            active_model = self._strong_model
+                            logger.info(
+                                "Escalating to strong model %s for session %s after rejected contract text",
+                                active_model,
+                                session_id,
+                            )
+                            yield {
+                                "type": "status",
+                                "message": f"Escalating to {active_model}...",
+                            }
+
                         instruction = _build_contract_continuation_instruction(
                             _latest_task_contract(messages),
                             final_status,
@@ -802,6 +1144,13 @@ class AgentEngine:
                             messages,
                             steps,
                         )
+                        if forced_recovery_tool:
+                            instruction += (
+                                "\n\nRECOVERY MODE: The next iteration will expose "
+                                f"only `{forced_recovery_tool}` because the task "
+                                "needs concrete evidence, not another progress note. "
+                                "Call that tool with appropriate arguments."
+                            )
                         if final_response.strip():
                             messages.append({"role": "assistant", "content": final_response})
                         messages.append({"role": "system", "content": instruction})
@@ -840,8 +1189,15 @@ class AgentEngine:
                             session_id,
                         )
                         continue
+                    final_response = _ensure_evidence_in_final_response(
+                        final_response,
+                        contract=_latest_task_contract(messages),
+                        original_prompt=original_prompt,
+                        steps=steps,
+                        messages=messages,
+                    )
                     if buffered_tokens and not emitted_tokens:
-                        yield {"type": "token", "content": "".join(buffered_tokens)}
+                        yield {"type": "token", "content": final_response}
                     # Record the reply so the next turn in this session sees it.
                     messages.append({"role": "assistant", "content": final_response})
                     yield {"type": "text", "content": final_response}
@@ -881,6 +1237,8 @@ class AgentEngine:
                     steps=steps,
                     tool_index=tool_index,
                 )
+                forced_recovery_tool = None
+                contract_text_rejections = 0
 
                 # Escalate to the strong model when the fast one keeps failing.
                 if tool_calls and iter_error_count == len(tool_calls):

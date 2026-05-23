@@ -146,6 +146,7 @@ class _ScriptedStreamingModel:
         self.request_messages: list[list[dict[str, Any]]] = []
         self.request_tool_names: list[list[str]] = []
         self.request_tool_choices: list[Any] = []
+        self.request_parallel_tool_calls: list[Any] = []
 
     async def __call__(self, **kwargs: Any) -> Any:
         messages = kwargs["messages"]
@@ -158,6 +159,7 @@ class _ScriptedStreamingModel:
             ]
         )
         self.request_tool_choices.append(kwargs.get("tool_choice"))
+        self.request_parallel_tool_calls.append(kwargs.get("parallel_tool_calls"))
         response = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return _stream_response(response)
@@ -537,3 +539,299 @@ def test_execute_contract_requires_matching_structured_evidence() -> None:
     assert dual_evidence_status["complete"] is True
     assert open_plan_status["complete"] is False
     assert "plan_open_steps" in open_plan_status["missing"]
+
+
+def test_parallel_tool_calls_disabled_during_contract_execution() -> None:
+    """parallel_tool_calls=False must be sent to the model on every turn where
+    must_set_contract or needs_execution is true.
+
+    Regression: the model previously emitted two update_plan calls in the same
+    turn (parallel tool calls), collapsing a 3-step plan to a 1-step plan before
+    any result was seen.  Setting parallel_tool_calls=False forces sequential
+    execution so only one call is made per turn.
+    """
+    script = [
+        _completion(tool_calls=[_contract_tool("execute", ["published_static_site_url"])]),
+        _completion(tool_calls=[_plan_tool("in_progress")]),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_write",
+                    "write_text_file",
+                    {"path": "/workspace/index.html", "content": "<html>Sleep</html>"},
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_publish",
+                    "publish_static_site",
+                    {"source_path": "/workspace", "slug": "sleep"},
+                )
+            ]
+        ),
+        _completion(tool_calls=[_plan_tool("done")]),
+        _completion(content="Published: http://localhost:8000/sites/sleep/"),
+    ]
+
+    events, tools, model = asyncio.run(_run_engine_with_model(script))
+
+    # Every contract-enforced turn must have parallel_tool_calls=False.
+    # Turn 0: must_set_contract → False
+    # Turn 1: needs_execution (plan missing) → False
+    # Turn 2: needs_execution (evidence missing) → False
+    # Turn 3: needs_execution (evidence missing) → False
+    # Turn 4: needs_execution (plan still open) → False
+    # Turn 5: final answer, not enforced → None (absent)
+    for i, ptc in enumerate(model.request_parallel_tool_calls[:-1]):
+        assert ptc is False, (
+            f"Turn {i}: expected parallel_tool_calls=False during contract enforcement, "
+            f"got {ptc!r}"
+        )
+    # Last turn (final answer generation) must NOT have the flag set.
+    assert model.request_parallel_tool_calls[-1] is None, (
+        "Final answer turn must not force parallel_tool_calls=False"
+    )
+    # The task must still complete successfully end-to-end.
+    assert tools.published
+    assert any(
+        event.get("type") == "text" and "sleep" in event.get("content", "")
+        for event in events
+    )
+
+
+def test_contract_recovery_forces_next_evidence_tool_after_rejected_prose() -> None:
+    """After rejected prose, the next execute turn is narrowed to one evidence tool."""
+    script = [
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_contract",
+                    "set_task_contract",
+                    {
+                        "mode": "execute",
+                        "summary": "Create a simple website about sleep.",
+                        "success_criteria": [
+                            "Website is published and accessible at a public URL",
+                            "Content about sleep is displayed and interactive",
+                        ],
+                        "evidence_requirements": [
+                            "published_static_site_url",
+                            "filesystem_artifact",
+                        ],
+                    },
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_plan",
+                    "update_plan",
+                    {
+                        "steps": [
+                            {
+                                "title": "Create index.html with sleep content",
+                                "status": "in_progress",
+                            },
+                            {"title": "Publish the website", "status": "pending"},
+                            {"title": "Verify the published URL", "status": "pending"},
+                        ]
+                    },
+                )
+            ]
+        ),
+        _completion(content="I'll create the sleep website now."),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_write",
+                    "write_text_file",
+                    {
+                        "path": "generated_sites/sleep/index.html",
+                        "content": "<!doctype html><title>Sleep</title>",
+                    },
+                )
+            ]
+        ),
+        _completion(content="I'll publish it next."),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_publish",
+                    "publish_static_site",
+                    {"source_path": "generated_sites/sleep", "slug": "sleep"},
+                )
+            ]
+        ),
+        _completion(tool_calls=[_plan_tool("done")]),
+        _completion(content="Published: http://localhost:8000/sites/sleep/"),
+    ]
+
+    events, tools, model = asyncio.run(_run_engine_with_model(script))
+
+    assert model.request_tool_names[3] == ["write_text_file"]
+    assert model.request_tool_names[5] == ["publish_static_site"]
+    assert tools.written
+    assert tools.published
+    assert any("sleep" in item["path"] for item in tools.written)
+    event_tools = [event.get("tool") for event in events if event.get("type") == "tool_call"]
+    assert "write_text_file" in event_tools
+    assert "publish_static_site" in event_tools
+    assert any(
+        event.get("type") == "text" and "sleep" in event.get("content", "").lower()
+        for event in events
+    )
+
+
+def test_completed_static_site_final_answer_includes_literal_url() -> None:
+    script = [
+        _completion(tool_calls=[_contract_tool("execute", ["published_static_site_url"])]),
+        _completion(tool_calls=[_plan_tool("in_progress")]),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_write",
+                    "write_text_file",
+                    {
+                        "path": "generated_sites/site/index.html",
+                        "content": "<!doctype html><title>Sleep</title>",
+                    },
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_publish",
+                    "publish_static_site",
+                    {"source_path": "generated_sites/site"},
+                )
+            ]
+        ),
+        _completion(tool_calls=[_plan_tool("done")]),
+        _completion(content="The website is ready: Importance of Sleep."),
+    ]
+
+    events, tools, _ = asyncio.run(_run_engine_with_model(script))
+
+    assert tools.published
+    final_texts = [
+        event.get("content", "")
+        for event in events
+        if event.get("type") in {"text", "final_answer"}
+    ]
+    assert final_texts
+    assert "Evidence:" in final_texts[-1]
+    assert "URL: http://localhost:8000/sites/site/" in final_texts[-1]
+    assert "Published path: /published/site" in final_texts[-1]
+
+
+def test_url_followup_recovers_published_url_from_history() -> None:
+    messages = [
+        {"role": "user", "content": "create a website"},
+        {
+            "role": "tool",
+            "tool_call_id": "call_publish",
+            "content": json.dumps(
+                {
+                    "published": True,
+                    "index_exists": True,
+                    "url": "http://localhost:8000/sites/site/",
+                }
+            ),
+        },
+        {"role": "assistant", "content": "I published the website."},
+        {"role": "user", "content": "give me the url"},
+    ]
+
+    final = agent_module._ensure_evidence_in_final_response(
+        "The URL is: Importance of Sleep.",
+        contract={"mode": "answer", "evidence_requirements": ["none"]},
+        original_prompt="give me the url",
+        steps=[],
+        messages=messages,
+    )
+
+    assert "URL: http://localhost:8000/sites/site/" in final
+
+
+def test_final_answer_appends_general_evidence_literals() -> None:
+    steps = [
+        ExecutionStep(
+            kind="tool_result",
+            content=json.dumps(
+                {
+                    "written": True,
+                    "path": "/tmp/report.txt",
+                    "exists": True,
+                    "size_bytes": 2,
+                }
+            ),
+            metadata={
+                "tool_name": "write_text_file",
+                "is_error": False,
+                "arguments": {"path": "/tmp/report.txt"},
+            },
+        ),
+        ExecutionStep(
+            kind="tool_result",
+            content=json.dumps(
+                {
+                    "exit_code": 0,
+                    "stdout": "installed ok\n",
+                    "stderr": "",
+                    "current_working_directory": "/tmp",
+                }
+            ),
+            metadata={
+                "tool_name": "execute_terminal_command",
+                "is_error": False,
+                "arguments": {"command": "echo installed ok"},
+            },
+        ),
+    ]
+
+    final = agent_module._ensure_evidence_in_final_response(
+        "Done.",
+        contract={
+            "mode": "execute",
+            "evidence_requirements": ["filesystem_artifact", "command_output"],
+        },
+        original_prompt="create the file and show command output",
+        steps=steps,
+        messages=[],
+    )
+
+    assert "File: /tmp/report.txt" in final
+    assert "Command: echo installed ok" in final
+    assert "Command output: installed ok" in final
+
+
+def test_contract_recovery_forces_command_tool_for_command_output_evidence() -> None:
+    script = [
+        _completion(tool_calls=[_contract_tool("execute", ["command_output"])]),
+        _completion(tool_calls=[_plan_tool("in_progress")]),
+        _completion(content="I'll run the command now."),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_command",
+                    "execute_terminal_command",
+                    {"command": "echo recovered"},
+                )
+            ]
+        ),
+        _completion(tool_calls=[_plan_tool("done")]),
+        _completion(content="Command output captured."),
+    ]
+
+    events, tools, model = asyncio.run(_run_engine_with_model(script))
+
+    assert model.request_tool_names[3] == ["execute_terminal_command"]
+    assert any("echo recovered" in command for command in tools.commands)
+    assert any(
+        event.get("type") == "text" and "Command output" in event.get("content", "")
+        for event in events
+    )

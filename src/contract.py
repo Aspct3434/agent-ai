@@ -77,6 +77,9 @@ _CONTRACT_EVIDENCE_TOOLS: dict[str, frozenset[str]] = {
     "command_output": frozenset(
         {"execute_terminal_command", "execute_background_service"}
     ),
+    "artifact_quality": frozenset(
+        {"write_text_file", "publish_static_site", "browser_navigate", "browser_screenshot"}
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -426,6 +429,9 @@ def _contract_completion_status(
         if not _evidence_requirement_satisfied(requirement, steps):
             missing.append(requirement)
 
+    if _artifact_quality_missing(contract, steps):
+        missing.append("artifact_quality")
+
     return {
         "complete": not missing,
         "missing": missing,
@@ -506,7 +512,12 @@ def _publish_static_site_evidence_is_positive(content: str) -> bool:
         data = json.loads(content)
     except (TypeError, json.JSONDecodeError):
         return False
-    return bool(data.get("published") and data.get("index_exists") and data.get("url"))
+    return bool(
+        data.get("published")
+        and data.get("index_exists")
+        and data.get("url")
+        and _artifact_quality_payload_is_acceptable(data)
+    )
 
 
 def _write_text_file_evidence_is_positive(content: str) -> bool:
@@ -514,7 +525,91 @@ def _write_text_file_evidence_is_positive(content: str) -> bool:
         data = json.loads(content)
     except (TypeError, json.JSONDecodeError):
         return False
-    return bool(data.get("written") and data.get("exists") and data.get("size_bytes", 0) > 0)
+    return bool(
+        data.get("written")
+        and data.get("exists")
+        and data.get("size_bytes", 0) > 0
+        and _artifact_quality_payload_is_acceptable(data)
+    )
+
+
+def _artifact_quality_payload_is_acceptable(data: dict[str, Any]) -> bool:
+    quality = data.get("artifact_quality")
+    if not isinstance(quality, dict):
+        return True
+    return not bool(quality.get("placeholder_detected"))
+
+
+def _contract_artifact_text(contract: dict[str, Any]) -> str:
+    pieces = [
+        str(contract.get("summary") or ""),
+        *[str(item) for item in contract.get("success_criteria") or []],
+    ]
+    return " ".join(pieces).lower()
+
+
+def _contract_requests_web_artifact(contract: dict[str, Any]) -> bool:
+    text = _contract_artifact_text(contract)
+    return any(
+        token in text
+        for token in ("website", "web site", "webpage", "web page", "html", "landing page", "static site")
+    )
+
+
+def _latest_artifact_quality(steps: list[ExecutionStep]) -> dict[str, Any] | None:
+    for step in reversed(steps):
+        if step.kind != "tool_result" or step.metadata.get("is_error"):
+            continue
+        if step.metadata.get("tool_name") not in {"write_text_file", "publish_static_site"}:
+            continue
+        try:
+            data = json.loads(step.content)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        quality = data.get("artifact_quality")
+        if isinstance(quality, dict):
+            return quality
+    return None
+
+
+def _artifact_quality_missing(contract: dict[str, Any], steps: list[ExecutionStep]) -> bool:
+    if not _contract_requests_web_artifact(contract):
+        return False
+
+    quality = _latest_artifact_quality(steps)
+    if not quality:
+        return False
+    if quality.get("placeholder_detected"):
+        return True
+
+    text = _contract_artifact_text(contract)
+    interactive_requested = any(
+        token in text
+        for token in ("interactive", "interaction", "javascript", "js", "quiz", "slider", "calculator", "button")
+    )
+    highly_interactive_requested = "highly interactive" in text
+    interactive_count = int(quality.get("interactive_signal_count") or 0)
+    style_count = int(quality.get("style_rule_count") or 0)
+    word_count = int(quality.get("content_word_count") or 0)
+
+    if highly_interactive_requested and interactive_count < 3:
+        return True
+    if interactive_requested and interactive_count < 1:
+        return True
+    if style_count < 2 and any(token in text for token in ("styled", "style", "beautiful", "highly interactive")):
+        return True
+    if word_count < 50 and any(token in text for token in ("about", "importance", "explain", "content")):
+        return True
+
+    # Baseline quality gate: ANY website request must have meaningful CSS and
+    # non-trivial content. A bare <h1>Hello</h1> with no styles is never an
+    # acceptable deliverable — the user expects a presentable page.
+    if style_count < 5:
+        return True
+    if word_count < 30:
+        return True
+
+    return False
 
 
 def _expose_local_http_service_evidence_is_positive(content: str) -> bool:

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -99,6 +100,7 @@ class ReplayCheckpointRequest(BaseModel):
 Handler = Callable[[Message], Awaitable[Any]]
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / "an-api.env")
 PUBLISHED_SITES_DIR = Path(
     os.getenv("PUBLISHED_SITES_DIR", str(_PROJECT_ROOT / "published_sites"))
 ).expanduser()
@@ -278,20 +280,22 @@ def _ensure_sqlite_db(db_path: Path) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db_path = Path(os.getenv("SQLITE_DB_PATH", "/app/test.db"))
-    checkpoint_db_path = Path(os.getenv("CHECKPOINT_DB_PATH", "/app/checkpoints.db"))
-    skills_dir = Path(os.getenv("SKILLS_DIR", "/app/skills"))
-    model = os.getenv("AGENT_MODEL", "anthropic/claude-haiku-4-5-20251001")
+    db_path = Path(os.getenv("SQLITE_DB_PATH", str(_PROJECT_ROOT / "test.db")))
+    checkpoint_db_path = Path(
+        os.getenv("CHECKPOINT_DB_PATH", str(_PROJECT_ROOT / "checkpoints.db"))
+    )
+    skills_dir = Path(os.getenv("SKILLS_DIR", str(_PROJECT_ROOT / "skills")))
+    model = os.getenv("AGENT_MODEL", "moonshot/kimi-k2.5")
     # Model tiers: routine work runs on FAST (defaults to AGENT_MODEL); the loop
     # escalates to STRONG on repeated failure and routes coder/auditor sub-agents
-    # there. Set STRONG_AGENT_MODEL to a stronger Claude model to enable routing.
+    # there. Set STRONG_AGENT_MODEL to a stronger model to enable routing.
     fast_model = os.getenv("FAST_AGENT_MODEL", model)
     strong_model = os.getenv("STRONG_AGENT_MODEL", model)
 
     _ensure_sqlite_db(db_path)
     await initialize_checkpoints_db(checkpoint_db_path)
 
-    data_dir = Path(os.getenv("AGENT_DATA_DIR", "/app/data"))
+    data_dir = Path(os.getenv("AGENT_DATA_DIR", str(_PROJECT_ROOT / "data")))
     checkpointer = StateCheckpointer(checkpoint_db_path)
 
     tools = ToolManager()

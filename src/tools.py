@@ -44,6 +44,62 @@ _TERMINAL_TIMEOUT_SECONDS = max(5, int(os.getenv("AGENT_TERMINAL_TIMEOUT_SECONDS
 # Uses the OS temp dir so it works on Windows (no /tmp) and Linux/macOS.
 _BACKGROUND_LOG_PATH = str(Path(tempfile.gettempdir()) / "background_task.log")
 
+_PLACEHOLDER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\badd\s+(?:more\s+)?(?:css|styles?|javascript|js|content|html|text|features?)\s+here\b", re.I),
+    re.compile(r"\b(?:todo|fixme)\s*:\s*(?:add|implement|write|fill)\b", re.I),
+    re.compile(r"\bplaceholder\s+(?:text|content|copy|image|section)\b", re.I),
+    re.compile(r"\blorem\s+ipsum\b", re.I),
+)
+
+_INTERACTIVE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\baddEventListener\s*\(", re.I),
+    re.compile(r"\bon(?:click|input|change|submit|mousemove|keydown)\s*=", re.I),
+    re.compile(r"\b(querySelector|getElementById)\s*\(", re.I),
+    re.compile(r"\b(setInterval|setTimeout|requestAnimationFrame)\s*\(", re.I),
+    re.compile(r"\b(canvas|input|button|select|textarea|details)\b", re.I),
+)
+
+
+def _artifact_quality_for_text(content: str, path: str | None = None) -> dict[str, Any]:
+    placeholder_matches: list[str] = []
+    for pattern in _PLACEHOLDER_PATTERNS:
+        placeholder_matches.extend(match.group(0) for match in pattern.finditer(content))
+
+    style_rule_count = len(re.findall(r"\{[^{}]*:[^{};]+;?[^{}]*\}", content))
+    interactive_signal_count = sum(
+        len(pattern.findall(content)) for pattern in _INTERACTIVE_PATTERNS
+    )
+    visible_text = re.sub(r"<script\b[^>]*>.*?</script>", " ", content, flags=re.I | re.S)
+    visible_text = re.sub(r"<style\b[^>]*>.*?</style>", " ", visible_text, flags=re.I | re.S)
+    visible_text = re.sub(r"<[^>]+>", " ", visible_text)
+    content_word_count = len(re.findall(r"[A-Za-z0-9]+", visible_text))
+
+    suffix = Path(path or "").suffix.lower()
+    is_web_artifact = suffix in {".html", ".css", ".js"} or "<html" in content.lower()
+    return {
+        "artifact_quality_ok": not placeholder_matches,
+        "is_web_artifact": is_web_artifact,
+        "placeholder_detected": bool(placeholder_matches),
+        "placeholder_matches": placeholder_matches[:8],
+        "style_rule_count": style_rule_count,
+        "interactive_signal_count": interactive_signal_count,
+        "content_word_count": content_word_count,
+    }
+
+
+def _artifact_quality_for_site(source: Path) -> dict[str, Any]:
+    chunks: list[str] = []
+    for path in sorted(source.rglob("*")):
+        if path.suffix.lower() not in {".html", ".css", ".js"} or not path.is_file():
+            continue
+        try:
+            chunks.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+    quality = _artifact_quality_for_text("\n".join(chunks), str(source / "index.html"))
+    quality["is_web_artifact"] = True
+    return quality
+
 
 def _detect_posix_shell() -> list[str] | None:
     """Return a POSIX shell argv prefix for Windows hosts, or None on POSIX systems.
@@ -557,7 +613,7 @@ class ToolManager:
         # list_tools round-trip to every MCP server on every agent turn.
         self._tools_cache: list[dict[str, Any]] | None = None
         self._env_snapshot: str = _collect_system_environment()
-        default_cwd = Path(os.getenv("AGENT_WORKDIR", "/app")).expanduser()
+        default_cwd = Path(os.getenv("AGENT_WORKDIR", str(_PROJECT_ROOT))).expanduser()
         if not default_cwd.exists():
             default_cwd = _PROJECT_ROOT
         self.current_cwd: str = str(default_cwd.resolve())
@@ -692,14 +748,14 @@ class ToolManager:
         The server is launched via ``npx`` and granted access to *data_dir*
         only -- it cannot read or write outside that path.
 
-        *data_dir* defaults to ``/app/data``.  The directory is created if it
+        *data_dir* defaults to ``<project_root>/data``.  The directory is created if it
         does not already exist.  The server is registered under the name
         ``"filesystem"``; a previous ``"filesystem"`` connection is
         disconnected before the new one is opened.
 
         Raises ``RuntimeError`` if ``npx`` is not available on PATH.
         """
-        path = Path(data_dir).resolve() if data_dir else Path("/app/data")
+        path = Path(data_dir).resolve() if data_dir else _PROJECT_ROOT / "data"
         path.mkdir(parents=True, exist_ok=True)
 
         npx = shutil.which("npx")
@@ -926,6 +982,7 @@ class ToolManager:
             "exists": target.is_file(),
             "size_bytes": target.stat().st_size if target.exists() else 0,
             "current_working_directory": self.current_cwd,
+            "artifact_quality": _artifact_quality_for_text(content, str(target)),
         }
         return json.dumps(payload, indent=2)
 
@@ -982,6 +1039,7 @@ class ToolManager:
             "url": f"{self.public_base_url}/sites/{site_slug}/",
             "index_exists": (destination / "index.html").is_file(),
             "files": copied_files[:50],
+            "artifact_quality": _artifact_quality_for_site(destination),
         }
         return json.dumps(payload, indent=2)
 

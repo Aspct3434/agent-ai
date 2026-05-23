@@ -16,6 +16,7 @@ from typing import Any
 from contract import (
     _attempted_tool_names,
     _is_continuation_signal,
+    _latest_artifact_quality,
     _latest_plan,
 )
 from evaluator import _SIDE_EFFECT_TOOLS, ExecutionStep
@@ -138,6 +139,21 @@ def _successful_tool_names(steps: list[ExecutionStep]) -> set[str]:
     }
 
 
+def _build_quality_rejection_detail(steps: list[ExecutionStep]) -> str:
+    """Return a human-readable summary of why the artifact quality gate failed."""
+    quality = _latest_artifact_quality(steps)
+    if not quality:
+        return "Quality metrics: unavailable (no artifact quality data found)."
+    lines = ["Quality metrics from the last artifact:"]
+    if quality.get("placeholder_detected"):
+        matches = quality.get("placeholder_matches", [])
+        lines.append(f"  PLACEHOLDER TEXT DETECTED: {matches[:4]}")
+    lines.append(f"  CSS rules: {quality.get('style_rule_count', 0)} (minimum 5 required)")
+    lines.append(f"  Content words: {quality.get('content_word_count', 0)} (minimum 30 required)")
+    lines.append(f"  Interactive signals: {quality.get('interactive_signal_count', 0)}")
+    return "\n".join(lines)
+
+
 def _build_contract_execution_instruction(
     contract: dict[str, Any],
     status: dict[str, Any],
@@ -164,24 +180,38 @@ def _build_contract_execution_instruction(
             if item not in {"plan", "plan_open_steps"}
         ]
         if evidence_missing:
-            if "published_static_site_url" in evidence_missing:
+            if "artifact_quality" in evidence_missing:
+                quality_detail = _build_quality_rejection_detail(_steps)
+                next_action = (
+                    "The artifact exists, but quality validation FAILED.\n"
+                    f"{quality_detail}\n"
+                    "Call write_text_file NOW and REPLACE the file with a COMPLETE, "
+                    "production-quality deliverable. The file must include:\n"
+                    "  • A full CSS design: colour palette, typography, spacing, layout\n"
+                    "  • 100+ words of real, substantive content (not placeholders)\n"
+                    "  • Visual polish: backgrounds, shadows, rounded corners, transitions\n"
+                    "  • Working JavaScript if interaction was requested\n"
+                    "Write the ENTIRE file content in one write_text_file call — do not "
+                    "hold back or truncate. Then publish/verify again."
+                )
+            elif "published_static_site_url" in evidence_missing:
                 file_written = "write_text_file" in succeeded
                 site_published = "publish_static_site" in attempted
                 if not file_written:
                     next_action = (
                         "IMMEDIATE ACTION — call write_text_file RIGHT NOW.\n"
-                        "  • path: '/workspace/index.html'\n"
+                        "  • path: 'generated_sites/site/index.html'\n"
                         "  • content: the full, complete, self-contained HTML file "
                         "(embed all CSS and JavaScript inside the single file).\n"
                         "Do NOT call update_plan before writing the file. "
                         "After write_text_file succeeds, call publish_static_site "
-                        "with path='/workspace'."
+                        "with source_path='generated_sites/site'."
                     )
                 elif not site_published:
                     next_action = (
                         "The file was written successfully. "
-                        "Call publish_static_site NOW with path='/workspace' "
-                        "(or wherever index.html was written). "
+                        "Call publish_static_site NOW with source_path set to the "
+                        "directory containing index.html. "
                         "Do NOT call update_plan before publishing."
                     )
                 else:

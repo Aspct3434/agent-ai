@@ -1,9 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
 export type ToolCallEvent = {
   type: "tool_call";
   tool: string;
@@ -17,7 +13,7 @@ export type TextEvent = {
 
 export type FinalAnswerEvent = {
   type: "final_answer";
-  /** "iteration_limit" — hit MAX_REACT_ITERATIONS; "exception" — unhandled Python error */
+  /** "iteration_limit" - hit MAX_REACT_ITERATIONS; "exception" - unhandled Python error */
   reason: "iteration_limit" | "exception" | "rate_limited" | "critical_failure";
   content: string;
 };
@@ -35,20 +31,12 @@ export interface UseAgentStreamReturn {
   events: AgentEvent[];
   streamingText: string;
   status: ConnectionStatus;
-  sendMessage: (text: string) => void;
+  sendMessage: (text: string, sessionId?: string) => void;
   clearEvents: () => void;
 }
 
-// ---------------------------------------------------------------------------
-// Reconnect constants
-// ---------------------------------------------------------------------------
-
 const BASE_DELAY_MS = 1_000;
 const MAX_DELAY_MS = 30_000;
-
-// ---------------------------------------------------------------------------
-// Hook
-// ---------------------------------------------------------------------------
 
 export function useAgentStream(url: string): UseAgentStreamReturn {
   const [events, setEvents] = useState<AgentEvent[]>([]);
@@ -58,17 +46,13 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectDelayRef = useRef(BASE_DELAY_MS);
-  // Stable session ID for the lifetime of this hook instance
   const sessionIdRef = useRef(crypto.randomUUID());
-  // Always points to the latest connect() closure so onclose can call it
   const connectRef = useRef<() => void>(() => {});
-  // Prevents state updates after unmount or during url-change teardown
   const activeRef = useRef(false);
 
   useEffect(() => {
     activeRef.current = true;
     reconnectDelayRef.current = BASE_DELAY_MS;
-    setEvents([]);
 
     function connect() {
       if (!activeRef.current) return;
@@ -83,11 +67,11 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
         setStatus("connected");
       };
 
-      ws.onmessage = (ev) => {
+      ws.onmessage = (event) => {
         if (!activeRef.current) return;
         let payload: unknown;
         try {
-          payload = JSON.parse(ev.data as string);
+          payload = JSON.parse(event.data as string);
         } catch {
           return;
         }
@@ -98,23 +82,23 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
         ) {
           return;
         }
-        const p = payload as { type: string };
-        if (p.type === "token") {
-          setStreamingText((prev) => prev + (p as TokenEvent).content);
+
+        const parsed = payload as { type: string };
+        if (parsed.type === "token") {
+          setStreamingText((previous) => previous + (parsed as TokenEvent).content);
         } else if (
-          p.type === "tool_call" ||
-          p.type === "text" ||
-          p.type === "final_answer"
+          parsed.type === "tool_call" ||
+          parsed.type === "text" ||
+          parsed.type === "final_answer"
         ) {
-          if (p.type === "text" || p.type === "final_answer") {
+          if (parsed.type === "text" || parsed.type === "final_answer") {
             setStreamingText("");
           }
-          setEvents((prev) => [...prev, p as AgentEvent]);
+          setEvents((previous) => [...previous, parsed as AgentEvent]);
         }
       };
 
       ws.onerror = () => {
-        // onclose always fires after onerror, so just let onclose drive reconnect
         ws.close();
       };
 
@@ -131,8 +115,6 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
       };
     }
 
-    // Keep the ref current so the onclose closure above always calls the right
-    // version even after the url changes and this effect re-runs
     connectRef.current = connect;
     connect();
 
@@ -147,10 +129,10 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
     };
   }, [url]);
 
-  const sendMessage = useCallback((text: string) => {
+  const sendMessage = useCallback((text: string, sessionId?: string) => {
     const ws = socketRef.current;
     if (ws?.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ session_id: sessionIdRef.current, text }));
+    ws.send(JSON.stringify({ session_id: sessionId ?? sessionIdRef.current, text }));
   }, []);
 
   const clearEvents = useCallback(() => {
