@@ -30,12 +30,11 @@ WORKDIR /app
 COPY --from=builder /install /usr/local
 
 # Runtime system packages:
-#  curl            — needed by rustup and any agent task that fetches URLs
-#  ca-certificates — required by cargo/rustup TLS when downloading from crates.io;
-#                    without this, every `cargo build` that pulls from the registry
-#                    fails TLS verification silently, even when internet is reachable
-#  git             — cargo fetches git-source dependencies; also common agent tool
-#  build-essential — gcc/make so the agent can compile native crates (e.g. openssl-sys)
+#  ca-certificates — required by rustup/cargo TLS and any HTTPS curl from the agent;
+#                    python:3.12-slim ships without this, so cargo silently fails TLS
+#  curl            — needed by rustup installer and agent wget-style fetches
+#  git             — cargo fetches git-source deps; also a common agent tool
+#  build-essential — gcc/make to compile native Rust crates (e.g. ring, openssl-sys)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -43,7 +42,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Application source
+# ── Pre-install Rust toolchain (system-wide) ───────────────────────────────
+# Install rustup/cargo/rustc into /usr/local/{rustup,cargo} so every user
+# (including the non-root `agent`) can compile Rust without a per-user download.
+#
+# Design choices:
+#   --profile minimal   → toolchain only (no clippy/rustfmt/docs) — saves ~300 MB
+#   --no-modify-path    → we manage PATH via ENV below; no shell-rc edits needed
+#   chmod a+rwx         → agent user can write the registry/build cache to CARGO_HOME
+#
+# Result: `rustc --version` and `cargo build` work immediately as the agent user,
+# and the zero-dependency built-in skill (build_std_rust_http_server) can build
+# offline without touching crates.io at all.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --default-toolchain stable --profile minimal \
+    && chmod -R a+rwx /usr/local/rustup /usr/local/cargo \
+    && rustc --version \
+    && cargo --version
+
+# Application source (includes src/builtin_skills/ for zero-dep Rust skill)
 COPY src/ ./src/
 
 # Dedicated non-root user WITH a home directory so that rustup/cargo work

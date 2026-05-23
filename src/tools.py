@@ -1370,11 +1370,32 @@ def _tail_file(raw_path: str, max_bytes: int = 4000) -> dict[str, Any]:
 # Skills-server bootstrap helpers
 # ---------------------------------------------------------------------------
 
+# Built-in skills live alongside the source tree so they're baked into the
+# Docker image.  On every start-up they are copied (overwritten) into the
+# writable skills volume so the agent MCP server can serve them.
+_BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "builtin_skills"
+
+
 def _ensure_skills_dir(skills_dir: Path) -> None:
-    """Create *skills_dir* and write the two bootstrap files if absent."""
+    """Create *skills_dir*, write bootstrap files, and deploy built-in skills.
+
+    Bootstrap files (_skill.py, server.py) are written only if absent so that
+    manual edits are not overwritten.  Built-in skills (from src/builtin_skills/)
+    are always written so that image updates propagate on restart.
+    """
     skills_dir.mkdir(parents=True, exist_ok=True)
     _write_if_absent(skills_dir / "_skill.py", _SKILL_DECORATOR_SRC)
     _write_if_absent(skills_dir / "server.py", _SKILLS_SERVER_SRC)
+
+    # Deploy built-in skills unconditionally (overwrite so updates land on restart)
+    if _BUILTIN_SKILLS_DIR.is_dir():
+        for src_file in sorted(_BUILTIN_SKILLS_DIR.glob("*.py")):
+            dest = skills_dir / src_file.name
+            try:
+                dest.write_text(src_file.read_text(encoding="utf-8"), encoding="utf-8")
+                logger.debug("Deployed built-in skill: %s → %s", src_file.name, dest)
+            except OSError as exc:
+                logger.warning("Could not deploy built-in skill %s: %s", src_file.name, exc)
 
 
 def _write_if_absent(path: Path, content: str) -> None:

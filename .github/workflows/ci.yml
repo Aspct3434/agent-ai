@@ -61,6 +61,7 @@ jobs:
                  tests/test_gateway_unit.py \
                  tests/test_coverage_boost.py \
                  tests/test_property.py \
+                 tests/test_rust_server_scenario.py \
                  -v --tb=short
         env:
           PYTHONPATH: src
