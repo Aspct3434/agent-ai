@@ -79,8 +79,8 @@ _PROBED_RUNTIMES = (
     "curl", "wget", "git",
     # Container / orchestration
     "docker", "docker-compose",
-    # Package managers
-    "npm", "pip", "pip3",
+    # Package managers / scaffolders — npx is how React/Vite/Next apps are created
+    "npm", "npx", "pip", "pip3",
 )
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ GET_SYSTEM_ENVIRONMENT_TOOL: dict[str, Any] = {
     "description": (
         "Return a JSON snapshot of the host system environment. Includes: OS type, "
         "disk space, which runtimes are on PATH (rustc, cargo, gcc, make, curl, wget, "
-        "git, node, python, docker, npm, and more), the active shell, and critically "
+        "git, node, npm, npx, python, docker, and more), the active shell, and critically "
         "the running user identity with is_root and sudo_available flags. "
         "ALWAYS call this first before attempting any package install (apt-get, "
         "rustup, npm, pip) so you know whether system-level installs will succeed "
@@ -1418,9 +1418,12 @@ def _collect_system_environment() -> str:
     }
     if not is_root and not sudo_available:
         user_info["warning"] = (
-            "Running as non-root without sudo. Package managers (apt-get, yum, brew) "
-            "will fail. Use rustup to ~/.cargo, pip install --user, or nvm for "
-            "per-user toolchain installs instead."
+            "Running as non-root without sudo, so system package managers (apt-get, "
+            "yum, brew) will fail -- do NOT attempt them. The common toolchains are "
+            "already pre-installed system-wide: check the 'runtimes' block above for "
+            "node/npm/npx, python/pip, and rustc/cargo before assuming anything is "
+            "missing. For extra Python packages use 'pip install --user'; for extra "
+            "npm packages prefer a local project install (npm install in the project)."
         )
 
     return json.dumps(

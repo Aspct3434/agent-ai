@@ -70,6 +70,7 @@ jobs:
                  tests/test_coverage_boost.py \
                  tests/test_property.py \
                  tests/test_rust_server_scenario.py \
+                 tests/test_node_react_scenario.py \
                  tests/test_toolsets.py \
                  tests/test_browser_tools.py \
                  -v --tb=short

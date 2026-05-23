@@ -78,6 +78,29 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustc --version \
     && cargo --version
 
+# ── Pre-install Node.js + npm + npx (system-wide) ──────────────────────────
+# A request for a React / Vue / Vite / Next app needs Node + npm. The container
+# runs as the non-root `agent` user, which cannot apt-get install anything, so —
+# exactly as with the Rust toolchain above — we bake Node in at build time.
+# The official binary tarball is extracted into /usr/local, putting node/npm/npx
+# on PATH for every user with no per-user download and no NodeSource apt repo.
+# Without this, "build a React site" hits a missing-runtime wall and the agent
+# wastes its whole budget trying (and failing) to apt-get nodejs as non-root.
+ENV NODE_VERSION=20.18.1
+
+RUN ARCH="$(dpkg --print-architecture)" \
+    && case "$ARCH" in \
+         amd64) NODE_ARCH="x64" ;; \
+         arm64) NODE_ARCH="arm64" ;; \
+         *) echo "Unsupported architecture for Node install: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" -o /tmp/node.tar.xz \
+    && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+    && rm /tmp/node.tar.xz \
+    && node --version \
+    && npm --version \
+    && npx --version
+
 # Application source (includes src/builtin_skills/ for zero-dep Rust skill)
 COPY src/ ./src/
 
