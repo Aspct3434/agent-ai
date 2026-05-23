@@ -12,31 +12,51 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-password}
       CHROMA_PATH: /app/chroma_data
       SKILLS_DIR: /app/skills
-      SQLITE_DB_PATH: /app/test.db
-      CHECKPOINT_DB_PATH: /app/checkpoints.db
+      SQLITE_DB_PATH: /app/data/agent.db
+      CHECKPOINT_DB_PATH: /app/data/checkpoints.db
       PUBLISHED_SITES_DIR: /app/published_sites
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      # Dedicated writable sandbox directory for all agent file operations.
+      # Keeps agent-generated files out of /app root and inside a capped volume.
+      AGENT_WORKDIR: /app/workspace
       AGENT_MAX_REACT_ITERATIONS: ${AGENT_MAX_REACT_ITERATIONS:-16}
-      AGENT_MAX_TOKENS: ${AGENT_MAX_TOKENS:-16384}
+      AGENT_MAX_TOKENS: ${AGENT_MAX_TOKENS:-32768}
       AGENT_RATE_LIMIT_RETRIES: ${AGENT_RATE_LIMIT_RETRIES:-2}
       AGENT_RATE_LIMIT_BASE_DELAY: ${AGENT_RATE_LIMIT_BASE_DELAY:-15}
       AGENT_BOOTSTRAP_SESSION: ${AGENT_BOOTSTRAP_SESSION:-false}
       AGENT_USE_HYBRID_MEMORY: ${AGENT_USE_HYBRID_MEMORY:-true}
     volumes:
-      - ./skills:/app/skills
-      - ./chroma_data:/app/chroma_data
-      - ./published_sites:/app/published_sites
+      # Named volumes — agent writes stay inside Docker's managed storage,
+      # never touching arbitrary paths on the host filesystem.
+      - agent_data:/app/data
+      - agent_skills:/app/skills
+      - agent_chroma:/app/chroma_data
+      - agent_published:/app/published_sites
+      - agent_workspace:/app/workspace
+    tmpfs:
+      # /tmp capped at 512 MB so large builds can't exhaust host disk.
+      - /tmp:size=512m,mode=1777
     depends_on:
       - neo4j
     networks:
       - agent_internal
-    # Resource limits: prevent runaway tasks from consuming the host
+    # ── Resource hard limits ───────────────────────────────────────────────
     deploy:
       resources:
         limits:
           memory: 2G
           cpus: "2.0"
-    # Drop capabilities not needed for a web service
+          # pids caps total PIDs in the container so a runaway agent loop or
+          # fork bomb cannot exhaust the host process table.
+          pids: 256
+    ulimits:
+      nproc:
+        soft: 256
+        hard: 512
+      nofile:
+        soft: 4096
+        hard: 8192
+    # ── Linux capability hardening ─────────────────────────────────────────
     cap_drop:
       - ALL
     cap_add:
@@ -67,5 +87,10 @@ networks:
     driver: bridge
 
 volumes:
+  agent_data:
+  agent_skills:
+  agent_chroma:
+  agent_published:
+  agent_workspace:
   neo4j_data:
   neo4j_logs:

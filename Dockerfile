@@ -109,7 +109,7 @@ COPY src/ ./src/
 # The shell is set to /bin/bash (not nologin) so execute_terminal_command works.
 RUN groupadd --gid 1001 agent \
     && useradd --uid 1001 --gid agent --create-home --shell /bin/bash agent \
-    && mkdir -p /app/data /app/published_sites /app/skills /app/chroma_data \
+    && mkdir -p /app/data /app/published_sites /app/skills /app/chroma_data /app/workspace \
     && chown -R agent:agent /app
 
 USER agent
@@ -117,7 +117,7 @@ USER agent
 EXPOSE 8000
 
 # Persist state across container restarts
-VOLUME ["/app/data", "/app/published_sites", "/app/skills", "/app/chroma_data"]
+VOLUME ["/app/data", "/app/published_sites", "/app/skills", "/app/chroma_data", "/app/workspace"]
 
 # Liveness probe — gateway exposes GET /health → {"status": "ok"}
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
