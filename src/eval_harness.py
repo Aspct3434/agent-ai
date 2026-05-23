@@ -313,6 +313,15 @@ LIVE_TASKS: list[EvalTask] = [
         check=_check_file("/tmp/eval-cats/index.html"),
         tags=["action", "website"],
     ),
+    # Regression: the agent previously stalled after update_plan without calling
+    # write_text_file when the user asked for an "interactive website" without
+    # naming a framework. Fixed by giving concrete step-by-step guidance.
+    EvalTask(
+        id="interactive_sleep_site",
+        prompt="Create an interactive website about the importance of sleep.",
+        check=_check_file("/workspace/index.html"),
+        tags=["action", "website", "regression"],
+    ),
 ]
 
 
