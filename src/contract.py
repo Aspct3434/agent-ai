@@ -757,81 +757,115 @@ def _repeated_command_message(tool_name: str, command: Any) -> str:
     )
 
 
-# Maximum consecutive get_filesystem_process_evidence calls that probe the
-# same port(s) and receive connectable=false before the next one is blocked
-# and the agent is directed to use wait_for_port instead.
-_MAX_CONSECUTIVE_PORT_POLL_FAILURES = max(
-    1, int(os.getenv("AGENT_MAX_PORT_POLL_FAILURES", "2"))
+# ---------------------------------------------------------------------------
+# Generic identical-tool-call anti-spin guard
+#
+# Applies to EVERY tool (not just host commands or port checks): re-issuing the
+# same tool with the same arguments, with no host/world state change in between,
+# cannot return new information — it just burns API calls and rate-limit budget.
+# The host-command guard above is the special case for terminal/background
+# commands; this covers all the read/evidence/research tools (filesystem &
+# process checks, web_fetch/web_search, get_system_environment, db reads, etc.).
+# ---------------------------------------------------------------------------
+
+# Tools exempt from the generic cap: repeating them with identical args is
+# legitimate paging / internal blocking / one-shot control rather than a spin.
+_REPEAT_CAP_EXEMPT_TOOLS: frozenset[str] = frozenset(
+    {
+        "expand_tool_output",  # deliberate paging through a large output handle
+        "set_task_contract",   # at most once per task anyway
+        "update_plan",         # plan-loop control; capping risks a contract deadlock
+        "wait_for_port",       # blocks internally; a repeat is a deliberate longer wait
+        "delegate_task",       # sub-agent dispatch; each run can differ
+    }
+)
+
+# Host-execution tools have their own command-signature guard
+# (_host_command_runs_since_state_change); exclude them here to avoid double
+# counting and to preserve that path's specialised escalation messaging.
+_GENERIC_CAP_SKIP_TOOLS: frozenset[str] = _REPEAT_CAP_EXEMPT_TOOLS | _HOST_EXECUTION_TOOLS
+
+# How many times one tool may be called with identical arguments since the last
+# state change before further identical calls are short-circuited. Env-tunable.
+_MAX_IDENTICAL_TOOL_CALLS = max(
+    1, int(os.getenv("AGENT_MAX_IDENTICAL_TOOL_CALLS", "3"))
 )
 
 
-def _consecutive_port_poll_failures(
-    steps: list[ExecutionStep],
-    ports: list[int],
-) -> int:
-    """Count consecutive get_filesystem_process_evidence calls that probed
-    *ports* and all returned connectable=false, since the last background
-    service launch or state change.
+def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
+    """Stable signature for a (tool, args) pair so identical calls compare equal."""
+    try:
+        args_repr = json.dumps(arguments or {}, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        args_repr = str(arguments)
+    return f"{tool_name}::{args_repr}"
 
-    Used to block poll-loops where the agent calls get_filesystem_process_evidence
-    repeatedly while waiting for a slow service to bind (e.g. a JVM server).
-    The guard redirects to wait_for_port which handles the wait in one API call.
+
+def _is_state_change_reset(step: ExecutionStep) -> bool:
+    """True if *step* is a successful state-changing event that should reset the
+    identical-call window (a write, db mutation, or background-service launch).
+
+    A changed world means a previously-identical read can now legitimately
+    return something new, so the counter restarts after such an event.
     """
-    if not ports:
-        return 0
-    target = frozenset(int(p) for p in ports)
+    if step.kind != "tool_result" or step.metadata.get("is_error"):
+        return False
+    name = step.metadata.get("tool_name")
+    return name in _STATE_CHANGING_TOOLS or name == "execute_background_service"
+
+
+def _identical_tool_call_runs_since_state_change(
+    steps: list[ExecutionStep],
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> int:
+    """Count prior calls of *tool_name* with identical *arguments* since the most
+    recent state-changing success.
+
+    Generalises the host-command anti-thrash guard to every tool. Any successful
+    write / db mutation / service launch resets the window, so only calls
+    repeated with no intervening state change accumulate toward the cap.
+    """
+    signature = _tool_call_signature(tool_name, arguments)
+
+    start = 0
+    for index, step in enumerate(steps):
+        if _is_state_change_reset(step):
+            start = index + 1
 
     count = 0
-    # Walk backward through steps; stop counting when we see a successful
-    # background service launch (= state changed) or a connectable port result.
-    for step in reversed(steps):
+    for step in steps[start:]:
         if step.kind != "tool_result":
             continue
-        name = step.metadata.get("tool_name")
-
-        # A new background service launch resets the window.
-        if name == "execute_background_service" and not step.metadata.get("is_error"):
-            break
-
-        # Any state-changing write also resets the window.
-        if name in _STATE_CHANGING_TOOLS and not step.metadata.get("is_error"):
-            break
-
-        if name != "get_filesystem_process_evidence":
+        if step.metadata.get("tool_name") != tool_name:
             continue
-
-        # Only count calls that probed the same (or a superset of) ports.
-        args = step.metadata.get("arguments") or {}
-        checked = frozenset(int(p) for p in (args.get("ports") or []))
-        if not checked.issuperset(target):
-            # Different port set — stop the backward scan.
-            break
-
-        # Check if any target port was connectable in this result.
-        try:
-            data = json.loads(step.content)
-            for port_info in data.get("ports", []):
-                if int(port_info.get("port", -1)) in target and port_info.get("connectable"):
-                    return count  # port was open at some point; reset
-        except (TypeError, json.JSONDecodeError, ValueError):
-            pass
-
-        count += 1
-
+        if _tool_call_signature(tool_name, step.metadata.get("arguments") or {}) == signature:
+            count += 1
     return count
 
 
-def _port_poll_block_message(ports: list[int]) -> str:
-    port_str = ", ".join(str(p) for p in ports)
+def _repeated_tool_call_message(tool_name: str, arguments: dict[str, Any]) -> str:
+    """Block message for a repeated identical tool call, tailored per tool."""
+    args = arguments or {}
+    # Port checks are the most common poll-loop — point at the right primitive.
+    if tool_name == "get_filesystem_process_evidence" and args.get("ports"):
+        ports = ", ".join(str(p) for p in args["ports"])
+        return (
+            f"[skipped: poll loop] You have checked port(s) {ports} repeatedly with "
+            "no change, so this was NOT run again. Polling burns API calls and the "
+            "rate-limit budget. Call wait_for_port instead — it blocks internally "
+            "until the port opens (or times out) in a single turn. If the service "
+            "failed to start, read the log first: "
+            "execute_terminal_command('cat /tmp/background_task.log')."
+        )
     return (
-        f"[skipped: poll loop detected] You have checked port(s) {port_str} "
-        f"{_MAX_CONSECUTIVE_PORT_POLL_FAILURES} times in a row and they are still "
-        "not open. Continuing to poll burns API calls without progress. "
-        "Instead: call wait_for_port to wait efficiently — it blocks internally "
-        "until the port opens (or the timeout expires) without requiring more LLM "
-        "turns. If the service failed to start, read the background log first: "
-        "execute_terminal_command('cat /tmp/background_task.log') to diagnose the "
-        "error before retrying."
+        f"[skipped: repeated call] You have already called {tool_name} with these "
+        "exact arguments several times with nothing changing in between, so it was "
+        "NOT run again — an identical call cannot return new information. Use the "
+        "result you already have and move on. If you are waiting for something to "
+        "finish, wait ONCE (wait_for_port for a service port, or a single blocking "
+        "command) instead of polling; if a previous step failed, fix the underlying "
+        "cause rather than re-checking the same thing."
     )
 
 

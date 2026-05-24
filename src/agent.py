@@ -14,25 +14,26 @@ from pydantic import BaseModel
 
 from checkpointer import StateCheckpointer
 from contract import (
+    _GENERIC_CAP_SKIP_TOOLS,
     _HOST_EXECUTION_TOOLS,
-    _MAX_CONSECUTIVE_PORT_POLL_FAILURES,
     _MAX_IDENTICAL_COMMAND_RUNS,
+    _MAX_IDENTICAL_TOOL_CALLS,
     _TASK_CONTRACT_TOOL,
     _attempted_tool_names,
     _blocked_action_tool_message,
     _build_incomplete_contract_cap_message,
     _build_task_contract_instruction,
     _can_stream_text_before_final,
-    _consecutive_port_poll_failures,
     _contract_completion_status,
     _duplicate_command_message,
     _filter_tool_schemas,
     _host_command_runs_since_state_change,
+    _identical_tool_call_runs_since_state_change,
     _last_host_command,
     _latest_task_contract,
     _normalize_command,
-    _port_poll_block_message,
     _repeated_command_message,
+    _repeated_tool_call_message,
     _run_set_task_contract,
     _should_block_tool_for_action_task,
     _tool_names_for_contract_status,
@@ -1496,25 +1497,24 @@ class AgentEngine:
         serial = [c for c in calls if c[1] not in _PARALLEL_SAFE_TOOLS]
 
         if parallel:
-            # Pre-screen parallel tools: block get_filesystem_process_evidence
-            # calls that are polling the same port(s) that keep returning
-            # connectable=false.  The agent should use wait_for_port instead,
-            # which handles the entire wait in a single LLM turn.
+            # Pre-screen parallel (read-only) tools with the generic anti-spin
+            # guard: any tool re-issued with identical arguments and no state
+            # change in between cannot return new information, so it is blocked
+            # instead of burning an API call. Covers port polling, file/process
+            # re-checks, repeated web_fetch/web_search, get_system_environment, etc.
             parallel_to_run: list[tuple[str, str, dict[str, Any]]] = []
             for tc_id, name, args in parallel:
-                if name == "get_filesystem_process_evidence":
-                    ports = [int(p) for p in (args.get("ports") or [])]
-                    if (
-                        ports
-                        and _consecutive_port_poll_failures(steps, ports)
-                        >= _MAX_CONSECUTIVE_PORT_POLL_FAILURES
-                    ):
-                        results[tc_id] = (
-                            _port_poll_block_message(ports),
-                            True,
-                            "__builtin__",
-                        )
-                        continue
+                if (
+                    name not in _GENERIC_CAP_SKIP_TOOLS
+                    and _identical_tool_call_runs_since_state_change(steps, name, args)
+                    >= _MAX_IDENTICAL_TOOL_CALLS
+                ):
+                    results[tc_id] = (
+                        _repeated_tool_call_message(name, args),
+                        True,
+                        "__builtin__",
+                    )
+                    continue
                 parallel_to_run.append((tc_id, name, args))
 
             gathered = await asyncio.gather(
@@ -1554,6 +1554,15 @@ class AgentEngine:
                 results[tc_id] = (_repeated_command_message(name, cmd), True, "__builtin__")
             elif cmd and cmd == last_host_cmd:
                 results[tc_id] = (_duplicate_command_message(name), False, "__builtin__")
+            elif (
+                not cmd
+                and name not in _GENERIC_CAP_SKIP_TOOLS
+                and _identical_tool_call_runs_since_state_change(steps, name, args)
+                >= _MAX_IDENTICAL_TOOL_CALLS
+            ):
+                # Generic anti-spin guard for non-host serial tools (e.g. MCP
+                # reads): identical call, no state change, no new information.
+                results[tc_id] = (_repeated_tool_call_message(name, args), True, "__builtin__")
             else:
                 results[tc_id] = await self._execute_single_tool(name, args, messages, tool_index)
                 if cmd:
