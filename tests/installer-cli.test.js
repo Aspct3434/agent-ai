@@ -132,4 +132,39 @@ function assertIncludes(text, expected) {
   assertIncludes(result.stdout, "npx @aspct3434/agent-ai doctor");
 }
 
-console.log("installer CLI tests passed");
+// Secret prompts echo one "*" per character on an interactive terminal so the
+// user gets visible feedback without revealing the token (OpenClaw-style).
+{
+  const { EventEmitter } = require("events");
+  const { Prompter } = require(path.join(root, "lib", "agent-ai-cli.js"));
+
+  const input = new EventEmitter();
+  input.isTTY = true;
+  input.isRaw = false;
+  input.setRawMode = (v) => { input.isRaw = v; };
+  input.resume = () => {};
+  input.pause = () => {};
+  input.setEncoding = () => {};
+
+  let out = "";
+  const output = { write: (t) => { out += t; } };
+
+  const prompter = new Prompter({ input, output });
+  const promise = prompter.secretQuestion("Token: ");
+  input.emit("data", "abc");                          // 3 chars → "***"
+  input.emit("data", String.fromCharCode(127));       // backspace → erase one
+  input.emit("data", "Xy");                            // 2 chars → "**"
+  input.emit("data", "\r");                            // Enter → submit
+
+  promise.then((value) => {
+    const stars = (out.match(/\*/g) || []).length;
+    assert.strictEqual(value, "abXy", "secret value should reflect typed input minus backspace");
+    assert.strictEqual(stars, 5, "should echo one '*' per typed character");
+    assert(out.includes("\b \b"), "backspace should erase a masked character");
+    assert.strictEqual(input.isRaw, false, "raw mode must be restored after input");
+    console.log("installer CLI tests passed");
+  }).catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
