@@ -73,6 +73,9 @@ jobs:
                  tests/test_plan_contract_robustness.py \
                  tests/test_toolsets.py \
                  tests/test_browser_tools.py \
+                 tests/test_telegram_adapter.py \
+                 tests/test_discord_adapter.py \
+                 tests/test_sandbox_selfheal.py \
                  -v --tb=short
         env:
           PYTHONPATH: src

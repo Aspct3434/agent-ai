@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -293,179 +294,19 @@ _AGENT_BACKGROUND_LOG_PATH = (
 )
 
 
-class _DockerSandbox:
-    """A long-lived Docker container used as an isolated command execution sandbox.
+class _ScriptSandbox:
+    """Shared behaviour for sandboxes that run Linux Python helpers.
 
-    One instance is created per ``ToolManager`` when ``AGENT_SANDBOX=docker``.
-    The container runs ``sleep infinity`` so it stays alive between commands;
-    each command is executed via ``docker exec``. The agentic workspace lives
-    inside the container at ``/workspace`` rather than bind-mounting the host
-    project directory, so general agent tasks cannot mutate the repo or host OS.
+    Both the Docker and SSH backends execute the agent's commands on a Linux
+    host, so the file-write, evidence-collection, and HTTP-proxy helpers are
+    identical Python scripts fed a JSON payload on stdin. Only the *transport*
+    differs (``docker exec`` vs ``ssh``), so subclasses implement just
+    :meth:`_run_python`. Keeping the scripts here prevents the two backends
+    from drifting apart and guarantees every backend supports the full tool
+    surface (writing files, collecting evidence, proxying HTTP).
     """
 
-    def __init__(self, image: str, host_workdir: str) -> None:
-        self._image = image
-        self._host_workdir = host_workdir
-        self._container_id: str | None = None
-        self._name = f"agent-sandbox-{os.getpid()}"
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
-    def start(self) -> None:
-        """Pull image (if needed) and start the sandbox container."""
-        # Stop any leftover container from a previous run with the same name.
-        subprocess.run(
-            ["docker", "stop", "-t", "2", self._name],
-            capture_output=True, timeout=10,
-        )
-
-        result = subprocess.run(
-            self._docker_run_command(),
-            capture_output=True, text=True, timeout=120,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Docker sandbox failed to start (exit {result.returncode}): "
-                f"{result.stderr.strip()}"
-            )
-
-        self._container_id = result.stdout.strip()
-        # Ensure the workspace dir exists inside the container.
-        subprocess.run(
-            ["docker", "exec", self._container_id, "mkdir", "-p", _SANDBOX_WORKDIR],
-            capture_output=True, timeout=10,
-        )
-        # Install baseline packages (curl, wget, git, …) that slim images lack.
-        self._install_baseline_packages()
-        logger.info(
-            "Docker sandbox started: container=%s image=%s container_workdir=%s",
-            self._container_id[:12], self._image, _SANDBOX_WORKDIR,
-        )
-
-    def _install_baseline_packages(self) -> None:
-        """Install essential packages that slim Docker images do not include.
-
-        Without these, nearly every real task fails on the first download,
-        clone, or archive extraction. The list is env-tunable via
-        ``AGENT_SANDBOX_BASELINE_PACKAGES``.
-        """
-        if not _SANDBOX_BASELINE_PACKAGES:
-            return
-        pkgs = " ".join(_SANDBOX_BASELINE_PACKAGES)
-        logger.info("Installing sandbox baseline packages: %s …", pkgs)
-        result = subprocess.run(
-            [
-                "docker", "exec", self._container_id, "bash", "-c",
-                f"apt-get update -qq && apt-get install -y -qq {pkgs} 2>&1 | tail -5",
-            ],
-            capture_output=True, text=True, timeout=180,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                "Sandbox baseline package install failed (exit %d): %s",
-                result.returncode, (result.stderr or result.stdout)[:300],
-            )
-        else:
-            logger.info("Sandbox baseline packages installed successfully.")
-
-    def _docker_run_command(self) -> list[str]:
-        """Return the docker run command used to create the sandbox."""
-        command = [
-            "docker", "run", "-d", "--rm",
-            "--name", self._name,
-            "--memory", _SANDBOX_MEMORY,
-            "--cpus", _SANDBOX_CPUS,
-            "--pids-limit", _SANDBOX_PIDS,
-            "--cap-drop", "ALL",
-        ]
-        for cap in _SANDBOX_PACKAGE_CAPS:
-            command.extend(["--cap-add", cap])
-        command.extend(
-            [
-                "--cap-add", "NET_BIND_SERVICE",
-                "--security-opt", "no-new-privileges",
-                "-w", _SANDBOX_WORKDIR,
-                self._image,
-                "sleep", "infinity",
-            ]
-        )
-        return command
-
-    def stop(self) -> None:
-        """Stop and remove the sandbox container."""
-        if self._container_id:
-            subprocess.run(
-                ["docker", "stop", "-t", "3", self._container_id],
-                capture_output=True, timeout=15,
-            )
-            self._container_id = None
-            logger.info("Docker sandbox stopped.")
-
-    @property
-    def container_id(self) -> str:
-        if not self._container_id:
-            raise RuntimeError("Docker sandbox is not running.")
-        return self._container_id
-
-    # ------------------------------------------------------------------
-    # Command execution
-    # ------------------------------------------------------------------
-
-    async def exec_async(
-        self, command: str, cwd: str, timeout: float
-    ) -> tuple[int, str, str]:
-        """Run *command* inside the container at *cwd* and await its output."""
-        def _run() -> subprocess.CompletedProcess[str]:
-            return subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    "-w",
-                    cwd,
-                    self.container_id,
-                    "bash",
-                    "-c",
-                    command,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-
-        try:
-            result = await asyncio.to_thread(_run)
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError from exc
-        return result.returncode, result.stdout, result.stderr
-
-    def exec_background(self, command: str, cwd: str, log_path: str) -> int | None:
-        """Launch *command* detached inside the container; output appends to *log_path*."""
-        wrapped = (
-            f"cd {shlex.quote(cwd)} && "
-            f"nohup bash -lc {shlex.quote(command)} "
-            f">> {shlex.quote(log_path)} 2>&1 < /dev/null & echo $!"
-        )
-        try:
-            result = subprocess.run(
-                ["docker", "exec", self.container_id, "bash", "-c", wrapped],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                logger.warning("sandbox exec_background failed: %s", result.stderr)
-                return None
-            return int(result.stdout.strip().splitlines()[-1])
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            logger.warning("sandbox exec_background failed: %s", exc)
-            return None
-
-    def write_text_file(self, path: str, content: str) -> dict[str, Any]:
-        """Write a UTF-8 text file inside the container workspace."""
-        script = r"""
+    _WRITE_SCRIPT = r"""
 import json, os, sys
 
 req = json.load(sys.stdin)
@@ -482,29 +323,8 @@ print(json.dumps({
     "size_bytes": st.st_size,
 }))
 """
-        result = subprocess.run(
-            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
-            input=json.dumps({"path": path, "content": content}),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "sandbox file write failed")
-        return json.loads(result.stdout)
 
-    def collect_evidence_json(
-        self,
-        *,
-        paths: list[str] | None = None,
-        pids: list[int] | None = None,
-        process_names: list[str] | None = None,
-        ports: list[int] | None = None,
-        include_background_log: bool = True,
-        cwd: str = _SANDBOX_WORKDIR,
-    ) -> dict[str, Any]:
-        """Inspect paths, processes, ports, and logs from inside the sandbox."""
-        script = r"""
+    _EVIDENCE_SCRIPT = r"""
 import json, os, socket, sys, time
 
 req = json.load(sys.stdin)
@@ -617,7 +437,7 @@ def tail_file(path, max_bytes=4000):
 
 cwd = req.get("cwd") or "/workspace"
 out = {
-    "scope": "docker_sandbox",
+    "scope": req.get("scope") or "docker_sandbox",
     "current_working_directory": cwd,
     "paths": [inspect_path(p, cwd) for p in req.get("paths") or []],
     "pids": [inspect_pid(int(p)) for p in req.get("pids") or []],
@@ -625,42 +445,11 @@ out = {
     "ports": [inspect_port(int(p)) for p in req.get("ports") or []],
 }
 if req.get("include_background_log", True):
-    out["background_log"] = tail_file("/tmp/background_task.log")
+    out["background_log"] = tail_file(req.get("background_log_path") or "/tmp/background_task.log")
 print(json.dumps(out))
 """
-        payload = json.dumps(
-            {
-                "cwd": cwd,
-                "paths": paths or [],
-                "pids": pids or [],
-                "process_names": process_names or [],
-                "ports": ports or [],
-                "include_background_log": include_background_log,
-            }
-        )
-        result = subprocess.run(
-            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "sandbox evidence failed")
-        return json.loads(result.stdout)
 
-    def fetch_http_json(
-        self,
-        *,
-        port: int,
-        path: str,
-        query: str,
-        method: str,
-        headers: dict[str, str],
-        body_b64: str,
-    ) -> dict[str, Any]:
-        """Fetch an HTTP URL from inside the sandbox for the backend proxy."""
-        script = r"""
+    _HTTP_SCRIPT = r"""
 import base64, json, sys, urllib.error, urllib.request
 
 req = json.load(sys.stdin)
@@ -691,7 +480,59 @@ except urllib.error.HTTPError as exc:
         "body_b64": base64.b64encode(payload).decode("ascii"),
     }))
 """
-        payload = json.dumps(
+
+    # Backend-specific transport. Runs *script* on the Linux host with *payload*
+    # serialised to JSON on stdin and returns the parsed JSON the script prints.
+    def _run_python(self, script: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        raise NotImplementedError
+
+    # Subclasses override to label evidence with their own sandbox mode.
+    _evidence_scope: str = "docker_sandbox"
+
+    def write_text_file(self, path: str, content: str) -> dict[str, Any]:
+        """Write a UTF-8 text file inside the sandbox workspace."""
+        return self._run_python(
+            self._WRITE_SCRIPT, {"path": path, "content": content}, timeout=30
+        )
+
+    def collect_evidence_json(
+        self,
+        *,
+        paths: list[str] | None = None,
+        pids: list[int] | None = None,
+        process_names: list[str] | None = None,
+        ports: list[int] | None = None,
+        include_background_log: bool = True,
+        cwd: str = _SANDBOX_WORKDIR,
+    ) -> dict[str, Any]:
+        """Inspect paths, processes, ports, and logs from inside the sandbox."""
+        return self._run_python(
+            self._EVIDENCE_SCRIPT,
+            {
+                "cwd": cwd,
+                "scope": self._evidence_scope,
+                "paths": paths or [],
+                "pids": pids or [],
+                "process_names": process_names or [],
+                "ports": ports or [],
+                "include_background_log": include_background_log,
+            },
+            timeout=10,
+        )
+
+    def fetch_http_json(
+        self,
+        *,
+        port: int,
+        path: str,
+        query: str,
+        method: str,
+        headers: dict[str, str],
+        body_b64: str,
+    ) -> dict[str, Any]:
+        """Fetch an HTTP URL from inside the sandbox for the backend proxy."""
+        return self._run_python(
+            self._HTTP_SCRIPT,
             {
                 "port": int(port),
                 "path": path,
@@ -699,17 +540,259 @@ except urllib.error.HTTPError as exc:
                 "method": method,
                 "headers": headers,
                 "body_b64": body_b64,
-            }
-        )
-        result = subprocess.run(
-            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
-            input=payload,
-            capture_output=True,
-            text=True,
+            },
             timeout=35,
         )
+
+
+def _is_missing_container_error(stderr: str) -> bool:
+    """True if *stderr* indicates the target container is gone or stopped."""
+    text = (stderr or "").lower()
+    return "no such container" in text or "is not running" in text
+
+
+class _DockerSandbox(_ScriptSandbox):
+    """A long-lived Docker container used as an isolated command execution sandbox.
+
+    One instance is created per ``ToolManager`` when ``AGENT_SANDBOX=docker``.
+    The container runs ``sleep infinity`` so it stays alive between commands;
+    each command is executed via ``docker exec``. The agentic workspace lives
+    inside the container at ``/workspace`` rather than bind-mounting the host
+    project directory, so general agent tasks cannot mutate the repo or host OS.
+    """
+
+    def __init__(self, image: str, host_workdir: str) -> None:
+        self._image = image
+        self._host_workdir = host_workdir
+        self._container_id: str | None = None
+        self._name = f"agent-sandbox-{os.getpid()}"
+        # Guards container (re)creation so concurrent commands rebuild it once.
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Pull image (if needed) and start the sandbox container."""
+        # Force-remove any leftover container with the same name (running or
+        # stopped) so `docker run --name` cannot fail with a name collision.
+        subprocess.run(
+            ["docker", "rm", "-f", self._name],
+            capture_output=True, timeout=15,
+        )
+
+        result = subprocess.run(
+            self._docker_run_command(),
+            capture_output=True, text=True, timeout=120,
+        )
+
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "sandbox HTTP fetch failed")
+            raise RuntimeError(
+                f"Docker sandbox failed to start (exit {result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+
+        self._container_id = result.stdout.strip()
+        # Ensure the workspace dir exists inside the container.
+        subprocess.run(
+            ["docker", "exec", self._container_id, "mkdir", "-p", _SANDBOX_WORKDIR],
+            capture_output=True, timeout=10,
+        )
+        # Install baseline packages (curl, wget, git, …) that slim images lack.
+        self._install_baseline_packages()
+        logger.info(
+            "Docker sandbox started: container=%s image=%s container_workdir=%s",
+            self._container_id[:12], self._image, _SANDBOX_WORKDIR,
+        )
+
+    def _install_baseline_packages(self) -> None:
+        """Install essential packages that slim Docker images do not include.
+
+        Without these, nearly every real task fails on the first download,
+        clone, or archive extraction. The list is env-tunable via
+        ``AGENT_SANDBOX_BASELINE_PACKAGES``.
+        """
+        if not _SANDBOX_BASELINE_PACKAGES:
+            return
+        pkgs = " ".join(_SANDBOX_BASELINE_PACKAGES)
+        logger.info("Installing sandbox baseline packages: %s …", pkgs)
+        result = subprocess.run(
+            [
+                "docker", "exec", self._container_id, "bash", "-c",
+                f"apt-get update -qq && apt-get install -y -qq {pkgs} 2>&1 | tail -5",
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Sandbox baseline package install failed (exit %d): %s",
+                result.returncode, (result.stderr or result.stdout)[:300],
+            )
+        else:
+            logger.info("Sandbox baseline packages installed successfully.")
+
+    def _docker_run_command(self) -> list[str]:
+        """Return the docker run command used to create the sandbox."""
+        command = [
+            "docker", "run", "-d", "--rm",
+            "--name", self._name,
+            "--memory", _SANDBOX_MEMORY,
+            "--cpus", _SANDBOX_CPUS,
+            "--pids-limit", _SANDBOX_PIDS,
+            "--cap-drop", "ALL",
+        ]
+        for cap in _SANDBOX_PACKAGE_CAPS:
+            command.extend(["--cap-add", cap])
+        command.extend(
+            [
+                "--cap-add", "NET_BIND_SERVICE",
+                "--security-opt", "no-new-privileges",
+                "-w", _SANDBOX_WORKDIR,
+                self._image,
+                "sleep", "infinity",
+            ]
+        )
+        return command
+
+    def stop(self) -> None:
+        """Stop and remove the sandbox container."""
+        if self._container_id:
+            subprocess.run(
+                ["docker", "stop", "-t", "3", self._container_id],
+                capture_output=True, timeout=15,
+            )
+            self._container_id = None
+            logger.info("Docker sandbox stopped.")
+
+    # ------------------------------------------------------------------
+    # Self-healing
+    # ------------------------------------------------------------------
+
+    def _is_running(self) -> bool:
+        """Return True only if the cached container exists and is running."""
+        if not self._container_id:
+            return False
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", self._container_id],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def _ensure_running(self) -> None:
+        """Recreate the container if it has died, been removed, or never started.
+
+        Containers run with ``--rm``, so a Docker daemon restart, host sleep, or
+        manual ``docker stop`` removes the container entirely; the cached id then
+        points at nothing and every ``docker exec`` fails with "No such
+        container". This makes the sandbox self-healing — it transparently
+        rebuilds on the next command instead of staying broken until the whole
+        process restarts.
+        """
+        if self._is_running():
+            return
+        with self._lock:
+            # Re-check inside the lock: another thread may have just rebuilt it.
+            if self._is_running():
+                return
+            if self._container_id:
+                logger.warning(
+                    "Docker sandbox container %s is gone; recreating it.",
+                    self._container_id[:12],
+                )
+                self._container_id = None
+            self.start()
+
+    @property
+    def container_id(self) -> str:
+        if not self._container_id:
+            raise RuntimeError("Docker sandbox is not running.")
+        return self._container_id
+
+    # ------------------------------------------------------------------
+    # Command execution
+    # ------------------------------------------------------------------
+
+    async def exec_async(
+        self, command: str, cwd: str, timeout: float
+    ) -> tuple[int, str, str]:
+        """Run *command* inside the container at *cwd* and await its output."""
+        def _docker_exec() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-w",
+                    cwd,
+                    self.container_id,
+                    "bash",
+                    "-c",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+
+        def _run() -> subprocess.CompletedProcess[str]:
+            self._ensure_running()
+            result = _docker_exec()
+            # Reactive self-heal: the container can die in the narrow window
+            # between the liveness check and the exec. Rebuild once and retry.
+            if result.returncode != 0 and _is_missing_container_error(result.stderr):
+                self._container_id = None
+                self._ensure_running()
+                result = _docker_exec()
+            return result
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError from exc
+        return result.returncode, result.stdout, result.stderr
+
+    def exec_background(self, command: str, cwd: str, log_path: str) -> int | None:
+        """Launch *command* detached inside the container; output appends to *log_path*."""
+        self._ensure_running()
+        wrapped = (
+            f"cd {shlex.quote(cwd)} && "
+            f"nohup bash -lc {shlex.quote(command)} "
+            f">> {shlex.quote(log_path)} 2>&1 < /dev/null & echo $!"
+        )
+        try:
+            result = subprocess.run(
+                ["docker", "exec", self.container_id, "bash", "-c", wrapped],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning("sandbox exec_background failed: %s", result.stderr)
+                return None
+            return int(result.stdout.strip().splitlines()[-1])
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            logger.warning("sandbox exec_background failed: %s", exc)
+            return None
+
+    _evidence_scope = "docker_sandbox"
+
+    def _run_python(
+        self, script: str, payload: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        """Run *script* inside the container with *payload* JSON on stdin."""
+        self._ensure_running()
+        result = subprocess.run(
+            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "sandbox script failed")
         return json.loads(result.stdout)
 
     # ------------------------------------------------------------------
@@ -718,6 +801,7 @@ except urllib.error.HTTPError as exc:
 
     def collect_environment_json(self) -> str:
         """Return a JSON snapshot of the *container's* environment."""
+        self._ensure_running()
         probe_script = (
             "python3 -c \""
             "import json, shutil, subprocess, os, platform; "
@@ -768,7 +852,7 @@ except urllib.error.HTTPError as exc:
 # ---------------------------------------------------------------------------
 
 
-class _SSHSandbox:
+class _SSHSandbox(_ScriptSandbox):
     """Route agent commands to a remote host over SSH.
 
     Authentication uses a key file (AGENT_SSH_KEY_PATH) or falls back to the
@@ -845,6 +929,27 @@ class _SSHSandbox:
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             logger.warning("SSH exec_background failed: %s", exc)
             return None
+
+    _evidence_scope = "ssh_sandbox"
+
+    def _run_python(
+        self, script: str, payload: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        """Run *script* on the remote host with *payload* JSON piped on stdin."""
+        remote_cmd = f"python3 -c {shlex.quote(script)}"
+        try:
+            result = subprocess.run(
+                [*self._ssh_argv(), remote_cmd],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError from exc
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ssh sandbox script failed")
+        return json.loads(result.stdout)
 
     def collect_environment_json(self) -> str:
         script = (

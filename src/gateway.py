@@ -52,6 +52,7 @@ class _SlidingWindowRateLimiter:
         self._limit = calls_per_minute
         self._windows: dict[str, list[float]] = defaultdict(list)
         self._lock = asyncio.Lock()
+        self._last_sweep = 0.0
 
     async def check(self, key: str) -> None:
         """Raise HTTP 429 if *key* has exceeded its per-minute quota."""
@@ -60,6 +61,7 @@ class _SlidingWindowRateLimiter:
         async with self._lock:
             now = time.monotonic()
             cutoff = now - _RATE_LIMIT_WINDOW
+            self._sweep_expired(cutoff, now)
             bucket = [t for t in self._windows[key] if t > cutoff]
             if len(bucket) >= self._limit:
                 raise HTTPException(
@@ -68,6 +70,24 @@ class _SlidingWindowRateLimiter:
                 )
             bucket.append(now)
             self._windows[key] = bucket
+
+    def _sweep_expired(self, cutoff: float, now: float) -> None:
+        """Drop keys whose timestamps have all expired so the dict stays bounded.
+
+        Without this, every distinct session/chat id would leave a permanent
+        entry behind, leaking memory over the lifetime of the server. Runs at
+        most once per window to keep per-request cost negligible.
+        """
+        if now - self._last_sweep < _RATE_LIMIT_WINDOW:
+            return
+        self._last_sweep = now
+        stale = [
+            key
+            for key, hits in self._windows.items()
+            if not any(t > cutoff for t in hits)
+        ]
+        for key in stale:
+            del self._windows[key]
 
 
 _rate_limiter = _SlidingWindowRateLimiter(_RATE_LIMIT_RPM)
@@ -374,6 +394,7 @@ async def lifespan(app: FastAPI):
             )
         )
 
+    gw = Gateway(handler)
     app.state.tools = tools
     app.state.distiller = distiller
     app.state.engine = engine
@@ -383,19 +404,50 @@ async def lifespan(app: FastAPI):
     app.state.profile_store = profile_store
     app.state.skill_registry = skill_registry
     app.state.scheduler = scheduler
-    app.state.gateway = Gateway(handler)
+    app.state.gateway = gw
     app.state.active_stream_tasks = {}
+
+    # -- Messaging adapters (optional) ------------------------------------
+    # Each adapter starts only when its bot-token env var is present so the
+    # server comes up cleanly with no messaging credentials configured.
+
+    from adapters.telegram import TelegramAdapter
+    from adapters.discord_bot import DiscordAdapter
+
+    async def _adapter_send(session_id: str, text: str) -> str:
+        result = await gw.send(session_id, {"text": text})
+        if result.error:
+            raise RuntimeError(result.error)
+        return str(result.output)
+
+    telegram_adapter: TelegramAdapter | None = None
+    discord_adapter: DiscordAdapter | None = None
+
+    if tg_token := os.getenv("TELEGRAM_BOT_TOKEN"):
+        telegram_adapter = TelegramAdapter(token=tg_token, send_fn=_adapter_send)
+        await telegram_adapter.start()
+        app.state.telegram_adapter = telegram_adapter
+
+    if dc_token := os.getenv("DISCORD_BOT_TOKEN"):
+        discord_adapter = DiscordAdapter(token=dc_token, send_fn=_adapter_send)
+        await discord_adapter.start()
+        app.state.discord_adapter = discord_adapter
 
     try:
         yield
     finally:
+        # Adapters first — they hold references to the gateway.
+        if telegram_adapter is not None:
+            await telegram_adapter.shutdown()
+        if discord_adapter is not None:
+            await discord_adapter.shutdown()
         for task in list(app.state.active_stream_tasks.values()):
             task.cancel()
         await asyncio.gather(
             *list(app.state.active_stream_tasks.values()),
             return_exceptions=True,
         )
-        await app.state.gateway.shutdown()
+        await gw.shutdown()
         await scheduler.shutdown()
         await distiller.shutdown()
         await tools.close()

@@ -143,6 +143,53 @@ Open `http://localhost:8000` for the API. Docker Compose serves the chat UI at `
 | `AGENT_USE_HYBRID_MEMORY` | `true` | Enable ChromaDB + Neo4j memory |
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j (optional; falls back to Chroma-only) |
 
+## Local models (Ollama / vLLM / OpenRouter)
+
+The agent uses [LiteLLM](https://docs.litellm.ai/docs/providers) internally, so any provider it supports works — just change `AGENT_MODEL` and supply the matching API key.
+
+**Ollama (fully local, no API key)**
+
+```bash
+ollama pull llama3.2          # install Ollama first: https://ollama.com
+cp ollama.env.example an-api.env
+docker compose up
+```
+
+Model strings follow the `ollama/<name>` convention (`ollama/llama3.2`, `ollama/qwen2.5:7b`, etc.). Override `OLLAMA_API_BASE` if Ollama runs on another host.
+
+**vLLM** — set `AGENT_MODEL=openai/<model>`, `OPENAI_API_KEY=dummy`, and `OPENAI_API_BASE=http://localhost:8000/v1`.
+
+**OpenRouter** — set `AGENT_MODEL=openrouter/<org>/<model>` and `OPENROUTER_API_KEY=sk-or-…`. 400+ models, many with a free tier.
+
+See `ollama.env.example` for the full provider reference (Anthropic, OpenAI, Gemini, Azure).
+
+## Messaging adapters (Telegram / Discord)
+
+The agent can receive and reply to messages on Telegram and Discord alongside the browser control panel. Adapters are **disabled by default** and start only when a bot token is present.
+
+**Telegram**
+
+1. Talk to [@BotFather](https://t.me/BotFather) → create a bot → copy the token.
+2. Add to `an-api.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=<token>
+   TELEGRAM_ALLOWED_IDS=<comma-separated chat_ids>   # omit to allow everyone
+   ```
+3. Restart the server — the adapter polls automatically.
+
+**Discord**
+
+1. [discord.com/developers](https://discord.com/developers/applications) → New Application → Bot → copy the token.
+2. Under **Bot → Privileged Gateway Intents**, enable **Message Content Intent**.
+3. Invite the bot with the `bot` scope and `Send Messages` + `Read Message History` permissions.
+4. Add to `an-api.env`:
+   ```
+   DISCORD_BOT_TOKEN=<token>
+   DISCORD_ALLOWED_USER_IDS=<comma-separated user_ids>   # omit to allow everyone
+   ```
+
+Each Telegram chat and Discord channel gets its own isolated session, so conversation history is scoped correctly per chat.
+
 ## Running tests
 
 ```bash
