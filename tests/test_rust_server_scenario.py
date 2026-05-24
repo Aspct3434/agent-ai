@@ -260,6 +260,20 @@ class TestBuiltinSkillDeployment:
         assert "stale content" not in fresh
         assert "build_std_rust_http_server" in fresh
 
+    def test_ensure_skills_dir_does_not_touch_unchanged_builtin(self, tmp_path: Path):
+        """Unchanged builtins must not be rewritten, or uvicorn --reload loops."""
+        if not _SKILL_SRC.exists():
+            pytest.skip("src/builtin_skills/std_rust_http_server.py not found")
+        _ensure_skills_dir(tmp_path)
+        deployed = tmp_path / "std_rust_http_server.py"
+        fixed_time = 1_700_000_000
+        os.utime(deployed, (fixed_time, fixed_time))
+        before = deployed.stat().st_mtime_ns
+
+        _ensure_skills_dir(tmp_path)
+
+        assert deployed.stat().st_mtime_ns == before
+
 
 # ---------------------------------------------------------------------------
 # Integration: actually build if cargo is available (skipped otherwise)
