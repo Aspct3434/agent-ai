@@ -1,4 +1,4 @@
-"""Regression tests for the "agent can't finish a React build on its own" failure.
+﻿"""Regression tests for the "agent can't finish a React build on its own" failure.
 
 Root cause from the captured transcript: the model emitted near-miss arguments
 that the framework rejected *silently*, trapping it:
@@ -8,9 +8,9 @@ that the framework rejected *silently*, trapping it:
   * step objects keyed "step" not "title", with status "waiting" (not canonical)
 
 Because those update_plan calls errored, the plan never closed, so the contract's
-`plan_open_steps` requirement could never clear — the task could never complete
+`plan_open_steps` requirement could never clear â€” the task could never complete
 even if the build had succeeded. These tests lock in tolerant coercion plus the
-build-and-publish directive that tells the agent to build before publishing.
+build-and-serve directive that tells the agent to build before serving.
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ class TestNormalisePlanStatus:
 
 
 # ---------------------------------------------------------------------------
-# Plan step coercion — title aliases and JSON-string inputs
+# Plan step coercion â€” title aliases and JSON-string inputs
 # ---------------------------------------------------------------------------
 
 
@@ -82,8 +82,8 @@ class TestCoercePlanSteps:
         assert steps[0]["title"] == "Build app"
 
     def test_name_alias_for_title(self):
-        steps = _coerce_plan_steps([{"name": "Publish", "status": "pending"}])
-        assert steps[0]["title"] == "Publish"
+        steps = _coerce_plan_steps([{"name": "Serve", "status": "pending"}])
+        assert steps[0]["title"] == "Serve"
 
     def test_waiting_status_coerced(self):
         steps = _coerce_plan_steps([{"step": "X", "status": "waiting"}])
@@ -106,7 +106,7 @@ class TestCoercePlanSteps:
 
 
 # ---------------------------------------------------------------------------
-# _plan_steps_from_args — "plan" alias for "steps"
+# _plan_steps_from_args â€” "plan" alias for "steps"
 # ---------------------------------------------------------------------------
 
 
@@ -129,7 +129,7 @@ class TestPlanStepsFromArgs:
 
 
 # ---------------------------------------------------------------------------
-# _run_update_plan — the transcript's malformed call must now succeed
+# _run_update_plan â€” the transcript's malformed call must now succeed
 # ---------------------------------------------------------------------------
 
 
@@ -139,7 +139,7 @@ class TestRunUpdatePlanTolerant:
         '[\n  {"step": "Create React app using Vite", "status": "done"},\n'
         '  {"step": "Install npm dependencies", "status": "in_progress"},\n'
         '  {"step": "Build the React app for production", "status": "waiting"},\n'
-        '  {"step": "Publish static site", "status": "waiting"}\n]'
+        '  {"step": "Serve static site", "status": "waiting"}\n]'
     )
 
     def test_transcript_plan_payload_is_not_an_error(self):
@@ -208,7 +208,7 @@ class TestLatestPlanWithAlias:
                 }
             ),
         ]
-        # "waiting" → pending, which is an open status
+        # "waiting" â†’ pending, which is an open status
         assert _plan_has_open_steps(messages)
 
     def test_all_done_closes_plan(self):
@@ -252,9 +252,9 @@ class TestNormaliseContractStringCriteria:
                 "summary": "Build a sleep site in React",
                 "success_criteria": (
                     "\n  <item>A working React application built and running</item>\n"
-                    "  <item>Website is published and accessible via a public URL</item>\n"
+                    "  <item>Website is served and accessible via a public URL</item>\n"
                 ),
-                "evidence_requirements": ["published_static_site_url"],
+                "evidence_requirements": ["running_http_service"],
                 "toolset": "coding",
             }
         )
@@ -275,12 +275,12 @@ class TestNormaliseContractStringCriteria:
 
 
 # ---------------------------------------------------------------------------
-# SYSTEM_DIRECTIVE build-and-publish recipe
+# SYSTEM_DIRECTIVE build-and-serve recipe
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
-# parallel_tool_calls=False guard — prevents double update_plan in one turn
+# parallel_tool_calls=False guard â€” prevents double update_plan in one turn
 # ---------------------------------------------------------------------------
 
 
@@ -301,14 +301,14 @@ class TestParallelToolCallsDisabledForContractExecution:
         return {
             "mode": "execute",
             "summary": "build sleep site",
-            "success_criteria": ["site published"],
-            "evidence_requirements": ["published_static_site_url"],
+            "success_criteria": ["site served"],
+            "evidence_requirements": ["running_http_service"],
             "toolset": "all",
         }
 
     def test_update_plan_response_discourages_another_call(self):
         """update_plan's response must tell the model not to call it again
-        in the same turn when there are still open steps — belt-and-braces
+        in the same turn when there are still open steps â€” belt-and-braces
         defence even though parallel_tool_calls=False is the primary guard."""
         result, is_error = _run_update_plan(
             {"steps": [{"title": "Build HTML", "status": "pending"}]}
@@ -319,7 +319,7 @@ class TestParallelToolCallsDisabledForContractExecution:
     def test_second_update_plan_collapse_is_still_coerced(self):
         """Even when two update_plan calls occur (e.g. on older models that
         ignore parallel_tool_calls), _latest_plan must return the second one
-        (the 1-step plan), not None — so the iteration can continue rather
+        (the 1-step plan), not None â€” so the iteration can continue rather
         than re-asking for a plan from scratch."""
         import json
 
@@ -336,8 +336,8 @@ class TestParallelToolCallsDisabledForContractExecution:
                                 {
                                     "mode": "execute",
                                     "summary": "build sleep site",
-                                    "success_criteria": ["published"],
-                                    "evidence_requirements": ["published_static_site_url"],
+                                    "success_criteria": ["served"],
+                                    "evidence_requirements": ["running_http_service"],
                                 }
                             ),
                         },
@@ -345,7 +345,7 @@ class TestParallelToolCallsDisabledForContractExecution:
                 ],
             },
             {"role": "tool", "tool_call_id": "c1", "content": "ok"},
-            # Two update_plan calls in one turn — the collapse pattern
+            # Two update_plan calls in one turn â€” the collapse pattern
             {
                 "role": "assistant",
                 "tool_calls": [
@@ -357,7 +357,7 @@ class TestParallelToolCallsDisabledForContractExecution:
                                 {
                                     "steps": [
                                         {"title": "Write HTML", "status": "pending"},
-                                        {"title": "Publish site", "status": "pending"},
+                                        {"title": "Serve site", "status": "pending"},
                                         {"title": "Verify URL", "status": "pending"},
                                     ]
                                 }
@@ -384,11 +384,11 @@ class TestParallelToolCallsDisabledForContractExecution:
         assert len(plan) == 1
         assert plan[0]["title"] == "Write HTML"
         assert plan[0]["status"] == "in_progress"
-        # Plan is still open — next iteration must proceed to write_text_file
+        # Plan is still open â€” next iteration must proceed to write_text_file
         assert _plan_has_open_steps(messages)
 
 
-class TestBuildPublishDirective:
+class TestBuildServeDirective:
     @staticmethod
     def _directive() -> str:
         from agent import SYSTEM_DIRECTIVE
@@ -401,7 +401,7 @@ class TestBuildPublishDirective:
     def test_mentions_dist_folder(self):
         assert "dist" in self._directive()
 
-    def test_warns_against_publishing_project_root(self):
+    def test_warns_against_serving_project_root(self):
         directive = self._directive()
         assert "project root" in directive and "never" in directive
 

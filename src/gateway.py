@@ -21,12 +21,14 @@ load_dotenv(Path(__file__).resolve().parent.parent / "an-api.env")
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from agent import AgentEngine, NormalizedMessage
 from checkpointer import StateCheckpointer, initialize_checkpoints_db
-from evaluator import SkillDistiller
+from evaluator import SkillDistiller, SkillRegistry
+from memory import UserProfileStore
+from persona import PersonaLoader
+from scheduler import CronScheduler, _validate_schedule
 from tools import ToolManager
 
 logger = logging.getLogger(__name__)
@@ -106,10 +108,6 @@ class ReplayCheckpointRequest(BaseModel):
 Handler = Callable[[Message], Awaitable[Any]]
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-PUBLISHED_SITES_DIR = Path(
-    os.getenv("PUBLISHED_SITES_DIR", str(_PROJECT_ROOT / "published_sites"))
-).expanduser()
-PUBLISHED_SITES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class _SessionLane:
@@ -289,11 +287,12 @@ async def lifespan(app: FastAPI):
     checkpoint_db_path = Path(
         os.getenv("CHECKPOINT_DB_PATH", str(_PROJECT_ROOT / "checkpoints.db"))
     )
+    cron_db_path = Path(os.getenv("CRON_DB_PATH", str(_PROJECT_ROOT / "cron_jobs.db")))
     skills_dir = Path(os.getenv("SKILLS_DIR", str(_PROJECT_ROOT / "skills")))
+    persona_dir = Path(os.getenv("PERSONA_DIR", str(_PROJECT_ROOT / "persona")))
+    chroma_path = os.getenv("CHROMA_PATH", "./chroma_db")
+
     model = os.getenv("AGENT_MODEL", "moonshot/kimi-k2.5")
-    # Model tiers: routine work runs on FAST (defaults to AGENT_MODEL); the loop
-    # escalates to STRONG on repeated failure and routes coder/auditor sub-agents
-    # there. Set STRONG_AGENT_MODEL to a stronger model to enable routing.
     fast_model = os.getenv("FAST_AGENT_MODEL", model)
     strong_model = os.getenv("STRONG_AGENT_MODEL", model)
 
@@ -318,14 +317,31 @@ async def lifespan(app: FastAPI):
     try:
         await tools.connect_filesystem_server(data_dir)
     except RuntimeError:
-        # The production Python image does not include Node/npx by default.
-        # Filesystem MCP is optional; keep the API online with SQLite + skills.
         pass
     await tools.connect_skills_server(skills_dir)
 
+    # -- Persona ----------------------------------------------------------
+    persona = PersonaLoader(persona_dir if persona_dir.exists() else None)
+    persona_content = persona.load()
+
+    # -- User profile store -----------------------------------------------
+    profile_store = UserProfileStore(profile_dir=chroma_path)
+
+    # -- Skill registry ---------------------------------------------------
+    skill_registry = SkillRegistry(
+        skills_dir=skills_dir,
+        model=fast_model,
+        improve_after_uses=int(os.getenv("SKILL_IMPROVE_AFTER_USES", "5")),
+    )
+
+    # -- Distiller --------------------------------------------------------
     distiller = SkillDistiller(skills_dir=skills_dir, model=fast_model)
     await distiller.start()
+
+    # -- Memory -----------------------------------------------------------
     memory = _build_memory()
+
+    # -- Engine -----------------------------------------------------------
     engine = AgentEngine(
         memory=memory,
         tools=tools,
@@ -334,7 +350,19 @@ async def lifespan(app: FastAPI):
         strong_model=strong_model,
         distiller=distiller,
         checkpointer=checkpointer,
+        profile_store=profile_store,
+        persona_content=persona_content,
     )
+
+    # -- Cron scheduler ---------------------------------------------------
+    async def _scheduled_runner(session_id: str, prompt: str) -> str:
+        return await engine.process_task(
+            NormalizedMessage(session_id=session_id, role="user", content=prompt)
+        )
+
+    scheduler = CronScheduler(db_path=str(cron_db_path), runner=_scheduled_runner)
+    await scheduler.start()
+    engine._scheduler = scheduler  # inject after both are created
 
     async def handler(message: Message) -> str:
         return await engine.process_task(
@@ -350,6 +378,10 @@ async def lifespan(app: FastAPI):
     app.state.engine = engine
     app.state.checkpointer = checkpointer
     app.state.memory = memory
+    app.state.persona = persona
+    app.state.profile_store = profile_store
+    app.state.skill_registry = skill_registry
+    app.state.scheduler = scheduler
     app.state.gateway = Gateway(handler)
     app.state.active_stream_tasks = {}
 
@@ -363,6 +395,7 @@ async def lifespan(app: FastAPI):
             return_exceptions=True,
         )
         await app.state.gateway.shutdown()
+        await scheduler.shutdown()
         await distiller.shutdown()
         await tools.close()
         if hasattr(memory, "close"):
@@ -373,11 +406,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-app.mount(
-    "/sites",
-    StaticFiles(directory=str(PUBLISHED_SITES_DIR), html=True),
-    name="sites",
-)
 
 
 _PROXY_REQUEST_SKIP_HEADERS = {
@@ -644,6 +672,185 @@ async def ws_stream(websocket: WebSocket) -> None:
             current_task.cancel()
             with suppress(asyncio.CancelledError):
                 await current_task
+
+
+# ---------------------------------------------------------------------------
+# Model config API
+# ---------------------------------------------------------------------------
+
+
+class ModelConfigRequest(BaseModel):
+    model: str | None = None
+    fast_model: str | None = None
+    strong_model: str | None = None
+
+
+@app.get("/api/config/model")
+async def get_model_config() -> dict[str, Any]:
+    engine: AgentEngine = app.state.engine
+    return {
+        "model": engine._model,
+        "fast_model": engine._fast_model,
+        "strong_model": engine._strong_model,
+    }
+
+
+@app.post("/api/config/model")
+async def set_model_config(payload: ModelConfigRequest) -> dict[str, Any]:
+    engine: AgentEngine = app.state.engine
+    engine.update_models(
+        model=payload.model,
+        fast_model=payload.fast_model,
+        strong_model=payload.strong_model,
+    )
+    return {
+        "model": engine._model,
+        "fast_model": engine._fast_model,
+        "strong_model": engine._strong_model,
+        "updated": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Persona API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/persona")
+async def get_persona() -> dict[str, Any]:
+    return app.state.persona.describe()
+
+
+class PersonaLoadRequest(BaseModel):
+    persona_name: str | None = None
+
+
+@app.post("/api/persona/load")
+async def load_persona(payload: PersonaLoadRequest) -> dict[str, Any]:
+    persona: PersonaLoader = app.state.persona
+    content = persona.load(payload.persona_name)
+    # Hot-reload: update the engine's system directive with new persona.
+    engine: AgentEngine = app.state.engine
+    from agent import SYSTEM_DIRECTIVE
+    engine._system_directive = (
+        f"{content}\n\n{SYSTEM_DIRECTIVE}" if content else SYSTEM_DIRECTIVE
+    )
+    return {**persona.describe(), "content_preview": content[:300]}
+
+
+# ---------------------------------------------------------------------------
+# User profile API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/profile")
+async def get_user_profile() -> dict[str, Any]:
+    return app.state.profile_store.get()
+
+
+@app.delete("/api/profile")
+async def clear_user_profile() -> dict[str, str]:
+    app.state.profile_store.clear()
+    return {"status": "cleared"}
+
+
+# ---------------------------------------------------------------------------
+# Skill registry API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/skills")
+async def list_skills() -> list[dict[str, Any]]:
+    return app.state.skill_registry.list_skills()
+
+
+@app.get("/api/skills/{skill_name}/export")
+async def export_skill(skill_name: str) -> dict[str, Any]:
+    result = app.state.skill_registry.export_skill(skill_name)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Skill {skill_name!r} not found")
+    return result
+
+
+class SkillImportRequest(BaseModel):
+    name: str
+    code: str
+    description: str = ""
+    tags: list[str] = []
+
+
+@app.post("/api/skills/import")
+async def import_skill(payload: SkillImportRequest) -> dict[str, str]:
+    try:
+        path = app.state.skill_registry.import_skill(payload.model_dump())
+        # Reconnect the skills MCP server so the new skill is immediately available.
+        try:
+            await app.state.tools.connect_skills_server()
+        except Exception:
+            pass
+        return {"status": "imported", "path": path}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Cron scheduler API
+# ---------------------------------------------------------------------------
+
+
+class CronJobRequest(BaseModel):
+    prompt: str
+    schedule_type: str
+    schedule_spec: str
+    label: str = ""
+    session_id: str = "cron"
+
+
+@app.get("/api/cron/jobs")
+async def list_cron_jobs() -> list[dict[str, Any]]:
+    return app.state.scheduler.list_jobs()
+
+
+@app.post("/api/cron/jobs")
+async def create_cron_job(payload: CronJobRequest) -> dict[str, Any]:
+    try:
+        _validate_schedule(payload.schedule_type, payload.schedule_spec)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    job = await app.state.scheduler.add_job(
+        schedule_type=payload.schedule_type,
+        schedule_spec=payload.schedule_spec,
+        prompt=payload.prompt,
+        session_id=payload.session_id,
+        label=payload.label,
+    )
+    return job.to_dict()
+
+
+@app.get("/api/cron/jobs/{job_id}")
+async def get_cron_job(job_id: str) -> dict[str, Any]:
+    job = app.state.scheduler.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
+    return job
+
+
+@app.delete("/api/cron/jobs/{job_id}")
+async def delete_cron_job(job_id: str) -> dict[str, Any]:
+    removed = await app.state.scheduler.remove_job(job_id)
+    return {"removed": removed, "job_id": job_id}
+
+
+class CronJobToggleRequest(BaseModel):
+    enabled: bool
+
+
+@app.patch("/api/cron/jobs/{job_id}")
+async def toggle_cron_job(job_id: str, payload: CronJobToggleRequest) -> dict[str, Any]:
+    ok = await app.state.scheduler.toggle_job(job_id, enabled=payload.enabled)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
+    return {"job_id": job_id, "enabled": payload.enabled}
 
 
 # ---------------------------------------------------------------------------

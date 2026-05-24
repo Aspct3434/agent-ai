@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +31,19 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
         "execute_terminal_command",
         "execute_background_service",
         "write_text_file",
-        "publish_static_site",
         "expose_local_http_service",
         "create_table",
         "write_query",
     }
 )
+
+
+def _temperature_for_synthesis_model(model: str) -> float:
+    """Return a provider-compatible temperature for background skill synthesis."""
+    normalized = model.lower()
+    if normalized.startswith("moonshot/") or normalized.startswith("kimi-"):
+        return 1.0
+    return 0.2
 
 _SKILL_SYNTHESIS_PROMPT = """\
 You are a skill synthesizer for an AI agent. An agent successfully completed this task:
@@ -179,7 +188,7 @@ class SkillDistiller:
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=900,
-                temperature=0.2,
+                temperature=_temperature_for_synthesis_model(self._model),
             )
             raw = (response.choices[0].message.content or "").strip()
         except Exception as exc:
@@ -298,3 +307,312 @@ def _is_trivial_prompt(prompt: str) -> bool:
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower()).strip("_")
     return slug[:64] or "distilled_skill"
+
+
+# ---------------------------------------------------------------------------
+# Skill registry: usage tracking + self-improvement
+# ---------------------------------------------------------------------------
+
+_SKILL_IMPROVEMENT_PROMPT = """\
+You are improving an existing AI agent skill. The skill has been used {use_count} times.
+
+ORIGINAL SKILL CODE:
+```python
+{original_code}
+```
+
+RECENT USAGE EXAMPLES (task → outcome):
+{usage_examples}
+
+Improve the skill to:
+1. Handle edge cases observed in usage
+2. Be more robust and parameterized
+3. Return richer, more informative results
+4. Fix any issues seen in failed runs
+
+Output ONLY the improved Python code block (same @skill format). If the original
+is already optimal, output it unchanged. Do NOT output NOT_DISTILLABLE.
+"""
+
+_PROFILE_EXTRACTION_PROMPT = """\
+Extract user information from this agent conversation. Return a JSON object with
+these fields (omit fields you cannot infer, do not guess):
+
+{
+  "name": "user's name if mentioned",
+  "expertise": ["domain1", "domain2"],
+  "communication_style": "one of: technical/casual/formal/brief",
+  "preferences": ["prefers X", "dislikes Y"],
+  "recurring_topics": ["topic1", "topic2"],
+  "goals": ["short goal description"]
+}
+
+CONVERSATION:
+{conversation}
+
+Return ONLY the JSON object. If no meaningful info can be extracted, return {{}}.
+"""
+
+
+class SkillRegistry:
+    """Tracks skill usage and triggers self-improvement when skills mature.
+
+    Usage stats are stored in a JSON sidecar file alongside each skill.
+    After ``improve_after_uses`` successful invocations, the skill code is
+    re-synthesized with usage context to produce a better version.
+    """
+
+    def __init__(
+        self,
+        skills_dir: str | Path,
+        model: str | None = None,
+        improve_after_uses: int = 5,
+    ) -> None:
+        self._skills_dir = Path(skills_dir)
+        self._model = model
+        self._improve_after_uses = improve_after_uses
+        self._stats_file = self._skills_dir / "_registry.json"
+        self._stats: dict[str, Any] = self._load_stats()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def list_skills(self) -> list[dict[str, Any]]:
+        """Return metadata for all installed skills."""
+        skills: list[dict[str, Any]] = []
+        for py_file in sorted(self._skills_dir.glob("*.py")):
+            if py_file.name.startswith("_"):
+                continue
+            code = ""
+            try:
+                code = py_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            name = py_file.stem
+            stats = self._stats.get(name, {})
+            skills.append({
+                "name": name,
+                "file": py_file.name,
+                "description": _extract_skill_description(code),
+                "tags": _extract_skill_tags(code),
+                "use_count": stats.get("use_count", 0),
+                "success_rate": stats.get("success_rate", 1.0),
+                "version": stats.get("version", 1),
+                "last_used": stats.get("last_used"),
+                "improved_at": stats.get("improved_at"),
+            })
+        return skills
+
+    def record_use(self, skill_name: str, *, success: bool) -> None:
+        """Record one invocation of *skill_name*."""
+        s = self._stats.setdefault(skill_name, {
+            "use_count": 0, "success_count": 0, "version": 1,
+            "usage_log": [], "last_used": None, "improved_at": None,
+        })
+        s["use_count"] += 1
+        if success:
+            s["success_count"] += 1
+        s["last_used"] = datetime.now(timezone.utc).isoformat()
+        total = s["use_count"]
+        s["success_rate"] = s["success_count"] / total if total else 1.0
+        self._save_stats()
+
+    def record_use_example(self, skill_name: str, task: str, outcome: str) -> None:
+        s = self._stats.setdefault(skill_name, {"usage_log": []})
+        log: list[dict[str, str]] = s.setdefault("usage_log", [])
+        log.append({"task": task[:200], "outcome": outcome[:200]})
+        if len(log) > 20:
+            s["usage_log"] = log[-20:]
+        self._save_stats()
+
+    async def maybe_improve(self, skill_name: str) -> bool:
+        """Trigger LLM-based self-improvement if the skill has matured.
+
+        Returns True when an improved version was written.
+        """
+        if self._model is None:
+            return False
+        s = self._stats.get(skill_name, {})
+        use_count = s.get("use_count", 0)
+        last_improved_at = s.get("improved_at")
+        last_improved_count = s.get("improved_at_count", 0)
+
+        if use_count < self._improve_after_uses:
+            return False
+        if use_count - last_improved_count < self._improve_after_uses:
+            return False
+
+        skill_file = self._skills_dir / f"{skill_name}.py"
+        if not skill_file.exists():
+            return False
+
+        original_code = skill_file.read_text(encoding="utf-8")
+        usage_log = s.get("usage_log", [])
+        usage_text = "\n".join(
+            f"- Task: {ex['task']} → {ex['outcome']}" for ex in usage_log[-10:]
+        ) or "No usage examples recorded."
+
+        improved = await self._synthesize_improvement(
+            original_code, usage_text, use_count
+        )
+        if not improved:
+            return False
+
+        # Backup the old version
+        version = s.get("version", 1)
+        backup = self._skills_dir / f"{skill_name}_v{version}.py.bak"
+        try:
+            backup.write_text(original_code, encoding="utf-8")
+            skill_file.write_text(improved, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("Could not write improved skill %s: %s", skill_name, exc)
+            return False
+
+        s["version"] = version + 1
+        s["improved_at"] = datetime.now(timezone.utc).isoformat()
+        s["improved_at_count"] = use_count
+        self._save_stats()
+        logger.info("Skill %s improved to version %d", skill_name, version + 1)
+        return True
+
+    def export_skill(self, skill_name: str) -> dict[str, Any] | None:
+        """Return a portable dict for sharing/importing this skill."""
+        skill_file = self._skills_dir / f"{skill_name}.py"
+        if not skill_file.exists():
+            return None
+        code = skill_file.read_text(encoding="utf-8")
+        stats = self._stats.get(skill_name, {})
+        return {
+            "name": skill_name,
+            "description": _extract_skill_description(code),
+            "tags": _extract_skill_tags(code),
+            "code": code,
+            "version": stats.get("version", 1),
+            "use_count": stats.get("use_count", 0),
+            "success_rate": stats.get("success_rate", 1.0),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def import_skill(self, payload: dict[str, Any]) -> str:
+        """Write an imported skill to the skills directory.
+
+        Returns the file path written.
+        """
+        name = _slugify(payload.get("name", "imported_skill"))
+        code = payload.get("code", "")
+        if not code:
+            raise ValueError("Imported skill has no code")
+        if not _validate_python_syntax(code):
+            raise ValueError("Imported skill has invalid Python syntax")
+        dest = self._skills_dir / f"{name}.py"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(code, encoding="utf-8")
+        logger.info("Imported skill: %s", dest.name)
+        return str(dest)
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    async def _synthesize_improvement(
+        self, original_code: str, usage_examples: str, use_count: int
+    ) -> str | None:
+        assert self._model is not None
+        prompt = _SKILL_IMPROVEMENT_PROMPT.format(
+            use_count=use_count,
+            original_code=original_code[:2000],
+            usage_examples=usage_examples,
+        )
+        try:
+            response = await litellm.acompletion(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1200,
+                temperature=_temperature_for_synthesis_model(self._model),
+            )
+            raw = (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning("Skill improvement LLM call failed: %s", exc)
+            return None
+        code = _extract_python_block(raw)
+        if not code or not _validate_python_syntax(code):
+            return None
+        return code
+
+    def _load_stats(self) -> dict[str, Any]:
+        try:
+            if self._stats_file.exists():
+                return json.loads(self._stats_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_stats(self) -> None:
+        try:
+            self._stats_file.parent.mkdir(parents=True, exist_ok=True)
+            self._stats_file.write_text(
+                json.dumps(self._stats, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.warning("Could not save skill registry stats: %s", exc)
+
+
+def _extract_skill_description(code: str) -> str:
+    m = re.search(r'description\s*=\s*["\']([^"\']+)["\']', code)
+    return m.group(1) if m else ""
+
+
+def _extract_skill_tags(code: str) -> list[str]:
+    """Heuristically tag a skill by keywords in its code."""
+    tags: list[str] = []
+    lower = code.lower()
+    tag_map = {
+        "web": ["requests", "httpx", "http", "url", "html", "scrape"],
+        "shell": ["subprocess", "execute", "terminal", "bash", "shell"],
+        "files": ["pathlib", "open(", "write_text", "read_text"],
+        "data": ["pandas", "csv", "json", "sqlite", "database"],
+        "git": ["git clone", "git commit", "git push"],
+        "docker": ["docker run", "docker build"],
+        "python": ["pip install", "import ", "python"],
+    }
+    for tag, keywords in tag_map.items():
+        if any(kw in lower for kw in keywords):
+            tags.append(tag)
+    return tags
+
+
+# ---------------------------------------------------------------------------
+# User profile extraction
+# ---------------------------------------------------------------------------
+
+
+async def extract_and_update_user_profile(
+    profile_store: Any,
+    conversation_text: str,
+    model: str,
+) -> None:
+    """Extract user info from conversation text and merge into profile_store.
+
+    Runs as a fire-and-forget coroutine after each completed task.
+    """
+    if not conversation_text.strip() or not model:
+        return
+    prompt = _PROFILE_EXTRACTION_PROMPT.format(conversation=conversation_text[:3000])
+    try:
+        response = await litellm.acompletion(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=400,
+            temperature=0.1,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        # Strip markdown code blocks if present
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        updates = json.loads(raw)
+        if isinstance(updates, dict) and updates:
+            profile_store.update(updates)
+            logger.debug("User profile updated from conversation")
+    except Exception as exc:
+        logger.debug("Profile extraction skipped: %s", exc)

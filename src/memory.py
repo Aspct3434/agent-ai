@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 import chromadb
@@ -146,6 +149,7 @@ class HybridMemory:
     # Private helpers
     # ------------------------------------------------------------------
 
+
     def _store_embedding(
         self, event_id: str, session_id: str, raw_text: str
     ) -> None:
@@ -220,3 +224,107 @@ class HybridMemory:
                 target=rel.get("target", ""),
                 props=props,
             )
+
+
+# ---------------------------------------------------------------------------
+# User profile store
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_PROFILE: dict[str, Any] = {
+    "name": "",
+    "expertise": [],
+    "communication_style": "",
+    "preferences": [],
+    "recurring_topics": [],
+    "goals": [],
+    "last_updated": "",
+    "interaction_count": 0,
+}
+
+
+class UserProfileStore:
+    """Persists a structured user profile to a JSON file.
+
+    The profile is built incrementally from conversations by an LLM extractor
+    (see ``evaluator.extract_and_update_user_profile``). The stored data is
+    injected into each new session to personalize the agent's responses.
+
+    File location: ``{profile_dir}/user_profile.json``
+    """
+
+    def __init__(self, profile_dir: str | Path = "./chroma_db") -> None:
+        self._path = Path(profile_dir) / "user_profile.json"
+        self._profile: dict[str, Any] = self._load()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get(self) -> dict[str, Any]:
+        return dict(self._profile)
+
+    def update(self, updates: dict[str, Any]) -> None:
+        """Merge *updates* into the stored profile and persist."""
+        for key, value in updates.items():
+            if key not in _DEFAULT_PROFILE:
+                continue
+            current = self._profile.get(key)
+            if isinstance(current, list) and isinstance(value, list):
+                # Merge lists, de-dup while preserving order
+                seen = set(current)
+                for item in value:
+                    if item and item not in seen:
+                        current.append(item)
+                        seen.add(item)
+                # Keep at most 20 items per list
+                self._profile[key] = current[-20:]
+            elif value:
+                self._profile[key] = value
+        self._profile["last_updated"] = datetime.now(timezone.utc).isoformat()
+        self._profile["interaction_count"] = self._profile.get("interaction_count", 0) + 1
+        self._save()
+
+    def as_context_string(self) -> str:
+        """Return a concise single-line summary for system prompt injection."""
+        p = self._profile
+        parts: list[str] = []
+        if p.get("name"):
+            parts.append(f"Name: {p['name']}")
+        if p.get("expertise"):
+            parts.append(f"Expertise: {', '.join(p['expertise'][:4])}")
+        if p.get("communication_style"):
+            parts.append(f"Style: {p['communication_style']}")
+        if p.get("preferences"):
+            parts.append(f"Preferences: {', '.join(p['preferences'][:3])}")
+        if p.get("recurring_topics"):
+            parts.append(f"Topics: {', '.join(p['recurring_topics'][:4])}")
+        return " | ".join(parts) if parts else ""
+
+    def clear(self) -> None:
+        self._profile = dict(_DEFAULT_PROFILE)
+        self._save()
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    def _load(self) -> dict[str, Any]:
+        try:
+            if self._path.exists():
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                return {**_DEFAULT_PROFILE, **data}
+        except Exception:
+            pass
+        return dict(_DEFAULT_PROFILE)
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(
+                json.dumps(self._profile, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Could not save user profile: %s", exc)

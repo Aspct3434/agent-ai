@@ -70,7 +70,6 @@ _WEB_TOOLS: frozenset[str] = frozenset(
 _FILE_WRITE_TOOLS: frozenset[str] = frozenset(
     {
         "write_text_file",
-        "publish_static_site",
         "expose_local_http_service",
         # MCP filesystem (write)
         "write_file",

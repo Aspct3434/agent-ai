@@ -11,6 +11,14 @@ export type TextEvent = {
   content: string;
 };
 
+export type ToolResultEvent = {
+  type: "tool_result";
+  tool: string;
+  is_error: boolean;
+  content: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type FinalAnswerEvent = {
   type: "final_answer";
   /** "iteration_limit" - hit MAX_REACT_ITERATIONS; "exception" - unhandled Python error */
@@ -28,7 +36,7 @@ export type TokenEvent = {
   content: string;
 };
 
-export type AgentEvent = ToolCallEvent | TextEvent | FinalAnswerEvent;
+export type AgentEvent = ToolCallEvent | ToolResultEvent | TextEvent | FinalAnswerEvent;
 
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -94,6 +102,7 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
           setStreamingText((previous) => previous + (parsed as TokenEvent).content);
         } else if (
           parsed.type === "tool_call" ||
+          parsed.type === "tool_result" ||
           parsed.type === "text" ||
           parsed.type === "final_answer"
         ) {

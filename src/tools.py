@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import platform
+import posixpath
 import re
 import shlex
 import shutil
@@ -45,6 +46,10 @@ _TERMINAL_TIMEOUT_SECONDS = max(5, int(os.getenv("AGENT_TERMINAL_TIMEOUT_SECONDS
 # Combined stdout/stderr of every background service is appended here.
 # Uses the OS temp dir so it works on Windows (no /tmp) and Linux/macOS.
 _BACKGROUND_LOG_PATH = str(Path(tempfile.gettempdir()) / "background_task.log")
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 _PLACEHOLDER_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\badd\s+(?:more\s+)?(?:css|styles?|javascript|js|content|html|text|features?)\s+here\b", re.I),
@@ -203,6 +208,17 @@ _LEADING_CD_RE = re.compile(
     r'^\s*cd\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))\s*(?:&&\s*)?'
 )
 
+_WINDOWS_SHELL_INVOKE_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?)\b",
+    re.IGNORECASE,
+)
+_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:^|[\s\"'])"
+    r"(?:[A-Za-z]:[\\/]|%USERPROFILE%|%HOMEDRIVE%|%APPDATA%|%LOCALAPPDATA%)",
+    re.IGNORECASE,
+)
+_WINDOWS_WHERE_RE = re.compile(r"(?:^|[;&|]\s*)where(?:\.exe)?\s+\S+", re.IGNORECASE)
+
 # ---------------------------------------------------------------------------
 # Docker sandbox mode
 #
@@ -217,14 +233,31 @@ _LEADING_CD_RE = re.compile(
 #   AGENT_SANDBOX_MEMORY   — memory limit (default: 1g)
 #   AGENT_SANDBOX_CPUS     — CPU limit (default: 1.0)
 #   AGENT_SANDBOX_PIDS     — PID limit (default: 256)
+#   AGENT_SANDBOX_HOST_FALLBACK
+#                           — set true to allow direct host execution if Docker
+#                             fails; default false blocks terminal/process tools
 # ---------------------------------------------------------------------------
 
-_SANDBOX_ENABLED = os.getenv("AGENT_SANDBOX", "").lower() == "docker"
+_SANDBOX_MODE = os.getenv("AGENT_SANDBOX", "").lower()
+_SANDBOX_ENABLED = _SANDBOX_MODE == "docker"
+_SSH_SANDBOX_ENABLED = _SANDBOX_MODE == "ssh"
+
+# SSH sandbox configuration
+_SSH_HOST = os.getenv("AGENT_SSH_HOST", "")
+_SSH_USER = os.getenv("AGENT_SSH_USER", "")
+_SSH_KEY_PATH = os.getenv("AGENT_SSH_KEY_PATH", "")
+_SSH_WORKDIR = os.getenv("AGENT_SSH_WORKDIR", "/tmp/agent-workspace")
+_SSH_PORT = int(os.getenv("AGENT_SSH_PORT", "22"))
+
+# Vision and image generation model config
+_VISION_MODEL = os.getenv("AGENT_VISION_MODEL", "")
+_IMAGE_GEN_MODEL = os.getenv("AGENT_IMAGE_GEN_MODEL", "dall-e-3")
 _SANDBOX_IMAGE = os.getenv("AGENT_SANDBOX_IMAGE", "python:3.12-slim")
 _SANDBOX_WORKDIR = "/workspace"
 _SANDBOX_MEMORY = os.getenv("AGENT_SANDBOX_MEMORY", "1g")
 _SANDBOX_CPUS = os.getenv("AGENT_SANDBOX_CPUS", "1.0")
 _SANDBOX_PIDS = os.getenv("AGENT_SANDBOX_PIDS", "256")
+_SANDBOX_FALLBACK_TO_HOST = _env_flag("AGENT_SANDBOX_HOST_FALLBACK", "false")
 _SANDBOX_PACKAGE_CAPS = (
     # apt/dpkg drop privileges to the _apt user and adjust package-owned files.
     # Keep the sandbox otherwise locked down, but allow normal package installs.
@@ -265,9 +298,9 @@ class _DockerSandbox:
 
     One instance is created per ``ToolManager`` when ``AGENT_SANDBOX=docker``.
     The container runs ``sleep infinity`` so it stays alive between commands;
-    each command is executed via ``docker exec``.  The host workspace directory
-    is bind-mounted to ``/workspace`` inside the container so file-tool writes
-    (which happen on the host) are immediately visible to terminal commands.
+    each command is executed via ``docker exec``. The agentic workspace lives
+    inside the container at ``/workspace`` rather than bind-mounting the host
+    project directory, so general agent tasks cannot mutate the repo or host OS.
     """
 
     def __init__(self, image: str, host_workdir: str) -> None:
@@ -308,8 +341,8 @@ class _DockerSandbox:
         # Install baseline packages (curl, wget, git, …) that slim images lack.
         self._install_baseline_packages()
         logger.info(
-            "Docker sandbox started: container=%s image=%s workdir=%s",
-            self._container_id[:12], self._image, self._host_workdir,
+            "Docker sandbox started: container=%s image=%s container_workdir=%s",
+            self._container_id[:12], self._image, _SANDBOX_WORKDIR,
         )
 
     def _install_baseline_packages(self) -> None:
@@ -354,8 +387,6 @@ class _DockerSandbox:
             [
                 "--cap-add", "NET_BIND_SERVICE",
                 "--security-opt", "no-new-privileges",
-                # Bind-mount the host workspace so file-tool writes are visible.
-                "-v", f"{self._host_workdir}:{_SANDBOX_WORKDIR}",
                 "-w", _SANDBOX_WORKDIR,
                 self._image,
                 "sleep", "infinity",
@@ -387,32 +418,28 @@ class _DockerSandbox:
         self, command: str, cwd: str, timeout: float
     ) -> tuple[int, str, str]:
         """Run *command* inside the container at *cwd* and await its output."""
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", "-w", cwd, self.container_id,
-            "bash", "-c", command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
+        def _run() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-w",
+                    cwd,
+                    self.container_id,
+                    "bash",
+                    "-c",
+                    command,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
             )
-        except asyncio.CancelledError:
-            proc.kill()
-            try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            raise
-        except TimeoutError:
-            proc.kill()
-            try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            raise
-        rc = proc.returncode if proc.returncode is not None else -1
-        return rc, stdout_bytes.decode(errors="replace"), stderr_bytes.decode(errors="replace")
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError from exc
+        return result.returncode, result.stdout, result.stderr
 
     def exec_background(self, command: str, cwd: str, log_path: str) -> int | None:
         """Launch *command* detached inside the container; output appends to *log_path*."""
@@ -436,6 +463,36 @@ class _DockerSandbox:
             logger.warning("sandbox exec_background failed: %s", exc)
             return None
 
+    def write_text_file(self, path: str, content: str) -> dict[str, Any]:
+        """Write a UTF-8 text file inside the container workspace."""
+        script = r"""
+import json, os, sys
+
+req = json.load(sys.stdin)
+path = req["path"]
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(req.get("content", ""))
+st = os.stat(path)
+print(json.dumps({
+    "path": path,
+    "exists": os.path.isfile(path),
+    "size_bytes": st.st_size,
+}))
+"""
+        result = subprocess.run(
+            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
+            input=json.dumps({"path": path, "content": content}),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "sandbox file write failed")
+        return json.loads(result.stdout)
+
     def collect_evidence_json(
         self,
         *,
@@ -455,9 +512,15 @@ req = json.load(sys.stdin)
 def preview(path, max_bytes=1200):
     try:
         with open(path, "rb") as f:
-            return f.read(max_bytes).decode("utf-8", "replace")
+            data = f.read(max_bytes)
     except OSError as exc:
         return "[preview error] " + str(exc)
+    if b"\0" in data:
+        return f"[binary file preview omitted; sampled {len(data)} bytes]"
+    printable = sum(1 for b in data if b in b"\n\r\t" or 32 <= b <= 126)
+    if data and printable / len(data) < 0.75:
+        return f"[binary file preview omitted; sampled {len(data)} bytes]"
+    return data.decode("utf-8", "replace")
 
 def inspect_path(raw, cwd):
     path = raw if os.path.isabs(raw) else os.path.join(cwd, raw)
@@ -700,11 +763,119 @@ except urllib.error.HTTPError as exc:
         }, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# SSH sandbox
+# ---------------------------------------------------------------------------
+
+
+class _SSHSandbox:
+    """Route agent commands to a remote host over SSH.
+
+    Authentication uses a key file (AGENT_SSH_KEY_PATH) or falls back to the
+    SSH agent / host ~/.ssh/config. The remote working directory is created
+    automatically on first use.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        key_path: str = "",
+        workdir: str = "/tmp/agent-workspace",
+        port: int = 22,
+    ) -> None:
+        self._host = host
+        self._user = user
+        self._key_path = key_path
+        self._workdir = workdir
+        self._port = port
+
+    def _ssh_argv(self) -> list[str]:
+        argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-p", str(self._port)]
+        if self._key_path:
+            argv += ["-i", self._key_path]
+        return argv + [f"{self._user}@{self._host}"]
+
+    def start(self) -> None:
+        """Verify connectivity and create the remote workspace directory."""
+        result = subprocess.run(
+            self._ssh_argv() + [f"mkdir -p {shlex.quote(self._workdir)}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"SSH sandbox connection failed: {result.stderr.strip()}"
+            )
+        logger.info("SSH sandbox ready: %s@%s:%s", self._user, self._host, self._workdir)
+
+    def stop(self) -> None:
+        pass  # stateless; no persistent process to tear down
+
+    async def exec_async(
+        self, command: str, cwd: str, timeout: float
+    ) -> tuple[int, str, str]:
+        full_cmd = f"cd {shlex.quote(cwd)} && {command}"
+        argv = self._ssh_argv() + [full_cmd]
+
+        def _run() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout
+            )
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError from exc
+        return result.returncode, result.stdout, result.stderr
+
+    def exec_background(self, command: str, cwd: str, log_path: str) -> int | None:
+        wrapped = (
+            f"cd {shlex.quote(cwd)} && "
+            f"nohup bash -c {shlex.quote(command)} "
+            f">> {shlex.quote(log_path)} 2>&1 < /dev/null & echo $!"
+        )
+        try:
+            result = subprocess.run(
+                self._ssh_argv() + [wrapped],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                return None
+            return int(result.stdout.strip().splitlines()[-1])
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            logger.warning("SSH exec_background failed: %s", exc)
+            return None
+
+    def collect_environment_json(self) -> str:
+        script = (
+            "python3 -c \""
+            "import json,platform,shutil,os; "
+            "rts=['python3','node','npm','git','curl','apt-get']; "
+            "found={r:shutil.which(r) is not None for r in rts}; "
+            "print(json.dumps({'os':'Linux','shell':{'shell':'bash','posix':True},"
+            "'sandbox':{'mode':'ssh','host':os.environ.get('SSH_CONNECTION','?')},"
+            "'runtimes':found}))\""
+        )
+        try:
+            result = subprocess.run(
+                self._ssh_argv() + [script],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception as exc:
+            logger.warning("SSH environment probe failed: %s", exc)
+        return json.dumps({
+            "os": "Linux", "sandbox": {"mode": "ssh", "host": self._host},
+            "shell": {"shell": "bash", "posix": True},
+        }, indent=2)
+
+
 GET_SYSTEM_ENVIRONMENT_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "get_system_environment",
     "description": (
-        "Return a JSON snapshot of the host system environment. Includes: OS type, "
+        "Return a JSON snapshot of the active execution environment. Includes: OS type, "
         "disk space, which runtimes are on PATH (rustc, cargo, gcc, make, curl, wget, "
         "git, node, npm, npx, python, docker, and more), the active shell, and critically "
         "the running user identity with is_root and sudo_available flags. "
@@ -723,7 +894,7 @@ GET_FILESYSTEM_PROCESS_EVIDENCE_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "get_filesystem_process_evidence",
     "description": (
-        "Return structured evidence about host filesystem paths, process IDs, "
+        "Return structured evidence about active-environment filesystem paths, process IDs, "
         "process names, localhost ports, and the background-service log. Use this "
         "after creating files, folders, servers, or background processes to prove "
         "the requested artifacts or service exist before giving a final answer. "
@@ -802,10 +973,10 @@ WRITE_TEXT_FILE_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "write_text_file",
     "description": (
-        "Create or overwrite a UTF-8 text file on the host filesystem. Parent "
+        "Create or overwrite a UTF-8 text file in the active workspace. Parent "
         "directories are created automatically. Use this for concrete artifacts "
         "such as HTML, CSS, JavaScript, Markdown, JSON, config files, or docs; "
-        "then verify or publish the artifact as required by the task contract."
+        "then verify the artifact as required by the task contract."
     ),
     "inputSchema": {
         "type": "object",
@@ -830,7 +1001,7 @@ SET_TASK_CONTRACT_TOOL: dict[str, Any] = {
     "description": (
         "Declare how the current user task must be completed before doing any "
         "work. Use mode='answer' for pure Q&A and mode='execute' for tasks that "
-        "must change files, services, databases, or other host state. The engine "
+        "must change files, services, databases, or other active-environment state. The engine "
         "uses this contract to decide whether a final text answer is acceptable. "
         "Optionally specify toolset to narrow the tools available for this task: "
         "'research' (web + read-only), 'coding' (files + terminal + web), "
@@ -849,7 +1020,7 @@ SET_TASK_CONTRACT_TOOL: dict[str, Any] = {
             "mode": {
                 "type": "string",
                 "enum": ["answer", "execute"],
-                "description": "Whether the task is answered in text or requires host-side execution.",
+                "description": "Whether the task is answered in text or requires tool-side execution evidence.",
             },
             "summary": {
                 "type": "string",
@@ -866,8 +1037,8 @@ SET_TASK_CONTRACT_TOOL: dict[str, Any] = {
                     "type": "string",
                     "enum": [
                         "filesystem_artifact",
-                        "published_static_site_url",
                         "running_http_service",
+                        "running_tcp_service",
                         "database_mutation",
                         "command_output",
                         "none",
@@ -875,7 +1046,10 @@ SET_TASK_CONTRACT_TOOL: dict[str, Any] = {
                 },
                 "description": (
                     "Structured proof the engine should require before accepting a "
-                    "final answer. Use 'none' only for answer-mode tasks."
+                    "final answer. Use 'none' only for answer-mode tasks. Use "
+                    "'running_http_service' for HTTP servers that should be exposed "
+                    "through the browser proxy, and 'running_tcp_service' for "
+                    "non-HTTP servers proven by process/port evidence."
                 ),
             },
             "toolset": {
@@ -886,38 +1060,6 @@ SET_TASK_CONTRACT_TOOL: dict[str, Any] = {
                     "research=web+read-only, coding=files+terminal+web, "
                     "web=browser+fetch+files, data=SQLite+terminal, ops=shell+files. "
                     "Default 'all'."
-                ),
-            },
-        },
-        "additionalProperties": False,
-    },
-}
-
-PUBLISH_STATIC_SITE_TOOL: dict[str, Any] = {
-    "server": "__builtin__",
-    "name": "publish_static_site",
-    "description": (
-        "Publish a completed static website directory through the already-exposed "
-        "agent backend at /sites/<slug>/. The source directory must contain an "
-        "index.html file. Use this instead of starting python -m http.server on "
-        "arbitrary container ports when the user asks to host, publish, serve, or "
-        "get a browser link for a static site."
-    ),
-    "inputSchema": {
-        "type": "object",
-        "properties": {
-            "source_path": {
-                "type": "string",
-                "description": (
-                    "Directory containing the static website files. Relative paths "
-                    "resolve from the current tool working directory. Defaults to "
-                    "the current tool working directory."
-                ),
-            },
-            "slug": {
-                "type": "string",
-                "description": (
-                    "Optional URL-safe site slug. Defaults to the source directory name."
                 ),
             },
         },
@@ -962,9 +1104,10 @@ EXECUTE_TERMINAL_COMMAND_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "execute_terminal_command",
     "description": (
-        "Execute a shell command on the host system and return its combined stdout "
-        "and stderr output. Commands run inside the OS default shell (sh on POSIX, "
-        "cmd on Windows) and this call WAITS for them to finish. "
+        "Execute a shell command in the active execution environment and return its "
+        "combined stdout and stderr output. Commands run inside that environment's "
+        "default shell, which is the Docker sandbox shell when sandbox mode is active, "
+        "and this call WAITS for them to finish. "
         f"Use this for slow-but-finite work too -- package installs (apt-get/pip), "
         f"downloads, builds, and tests -- it allows up to {_TERMINAL_TIMEOUT_SECONDS} "
         "seconds, so let them run to completion here instead of backgrounding them. "
@@ -1092,42 +1235,155 @@ DELEGATE_TASK_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "delegate_task",
     "description": (
-        "Delegate a self-contained unit of work to a specialised sub-agent. "
-        "Use 'researcher' to gather or synthesise information, 'coder' to write "
-        "or modify source code, and 'auditor' to review, critique, or verify "
-        "correctness. The sub-agent receives only task_description and "
-        "context_payload -- it has no access to the current conversation history. "
-        "Do not use this tool as the primary way to create files, install packages, "
-        "or start services on the host; for physical environment changes, call "
-        "execute_terminal_command or execute_background_service directly and verify "
-        "the result afterwards."
+        "Delegate one or more self-contained tasks to specialised sub-agents.\n\n"
+        "Single-task form (backward compat):\n"
+        "  {agent_type, task_description, context_payload}\n\n"
+        "Parallel batch form (run multiple sub-agents concurrently):\n"
+        "  {tasks: [{agent_type, task_description, context_payload},...], mode: 'parallel'}\n\n"
+        "Agent types:\n"
+        "  'researcher' — gather/synthesise information (no side effects)\n"
+        "  'coder'      — write or refactor code\n"
+        "  'auditor'    — security/correctness review\n"
+        "  'planner'    — break a goal into ordered, verifiable steps\n\n"
+        "Sub-agents do not share conversation history. Pass relevant context in "
+        "context_payload. For filesystem/process operations, use "
+        "execute_terminal_command directly instead."
     ),
     "inputSchema": {
         "type": "object",
-        "required": ["agent_type", "task_description", "context_payload"],
         "properties": {
             "agent_type": {
                 "type": "string",
-                "enum": ["researcher", "coder", "auditor"],
-                "description": (
-                    "Which specialised sub-agent to invoke: "
-                    "'researcher' for information gathering, "
-                    "'coder' for code generation or editing, "
-                    "'auditor' for review and verification."
-                ),
+                "enum": ["researcher", "coder", "auditor", "planner"],
+                "description": "Sub-agent type for single-task form.",
             },
             "task_description": {
                 "type": "string",
-                "description": "The exact, self-contained instruction for the sub-agent.",
+                "description": "Task instruction for single-task form.",
             },
             "context_payload": {
                 "type": "object",
-                "description": (
-                    "A flat or nested dictionary of background facts the sub-agent "
-                    "needs to complete the task (e.g. relevant schema snippets, "
-                    "prior tool outputs, file paths)."
-                ),
+                "description": "Background facts for single-task form.",
                 "additionalProperties": True,
+            },
+            "tasks": {
+                "type": "array",
+                "description": "List of tasks for batch form.",
+                "items": {
+                    "type": "object",
+                    "required": ["agent_type", "task_description"],
+                    "properties": {
+                        "agent_type": {"type": "string"},
+                        "task_description": {"type": "string"},
+                        "context_payload": {"type": "object", "additionalProperties": True},
+                    },
+                },
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["sequential", "parallel"],
+                "description": "Execution mode for batch form. Default: sequential.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+
+ANALYZE_IMAGE_TOOL: dict[str, Any] = {
+    "server": "__builtin__",
+    "name": "analyze_image",
+    "description": (
+        "Analyze an image using a vision-capable LLM. Pass a public URL or a "
+        "file:// path to an image, and ask a question about its contents. "
+        "Returns the model's answer as plain text. Requires AGENT_VISION_MODEL "
+        "to be set to a vision-capable model (e.g. gpt-4o-mini)."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "required": ["image_url", "question"],
+        "properties": {
+            "image_url": {
+                "type": "string",
+                "description": "Public URL or base64 data URI of the image to analyze.",
+            },
+            "question": {
+                "type": "string",
+                "description": "What to ask about the image.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+GENERATE_IMAGE_TOOL: dict[str, Any] = {
+    "server": "__builtin__",
+    "name": "generate_image",
+    "description": (
+        "Generate an image from a text prompt using DALL-E or a compatible API. "
+        "Requires OPENAI_API_KEY and AGENT_IMAGE_GEN_MODEL (default: dall-e-3). "
+        "Returns a JSON object with the image URL and optional local save path."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "Detailed description of the image to generate.",
+            },
+            "size": {
+                "type": "string",
+                "enum": ["1024x1024", "1792x1024", "1024x1792"],
+                "description": "Image dimensions. Default: 1024x1024.",
+            },
+            "save_path": {
+                "type": "string",
+                "description": (
+                    "Optional workspace path to download and save the image "
+                    "(e.g. /workspace/output.png). Omit to return only the URL."
+                ),
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+SCHEDULE_TASK_TOOL: dict[str, Any] = {
+    "server": "__builtin__",
+    "name": "schedule_task",
+    "description": (
+        "Schedule a task to run automatically on a recurring schedule or at a "
+        "specific future time. The task is dispatched to the agent and runs "
+        "unattended. Returns the job ID.\n"
+        "schedule_type options:\n"
+        "  'interval' — run every N seconds (spec: '300' = every 5 min)\n"
+        "  'cron'     — 5-field cron expression (spec: '0 9 * * 1' = every Monday 9am)\n"
+        "  'once'     — run once at an ISO datetime (spec: '2026-06-01T12:00:00Z')\n"
+    ),
+    "inputSchema": {
+        "type": "object",
+        "required": ["prompt", "schedule_type", "schedule_spec"],
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The task instruction to run on schedule.",
+            },
+            "schedule_type": {
+                "type": "string",
+                "enum": ["interval", "cron", "once"],
+                "description": "How the schedule repeats.",
+            },
+            "schedule_spec": {
+                "type": "string",
+                "description": (
+                    "The schedule specification: seconds for 'interval', "
+                    "5-field cron string for 'cron', ISO datetime for 'once'."
+                ),
+            },
+            "label": {
+                "type": "string",
+                "description": "Optional human-readable name for the job.",
             },
         },
         "additionalProperties": False,
@@ -1158,40 +1414,60 @@ class ToolManager:
             default_cwd = _PROJECT_ROOT
         host_workdir = str(default_cwd.resolve())
 
-        # Docker sandbox — started eagerly so the container is ready before the
-        # first terminal command arrives and so get_system_environment reflects
-        # the container's Linux environment from the very first session message.
-        self._sandbox: _DockerSandbox | None = None
-        self._sandbox_startup_failed: bool = False  # set True when AGENT_SANDBOX=docker but Docker unreachable
+        # Sandbox — started eagerly so the environment is ready before the first
+        # terminal command and get_system_environment reflects the actual runtime.
+        self._sandbox: _DockerSandbox | _SSHSandbox | None = None
+        self._sandbox_startup_failed: bool = False
+        self._host_execution_disabled_reason: str | None = None
         if _SANDBOX_ENABLED:
             try:
                 sandbox = _DockerSandbox(image=_SANDBOX_IMAGE, host_workdir=host_workdir)
                 sandbox.start()
                 self._sandbox = sandbox
-                # Inside the container all commands run under /workspace.
                 self.current_cwd: str = _SANDBOX_WORKDIR
                 self._env_snapshot: str = sandbox.collect_environment_json()
                 logger.info("Sandbox mode: docker (image=%s)", _SANDBOX_IMAGE)
             except Exception as exc:
-                logger.error(
-                    "Docker sandbox failed to start — falling back to host execution: %s", exc
-                )
                 self._sandbox = None
                 self._sandbox_startup_failed = True
                 self.current_cwd = host_workdir
                 self._env_snapshot = _collect_system_environment()
+                if not _SANDBOX_FALLBACK_TO_HOST:
+                    logger.error("Docker sandbox failed to start; host execution is blocked: %s", exc)
+                    self._host_execution_disabled_reason = (
+                        "Docker sandbox failed to start and "
+                        "AGENT_SANDBOX_HOST_FALLBACK is not enabled. Terminal, "
+                        "background-service, process, and port tools are blocked "
+                        "so the agent cannot accidentally mutate the host OS. "
+                        f"Root cause: {exc}"
+                    )
+                else:
+                    logger.error("Docker sandbox failed — falling back to host execution: %s", exc)
+        elif _SSH_SANDBOX_ENABLED:
+            try:
+                ssh = _SSHSandbox(
+                    host=_SSH_HOST,
+                    user=_SSH_USER,
+                    key_path=_SSH_KEY_PATH,
+                    workdir=_SSH_WORKDIR,
+                    port=_SSH_PORT,
+                )
+                ssh.start()
+                self._sandbox = ssh
+                self.current_cwd: str = _SSH_WORKDIR
+                self._env_snapshot: str = ssh.collect_environment_json()
+                logger.info("Sandbox mode: ssh (%s@%s)", _SSH_USER, _SSH_HOST)
+            except Exception as exc:
+                self._sandbox = None
+                self._sandbox_startup_failed = True
+                self.current_cwd = host_workdir
+                self._env_snapshot = _collect_system_environment()
+                logger.error("SSH sandbox failed to start — falling back to host: %s", exc)
         else:
             self.current_cwd = host_workdir
             self._env_snapshot = _collect_system_environment()
 
-        self.published_sites_dir = Path(
-            os.getenv("PUBLISHED_SITES_DIR", str(_PROJECT_ROOT / "published_sites"))
-        ).expanduser()
         self.public_base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
-        # When sandbox is active, _host_workdir is the real host path mounted
-        # into the container as /workspace. File tools use it to remap container
-        # paths back to host paths so write_text_file("/workspace/x") resolves
-        # correctly on the host.
         self._host_workdir: str = host_workdir
         # Lazy browser session — started on first browser_* tool call.
         self._browser_session: _BrowserSession | None = None
@@ -1287,13 +1563,18 @@ class ToolManager:
             results.extend(_BROWSER_TOOL_SCHEMAS)
         results.append(WRITE_TEXT_FILE_TOOL)
         results.append(SET_TASK_CONTRACT_TOOL)
-        results.append(PUBLISH_STATIC_SITE_TOOL)
         results.append(EXPOSE_LOCAL_HTTP_SERVICE_TOOL)
         results.append(EXECUTE_TERMINAL_COMMAND_TOOL)
         results.append(EXECUTE_BACKGROUND_SERVICE_TOOL)
         results.append(EXPAND_TOOL_OUTPUT_TOOL)
         results.append(UPDATE_PLAN_TOOL)
         results.append(DELEGATE_TASK_TOOL)
+        # Vision / image-gen tools only appear when a vision model is configured.
+        if _VISION_MODEL:
+            results.append(ANALYZE_IMAGE_TOOL)
+        results.append(GENERATE_IMAGE_TOOL)
+        # Schedule tool always available (scheduler handles missing config gracefully).
+        results.append(SCHEDULE_TASK_TOOL)
         self._tools_cache = results
         return results
 
@@ -1385,6 +1666,43 @@ class ToolManager:
         the operator) that commands run on the host, not inside a container.
         """
         return self._sandbox_startup_failed
+
+    @property
+    def host_execution_disabled_reason(self) -> str | None:
+        return self._host_execution_disabled_reason
+
+    def _host_execution_blocked_result(self, command: str | None = None) -> dict[str, Any]:
+        reason = self._host_execution_disabled_reason or "Host execution is disabled."
+        command_line = f"\nCommand was not executed: {command}" if command else ""
+        return {
+            "exit_code": -1,
+            "stdout": (
+                "SYSTEM ALERT: Host execution is blocked because the requested Docker "
+                "sandbox is unavailable. Do not retry shell variants on this host. "
+                "Start Docker Desktop and restart the backend, or explicitly set "
+                "AGENT_SANDBOX_HOST_FALLBACK=true if direct host execution is intended."
+                f"{command_line}"
+            ),
+            "stderr": reason,
+            "current_working_directory": self.current_cwd,
+            "scope": "sandbox_unavailable",
+        }
+
+    def _wrong_environment_blocked_result(self, command: str, reason: str) -> dict[str, Any]:
+        scope = "docker_sandbox" if self._sandbox is not None else "host"
+        return {
+            "exit_code": -1,
+            "stdout": (
+                "SYSTEM ALERT: Command blocked before execution because it targets "
+                "the wrong operating environment. The command was not run anywhere. "
+                f"{reason} Read get_system_environment and issue a command that fits "
+                "the active execution environment; do not retry with shell wrappers."
+                f"\nCommand was not executed: {command}"
+            ),
+            "stderr": reason,
+            "current_working_directory": self.current_cwd,
+            "scope": scope,
+        }
 
     async def web_fetch(
         self,
@@ -1541,6 +1859,20 @@ class ToolManager:
         include_background_log: bool = True,
     ) -> str:
         """Return JSON evidence for files/folders, processes, ports, and logs."""
+        if self._host_execution_disabled_reason is not None:
+            return json.dumps(
+                {
+                    "scope": "sandbox_unavailable",
+                    "error": self._host_execution_disabled_reason,
+                    "current_working_directory": self.current_cwd,
+                    "paths": [],
+                    "pids": [],
+                    "process_names": [],
+                    "ports": [],
+                    "background_log": {"exists": False, "tail": ""},
+                },
+                indent=2,
+            )
         if self._sandbox is not None:
             return json.dumps(
                 self._sandbox.collect_evidence_json(
@@ -1572,6 +1904,20 @@ class ToolManager:
 
     def write_text_file(self, path: str, content: str) -> str:
         """Create or overwrite a UTF-8 text file and return structured evidence."""
+        if self._sandbox is not None:
+            display_path = self._resolve_sandbox_file_path(path)
+            result = self._sandbox.write_text_file(display_path, content)
+            payload = {
+                "written": True,
+                "path": display_path,
+                "exists": bool(result.get("exists")),
+                "size_bytes": int(result.get("size_bytes") or 0),
+                "current_working_directory": self.current_cwd,
+                "scope": "docker_sandbox",
+                "artifact_quality": _artifact_quality_for_text(content, display_path),
+            }
+            return json.dumps(payload, indent=2)
+
         target = self._resolve_file_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -1581,64 +1927,8 @@ class ToolManager:
             "exists": target.is_file(),
             "size_bytes": target.stat().st_size if target.exists() else 0,
             "current_working_directory": self.current_cwd,
+            "scope": "host",
             "artifact_quality": _artifact_quality_for_text(content, str(target)),
-        }
-        return json.dumps(payload, indent=2)
-
-    def publish_static_site(
-        self,
-        source_path: str | None = None,
-        slug: str | None = None,
-    ) -> str:
-        """Copy a static site into the backend-served published-sites directory.
-
-        The FastAPI app serves ``published_sites_dir`` at ``/sites``. This gives
-        browser-reachable URLs through the existing Docker port mapping instead
-        of starting throwaway HTTP servers on ports that are internal to the
-        container.
-        """
-        source = self._resolve_file_path(source_path or self.current_cwd)
-        if not source.exists():
-            raise FileNotFoundError(f"Static site source does not exist: {source}")
-        if not source.is_dir():
-            raise NotADirectoryError(f"Static site source is not a directory: {source}")
-
-        index_path = source / "index.html"
-        if not index_path.is_file():
-            raise FileNotFoundError(
-                f"Static site source must contain index.html: {index_path}"
-            )
-
-        site_slug = _slugify_site_slug(slug or source.name)
-        self.published_sites_dir.mkdir(parents=True, exist_ok=True)
-        published_root = self.published_sites_dir.resolve()
-        destination = (published_root / site_slug).resolve()
-        if destination != published_root and published_root not in destination.parents:
-            raise ValueError(f"Refusing to publish outside {published_root}: {destination}")
-
-        if destination.exists():
-            shutil.rmtree(destination)
-
-        shutil.copytree(
-            source,
-            destination,
-            symlinks=False,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
-        )
-
-        copied_files = [
-            str(path.relative_to(destination)).replace("\\", "/")
-            for path in sorted(destination.rglob("*"))
-            if path.is_file()
-        ]
-        payload = {
-            "published": True,
-            "source_path": str(source),
-            "published_path": str(destination),
-            "url": f"{self.public_base_url}/sites/{site_slug}/",
-            "index_exists": (destination / "index.html").is_file(),
-            "files": copied_files[:50],
-            "artifact_quality": _artifact_quality_for_site(destination),
         }
         return json.dumps(payload, indent=2)
 
@@ -1649,6 +1939,8 @@ class ToolManager:
         name: str | None = None,
     ) -> str:
         """Return a public backend-proxy URL for an internal HTTP service."""
+        if self._host_execution_disabled_reason is not None:
+            raise ConnectionError(self._host_execution_disabled_reason)
         service_port = int(port)
         if service_port < 1 or service_port > 65535:
             raise ValueError(f"Port out of range: {service_port}")
@@ -1726,6 +2018,15 @@ class ToolManager:
           ``{open, port, elapsed_seconds}``          on success, or
           ``{open: false, port, timeout, elapsed_seconds, hint}``  on timeout.
         """
+        if self._host_execution_disabled_reason is not None:
+            return json.dumps(
+                {
+                    "open": False,
+                    "port": int(port),
+                    "error": self._host_execution_disabled_reason,
+                    "scope": "sandbox_unavailable",
+                }
+            )
         timeout = min(max(int(timeout), 1), 300)
         interval = min(max(int(interval), 1), 30)
         start = asyncio.get_event_loop().time()
@@ -1778,6 +2079,9 @@ class ToolManager:
           stderr                    -- decoded stderr
           current_working_directory -- ``self.current_cwd`` after all cd tracking
         """
+        if self._host_execution_disabled_reason is not None:
+            return self._host_execution_blocked_result(command)
+
         # Safety gate: block unconditionally dangerous command patterns.
         if _is_dangerous_command(command):
             return {
@@ -1789,6 +2093,13 @@ class ToolManager:
                 "stderr": "",
                 "current_working_directory": self.current_cwd,
             }
+
+        mismatch_reason = _wrong_environment_command_reason(
+            command,
+            sandbox_active=self._sandbox is not None,
+        )
+        if mismatch_reason:
+            return self._wrong_environment_blocked_result(command, mismatch_reason)
 
         # â"€â"€ Step 1: intercept a leading `cd <path>` â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         cd_match = _LEADING_CD_RE.match(command)
@@ -1922,6 +2233,7 @@ class ToolManager:
             "stdout": stdout,
             "stderr": stderr,
             "current_working_directory": cwd_snapshot,
+            "scope": "docker_sandbox" if self._sandbox is not None else "host",
         }
 
         # â"€â"€ Step 3: track any embedded cd calls (e.g. mkdir /x && cd /x) â"€â"€â"€â"€
@@ -1951,6 +2263,32 @@ class ToolManager:
         Returns a dict with keys ``pid`` (int, or ``None`` on failure),
         ``status`` (``"launched"`` or ``"error"``), ``message``, and ``log_file``.
         """
+        if self._host_execution_disabled_reason is not None:
+            blocked = self._host_execution_blocked_result(command)
+            return {
+                "pid": None,
+                "status": "error",
+                "message": blocked["stdout"],
+                "error": blocked["stderr"],
+                "log_file": _AGENT_BACKGROUND_LOG_PATH,
+                "scope": "sandbox_unavailable",
+            }
+
+        mismatch_reason = _wrong_environment_command_reason(
+            command,
+            sandbox_active=self._sandbox is not None,
+        )
+        if mismatch_reason:
+            blocked = self._wrong_environment_blocked_result(command, mismatch_reason)
+            return {
+                "pid": None,
+                "status": "error",
+                "message": blocked["stdout"],
+                "error": blocked["stderr"],
+                "log_file": _AGENT_BACKGROUND_LOG_PATH,
+                "scope": blocked["scope"],
+            }
+
         if self._sandbox is not None:
             # ── Sandbox path: launch inside Docker ────────────────────────
             sandbox_log = "/tmp/background_task.log"
@@ -2054,6 +2392,81 @@ class ToolManager:
             self._browser_session = _BrowserSession()
         return self._browser_session
 
+    # ------------------------------------------------------------------
+    # Vision and image generation
+    # ------------------------------------------------------------------
+
+    async def analyze_image(self, image_url: str, question: str) -> str:
+        """Analyze an image using a vision-capable LLM model."""
+        if not _VISION_MODEL:
+            return json.dumps({"error": "AGENT_VISION_MODEL is not configured."})
+        try:
+            import litellm as _litellm
+            content: list[dict[str, Any]] = [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
+            response = await _litellm.acompletion(
+                model=_VISION_MODEL,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=1024,
+            )
+            answer = response.choices[0].message.content or ""
+            return json.dumps({"image_url": image_url, "analysis": answer}, indent=2)
+        except Exception as exc:
+            logger.warning("analyze_image failed: %s", exc)
+            return json.dumps({"error": str(exc), "image_url": image_url})
+
+    async def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        save_path: str | None = None,
+    ) -> str:
+        """Generate an image from *prompt* using DALL-E or a compatible API."""
+        try:
+            import litellm as _litellm
+            import httpx as _httpx
+            response = await _litellm.aimage_generation(
+                model=_IMAGE_GEN_MODEL,
+                prompt=prompt,
+                size=size,
+                n=1,
+            )
+            image_url = response.data[0].url or ""
+            result: dict[str, Any] = {"prompt": prompt, "image_url": image_url, "size": size}
+
+            if save_path and image_url:
+                # Normalize path for sandbox mode
+                if self._sandbox is not None:
+                    dest = self._resolve_sandbox_file_path(save_path)
+                else:
+                    dest = str(self._resolve_file_path(save_path))
+                try:
+                    async with _httpx.AsyncClient(timeout=60.0) as client:
+                        img_response = await client.get(image_url)
+                    img_bytes = img_response.content
+                    if self._sandbox is not None and hasattr(self._sandbox, "write_text_file"):
+                        # For Docker: upload via the sandbox write method
+                        import base64 as _b64
+                        self._sandbox.write_text_file(
+                            dest, _b64.b64encode(img_bytes).decode()
+                        )
+                    else:
+                        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+                        Path(dest).write_bytes(img_bytes)
+                    result["saved_to"] = dest
+                except Exception as save_exc:
+                    result["save_error"] = str(save_exc)
+            return json.dumps(result, indent=2)
+        except Exception as exc:
+            logger.warning("generate_image failed: %s", exc)
+            return json.dumps({"error": str(exc), "prompt": prompt})
+
+    # ------------------------------------------------------------------
+    # Browser convenience methods (delegates to lazy _BrowserSession)
+    # ------------------------------------------------------------------
+
     async def browser_navigate(self, url: str, timeout: float = 30.0) -> str:
         """Navigate to *url* and return rendered text as JSON."""
         result = await self._get_browser().navigate(url, timeout=timeout)
@@ -2108,24 +2521,17 @@ class ToolManager:
             await stack.aclose()
 
     def _resolve_file_path(self, raw_path: str) -> Path:
-        """Resolve a path for file tools (write_text_file, publish_static_site, etc.).
-
-        In sandbox mode the agent's cwd is ``/workspace`` (a container path).
-        Absolute paths starting with ``/workspace`` are remapped to the actual
-        host workdir so that host-side file writes land in the right place.
-        In normal (non-sandbox) mode this is identical to
-        ``_resolve_tool_path(raw_path, self.current_cwd)``.
-        """
+        """Resolve a host path for host-mode file tools."""
         if self._sandbox is not None:
-            # Remap /workspace/* → host_workdir/*
-            p = raw_path.replace("\\", "/")
-            if p == "/workspace" or p.startswith("/workspace/"):
-                suffix = p[len("/workspace"):]
-                raw_path = self._host_workdir + suffix.replace("/", os.sep)
-            elif not Path(raw_path).is_absolute():
-                # Relative paths resolve against the host workdir.
-                return _resolve_tool_path(raw_path, self._host_workdir)
+            raise RuntimeError("Host path resolution is disabled in Docker sandbox mode")
         return _resolve_tool_path(raw_path, self.current_cwd)
+
+    def _resolve_sandbox_file_path(self, raw_path: str) -> str:
+        """Resolve a tool path from the container's point of view."""
+        path = (raw_path or self.current_cwd).replace("\\", "/")
+        if not posixpath.isabs(path):
+            path = posixpath.join(self.current_cwd or _SANDBOX_WORKDIR, path)
+        return posixpath.normpath(path)
 
 
 # ---------------------------------------------------------------------------
@@ -2143,6 +2549,31 @@ def _is_dangerous_command(command: str) -> bool:
     # Collapse internal whitespace to defeat space-padding bypasses.
     normalized = re.sub(r"\s+", " ", command.strip())
     return any(pat.search(normalized) is not None for pat in _DANGEROUS_PATTERNS)
+
+
+def _wrong_environment_command_reason(command: str, *, sandbox_active: bool) -> str | None:
+    """Return a reason when *command* targets an OS other than the active runner."""
+    normalized = re.sub(r"\s+", " ", command.strip())
+    if not normalized:
+        return None
+
+    if sandbox_active:
+        if _WINDOWS_SHELL_INVOKE_RE.search(normalized):
+            return (
+                "Command targets a Windows shell (cmd/PowerShell), but the active "
+                "execution environment is the Linux Docker sandbox."
+            )
+        if _WINDOWS_ABSOLUTE_PATH_RE.search(normalized):
+            return (
+                "Command contains a Windows absolute path, but the active execution "
+                "environment is the Linux Docker sandbox mounted at /workspace."
+            )
+        if _WINDOWS_WHERE_RE.search(normalized):
+            return (
+                "Command uses Windows 'where' lookup syntax, but the active execution "
+                "environment is Linux. Use command -v or get_system_environment."
+            )
+    return None
 
 
 def _resolve_cd_target(command: str, current_cwd: str) -> str | None:
@@ -2318,11 +2749,6 @@ def _resolve_tool_path(raw_path: str, current_cwd: str) -> Path:
         return path.absolute()
 
 
-def _slugify_site_slug(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower()).strip("-._")
-    return slug or "site"
-
-
 def _inspect_path(raw_path: str, current_cwd: str) -> dict[str, Any]:
     resolved = _resolve_tool_path(raw_path, current_cwd)
 
@@ -2368,6 +2794,11 @@ def _preview_file(path: Path, max_bytes: int = 1200) -> str:
         data = path.read_bytes()[:max_bytes]
     except OSError as exc:
         return f"[preview error] {exc}"
+    if b"\0" in data:
+        return f"[binary file preview omitted; sampled {len(data)} bytes]"
+    printable = sum(1 for byte in data if byte in b"\n\r\t" or 32 <= byte <= 126)
+    if data and printable / len(data) < 0.75:
+        return f"[binary file preview omitted; sampled {len(data)} bytes]"
     return data.decode("utf-8", errors="replace")
 
 

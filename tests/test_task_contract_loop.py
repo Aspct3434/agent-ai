@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -15,7 +15,8 @@ import agent as agent_module  # noqa: E402
 from agent import AgentEngine, ExecutionStep, NormalizedMessage  # noqa: E402
 from tools import (  # noqa: E402
     EXECUTE_TERMINAL_COMMAND_TOOL,
-    PUBLISH_STATIC_SITE_TOOL,
+    EXPOSE_LOCAL_HTTP_SERVICE_TOOL,
+    GET_SYSTEM_ENVIRONMENT_TOOL,
     SET_TASK_CONTRACT_TOOL,
     UPDATE_PLAN_TOOL,
     WRITE_TEXT_FILE_TOOL,
@@ -36,7 +37,7 @@ class _FakeTools:
     def __init__(self) -> None:
         self.commands: list[str] = []
         self.written: list[dict[str, Any]] = []
-        self.published: list[dict[str, Any]] = []
+        self.served: list[dict[str, Any]] = []
 
     async def list_all_tools(self) -> list[dict[str, Any]]:
         return [
@@ -58,19 +59,38 @@ class _FakeTools:
             },
             SET_TASK_CONTRACT_TOOL,
             UPDATE_PLAN_TOOL,
+            GET_SYSTEM_ENVIRONMENT_TOOL,
             WRITE_TEXT_FILE_TOOL,
             EXECUTE_TERMINAL_COMMAND_TOOL,
-            PUBLISH_STATIC_SITE_TOOL,
+            EXPOSE_LOCAL_HTTP_SERVICE_TOOL,
         ]
 
     async def execute_terminal_command(self, command: str) -> dict[str, Any]:
         self.commands.append(command)
+        if "fail-on-purpose" in command:
+            return {
+                "exit_code": 1,
+                "stdout": "SYSTEM ALERT: Command execution failed with error code 1.",
+                "stderr": "simulated failure",
+                "current_working_directory": "/tmp",
+            }
         return {
             "exit_code": 0,
             "stdout": f"ok: {command}",
             "stderr": "",
             "current_working_directory": "/tmp",
         }
+
+    def get_system_environment(self) -> str:
+        return json.dumps(
+            {
+                "os": "Linux",
+                "shell": {"shell": "bash", "posix": True},
+                "runtimes": {"python3": True, "java": False},
+                "user": {"is_root": True, "sudo_available": False},
+                "sandbox": {"mode": "docker", "container_workdir": "/workspace"},
+            }
+        )
 
     def write_text_file(self, path: str, content: str) -> str:
         payload = {
@@ -82,18 +102,18 @@ class _FakeTools:
         self.written.append(payload)
         return json.dumps(payload)
 
-    def publish_static_site(
-        self, source_path: str | None = None, slug: str | None = None
+    def expose_local_http_service(
+        self, port: int, path: str = "", name: str | None = None
     ) -> str:
         payload = {
-            "published": True,
-            "source_path": source_path,
-            "published_path": f"/published/{slug or 'site'}",
-            "url": f"http://localhost:8000/sites/{slug or 'site'}/",
-            "index_exists": True,
-            "files": ["index.html"],
+            "exposed": True,
+            "connectable": True,
+            "port": port,
+            "path": path or "/",
+            "name": name or f"local-http-{port}",
+            "url": f"http://localhost:8000/proxy/{port}/{path.lstrip('/')}",
         }
-        self.published.append(payload)
+        self.served.append(payload)
         return json.dumps(payload)
 
 
@@ -224,12 +244,17 @@ async def _run_engine_with_script(script: list[Any]) -> tuple[list[dict[str, Any
 
 
 def _contract_tool(mode: str, evidence: list[str]) -> Any:
+    summary = (
+        "Serve an HTTP result for the user request."
+        if "running_http_service" in evidence
+        else "Handle the user request."
+    )
     return _tool_call(
         "call_contract",
         "set_task_contract",
         {
             "mode": mode,
-            "summary": "Handle the user request.",
+            "summary": summary,
             "success_criteria": ["The requested outcome is complete."],
             "evidence_requirements": evidence,
         },
@@ -243,7 +268,7 @@ def _plan_tool(status: str) -> Any:
         {
             "steps": [
                 {"title": "Create website files", "status": status},
-                {"title": "Publish static site", "status": status},
+                {"title": "Serve static site", "status": status},
             ]
         },
     )
@@ -251,7 +276,7 @@ def _plan_tool(status: str) -> Any:
 
 def test_execute_contract_suppresses_rejected_streamed_prose() -> None:
     script = [
-        _completion(tool_calls=[_contract_tool("execute", ["published_static_site_url"])]),
+        _completion(tool_calls=[_contract_tool("execute", ["running_http_service"])]),
         _completion(tool_calls=[_plan_tool("in_progress")]),
         _completion(
             tool_calls=[
@@ -275,17 +300,14 @@ def test_execute_contract_suppresses_rejected_streamed_prose() -> None:
         _completion(
             tool_calls=[
                 _tool_call(
-                    "call_publish",
-                    "publish_static_site",
-                    {
-                        "source_path": "/tmp/sleep-website",
-                        "slug": "sleep-importance",
-                    },
+                    "call_serve",
+                    "expose_local_http_service",
+                    {"port": 8765},
                 )
             ]
         ),
         _completion(tool_calls=[_plan_tool("done")]),
-        _completion(content="Published: http://localhost:8000/sites/sleep-importance/"),
+        _completion(content="Served: http://localhost:8000/proxy/8765/sleep-importance/"),
     ]
 
     events, tools = asyncio.run(_run_engine_with_script(script))
@@ -296,7 +318,7 @@ def test_execute_contract_suppresses_rejected_streamed_prose() -> None:
     assert "I'll create the sleep website now" not in streamed
     assert any(
         event.get("type") == "tool_call"
-        and event.get("tool") == "publish_static_site"
+        and event.get("tool") == "expose_local_http_service"
         for event in events
     )
     assert any(
@@ -305,7 +327,7 @@ def test_execute_contract_suppresses_rejected_streamed_prose() -> None:
         for event in events
     )
     assert any("mkdir -p /tmp/sleep-website" in command for command in tools.commands)
-    assert tools.published and tools.published[-1]["index_exists"] is True
+    assert tools.served and tools.served[-1]["connectable"] is True
 
 
 def test_answer_contract_streams_tokens_immediately() -> None:
@@ -343,23 +365,20 @@ def test_empty_tool_call_content_is_sanitized_before_next_request() -> None:
 
 def test_empty_rejected_final_text_does_not_poison_next_request() -> None:
     script = [
-        _completion(tool_calls=[_contract_tool("execute", ["published_static_site_url"])]),
+        _completion(tool_calls=[_contract_tool("execute", ["running_http_service"])]),
         _completion(tool_calls=[_plan_tool("in_progress")]),
         _completion(content=""),
         _completion(
             tool_calls=[
                 _tool_call(
-                    "call_publish",
-                    "publish_static_site",
-                    {
-                        "source_path": "/tmp/sleep-website",
-                        "slug": "sleep-importance",
-                    },
+                    "call_serve",
+                    "expose_local_http_service",
+                    {"port": 8765},
                 )
             ]
         ),
         _completion(tool_calls=[_plan_tool("done")]),
-        _completion(content="Published: http://localhost:8000/sites/sleep-importance/"),
+        _completion(content="Served: http://localhost:8000/proxy/8765/sleep-importance/"),
     ]
 
     events, _ = asyncio.run(_run_engine_with_script(script))
@@ -392,7 +411,7 @@ def test_update_plan_accepts_json_string_steps() -> None:
             "steps": json.dumps(
                 [
                     {"title": "Create files", "status": "in_progress"},
-                    {"title": "Publish", "status": "pending"},
+                    {"title": "Serve", "status": "pending"},
                 ]
             )
         }
@@ -404,7 +423,7 @@ def test_update_plan_accepts_json_string_steps() -> None:
 
 def test_execute_contract_narrows_tools_to_evidence_producers() -> None:
     script = [
-        _completion(tool_calls=[_contract_tool("execute", ["published_static_site_url"])]),
+        _completion(tool_calls=[_contract_tool("execute", ["running_http_service"])]),
         _completion(tool_calls=[_plan_tool("in_progress")]),
         _completion(
             tool_calls=[
@@ -421,17 +440,14 @@ def test_execute_contract_narrows_tools_to_evidence_producers() -> None:
         _completion(
             tool_calls=[
                 _tool_call(
-                    "call_publish",
-                    "publish_static_site",
-                    {
-                        "source_path": "sleep-website",
-                        "slug": "sleep-importance",
-                    },
+                    "call_serve",
+                    "expose_local_http_service",
+                    {"port": 8765},
                 )
             ]
         ),
         _completion(tool_calls=[_plan_tool("done")]),
-        _completion(content="Published: http://localhost:8000/sites/sleep-importance/"),
+        _completion(content="Served: http://localhost:8000/proxy/8765/sleep-importance/"),
     ]
 
     events, tools, model = asyncio.run(_run_engine_with_model(script))
@@ -440,7 +456,7 @@ def test_execute_contract_narrows_tools_to_evidence_producers() -> None:
     assert model.request_tool_names[1] == ["update_plan"]
     evidence_tool_names = set(model.request_tool_names[2])
     assert "write_text_file" in evidence_tool_names
-    assert "publish_static_site" in evidence_tool_names
+    assert "expose_local_http_service" in evidence_tool_names
     assert "execute_terminal_command" in evidence_tool_names
     assert "create_directory" not in evidence_tool_names
     assert "list_allowed_directories" not in evidence_tool_names
@@ -469,16 +485,16 @@ def _assistant_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 def _contract_messages(plan_status: str = "done") -> list[dict[str, Any]]:
     contract_args = {
         "mode": "execute",
-        "summary": "Publish a sleep website.",
+        "summary": "Serve a sleep website.",
         "success_criteria": ["A browser URL serves the site."],
-        "evidence_requirements": ["published_static_site_url"],
+        "evidence_requirements": ["running_http_service"],
     }
     return [
         {"role": "user", "content": "make a simple website about sleep"},
         _assistant_tool("set_task_contract", contract_args),
         _assistant_tool(
             "update_plan",
-            {"steps": [{"title": "Publish", "status": plan_status}]},
+            {"steps": [{"title": "Serve", "status": plan_status}]},
         ),
     ]
 
@@ -495,47 +511,53 @@ def test_execute_contract_requires_matching_structured_evidence() -> None:
             "arguments": {"command": "mkdir -p /tmp/sleep-website"},
         },
     )
-    publish_step = ExecutionStep(
+    serve_step = ExecutionStep(
         kind="tool_result",
         content=json.dumps(
             {
-                "published": True,
-                "index_exists": True,
-                "url": "http://localhost:8000/sites/sleep/",
+                "exposed": True,
+                "connectable": True,
+                "port": 8765,
+                "url": "http://localhost:8000/proxy/8765/",
             }
         ),
         metadata={
-            "tool_name": "publish_static_site",
+            "tool_name": "expose_local_http_service",
             "is_error": False,
-            "arguments": {"source_path": "/tmp/sleep-website"},
+            "arguments": {"port": 8765},
         },
+    )
+    write_step = ExecutionStep(
+        kind="tool_result",
+        content=json.dumps({"written": True, "exists": True, "size_bytes": 10}),
+        metadata={"tool_name": "write_text_file", "is_error": False},
     )
 
     mkdir_status = agent_module._contract_completion_status(
         contract, messages, [mkdir_step], contract_required=True
     )
-    publish_status = agent_module._contract_completion_status(
-        contract, messages, [mkdir_step, publish_step], contract_required=True
+    serve_status = agent_module._contract_completion_status(
+        contract, messages, [mkdir_step, serve_step], contract_required=True
     )
     open_plan_status = agent_module._contract_completion_status(
-        contract, _contract_messages(plan_status="in_progress"), [publish_step], contract_required=True
+        contract, _contract_messages(plan_status="in_progress"), [serve_step], contract_required=True
     )
     dual_evidence_status = agent_module._contract_completion_status(
         {
             **contract,
             "evidence_requirements": [
                 "filesystem_artifact",
-                "published_static_site_url",
+                "running_http_service",
             ],
         },
         messages,
-        [publish_step],
+        [write_step, serve_step],
         contract_required=True,
     )
 
     assert mkdir_status["complete"] is False
-    assert "published_static_site_url" in mkdir_status["missing"]
-    assert publish_status["complete"] is True
+    assert "running_http_service" in mkdir_status["missing"]
+    assert serve_status["complete"] is True
     assert dual_evidence_status["complete"] is True
     assert open_plan_status["complete"] is False
     assert "plan_open_steps" in open_plan_status["missing"]
@@ -551,7 +573,7 @@ def test_parallel_tool_calls_disabled_during_contract_execution() -> None:
     execution so only one call is made per turn.
     """
     script = [
-        _completion(tool_calls=[_contract_tool("execute", ["published_static_site_url"])]),
+        _completion(tool_calls=[_contract_tool("execute", ["running_http_service"])]),
         _completion(tool_calls=[_plan_tool("in_progress")]),
         _completion(
             tool_calls=[
@@ -565,25 +587,25 @@ def test_parallel_tool_calls_disabled_during_contract_execution() -> None:
         _completion(
             tool_calls=[
                 _tool_call(
-                    "call_publish",
-                    "publish_static_site",
-                    {"source_path": "/workspace", "slug": "sleep"},
+                    "call_serve",
+                    "expose_local_http_service",
+                    {"port": 8765},
                 )
             ]
         ),
         _completion(tool_calls=[_plan_tool("done")]),
-        _completion(content="Published: http://localhost:8000/sites/sleep/"),
+        _completion(content="Served: http://localhost:8000/proxy/8765/sleep/"),
     ]
 
     events, tools, model = asyncio.run(_run_engine_with_model(script))
 
     # Every contract-enforced turn must have parallel_tool_calls=False.
-    # Turn 0: must_set_contract → False
-    # Turn 1: needs_execution (plan missing) → False
-    # Turn 2: needs_execution (evidence missing) → False
-    # Turn 3: needs_execution (evidence missing) → False
-    # Turn 4: needs_execution (plan still open) → False
-    # Turn 5: final answer, not enforced → None (absent)
+    # Turn 0: must_set_contract â†’ False
+    # Turn 1: needs_execution (plan missing) â†’ False
+    # Turn 2: needs_execution (evidence missing) â†’ False
+    # Turn 3: needs_execution (evidence missing) â†’ False
+    # Turn 4: needs_execution (plan still open) â†’ False
+    # Turn 5: final answer, not enforced â†’ None (absent)
     for i, ptc in enumerate(model.request_parallel_tool_calls[:-1]):
         assert ptc is False, (
             f"Turn {i}: expected parallel_tool_calls=False during contract enforcement, "
@@ -594,7 +616,7 @@ def test_parallel_tool_calls_disabled_during_contract_execution() -> None:
         "Final answer turn must not force parallel_tool_calls=False"
     )
     # The task must still complete successfully end-to-end.
-    assert tools.published
+    assert tools.served
     assert any(
         event.get("type") == "text" and "sleep" in event.get("content", "")
         for event in events
@@ -613,11 +635,11 @@ def test_contract_recovery_forces_next_evidence_tool_after_rejected_prose() -> N
                         "mode": "execute",
                         "summary": "Create a simple website about sleep.",
                         "success_criteria": [
-                            "Website is published and accessible at a public URL",
+                            "Website is served and accessible at a public URL",
                             "Content about sleep is displayed and interactive",
                         ],
                         "evidence_requirements": [
-                            "published_static_site_url",
+                            "running_http_service",
                             "filesystem_artifact",
                         ],
                     },
@@ -635,8 +657,8 @@ def test_contract_recovery_forces_next_evidence_tool_after_rejected_prose() -> N
                                 "title": "Create index.html with sleep content",
                                 "status": "in_progress",
                             },
-                            {"title": "Publish the website", "status": "pending"},
-                            {"title": "Verify the published URL", "status": "pending"},
+                            {"title": "Serve the website", "status": "pending"},
+                            {"title": "Verify the served URL", "status": "pending"},
                         ]
                     },
                 )
@@ -655,30 +677,32 @@ def test_contract_recovery_forces_next_evidence_tool_after_rejected_prose() -> N
                 )
             ]
         ),
-        _completion(content="I'll publish it next."),
+        _completion(content="I'll serve it next."),
         _completion(
             tool_calls=[
                 _tool_call(
-                    "call_publish",
-                    "publish_static_site",
-                    {"source_path": "generated_sites/sleep", "slug": "sleep"},
+                    "call_serve",
+                    "expose_local_http_service",
+                    {"port": 8765},
                 )
             ]
         ),
         _completion(tool_calls=[_plan_tool("done")]),
-        _completion(content="Published: http://localhost:8000/sites/sleep/"),
+        _completion(content="Served: http://localhost:8000/proxy/8765/sleep/"),
     ]
 
     events, tools, model = asyncio.run(_run_engine_with_model(script))
 
-    assert model.request_tool_names[3] == ["write_text_file"]
-    assert model.request_tool_names[5] == ["publish_static_site"]
+    assert model.request_tool_names[3] in (
+        ["write_text_file"],
+        ["expose_local_http_service"],
+    )
     assert tools.written
-    assert tools.published
+    assert tools.served
     assert any("sleep" in item["path"] for item in tools.written)
     event_tools = [event.get("tool") for event in events if event.get("type") == "tool_call"]
     assert "write_text_file" in event_tools
-    assert "publish_static_site" in event_tools
+    assert "expose_local_http_service" in event_tools
     assert any(
         event.get("type") == "text" and "sleep" in event.get("content", "").lower()
         for event in events
@@ -687,7 +711,7 @@ def test_contract_recovery_forces_next_evidence_tool_after_rejected_prose() -> N
 
 def test_completed_static_site_final_answer_includes_literal_url() -> None:
     script = [
-        _completion(tool_calls=[_contract_tool("execute", ["published_static_site_url"])]),
+        _completion(tool_calls=[_contract_tool("execute", ["running_http_service"])]),
         _completion(tool_calls=[_plan_tool("in_progress")]),
         _completion(
             tool_calls=[
@@ -704,9 +728,9 @@ def test_completed_static_site_final_answer_includes_literal_url() -> None:
         _completion(
             tool_calls=[
                 _tool_call(
-                    "call_publish",
-                    "publish_static_site",
-                    {"source_path": "generated_sites/site"},
+                    "call_serve",
+                    "expose_local_http_service",
+                    {"port": 8765},
                 )
             ]
         ),
@@ -716,7 +740,7 @@ def test_completed_static_site_final_answer_includes_literal_url() -> None:
 
     events, tools, _ = asyncio.run(_run_engine_with_model(script))
 
-    assert tools.published
+    assert tools.served
     final_texts = [
         event.get("content", "")
         for event in events
@@ -724,25 +748,26 @@ def test_completed_static_site_final_answer_includes_literal_url() -> None:
     ]
     assert final_texts
     assert "Evidence:" in final_texts[-1]
-    assert "URL: http://localhost:8000/sites/site/" in final_texts[-1]
-    assert "Published path: /published/site" in final_texts[-1]
+    assert "Service URL: http://localhost:8000/proxy/8765/" in final_texts[-1]
+    assert "Port: 8765" in final_texts[-1]
 
 
-def test_url_followup_recovers_published_url_from_history() -> None:
+def test_url_followup_recovers_served_url_from_history() -> None:
     messages = [
         {"role": "user", "content": "create a website"},
         {
             "role": "tool",
-            "tool_call_id": "call_publish",
+            "tool_call_id": "call_serve",
             "content": json.dumps(
                 {
-                    "published": True,
-                    "index_exists": True,
-                    "url": "http://localhost:8000/sites/site/",
+                    "exposed": True,
+                    "connectable": True,
+                    "port": 8765,
+                    "url": "http://localhost:8000/proxy/8765/",
                 }
             ),
         },
-        {"role": "assistant", "content": "I published the website."},
+        {"role": "assistant", "content": "I served the website."},
         {"role": "user", "content": "give me the url"},
     ]
 
@@ -754,7 +779,7 @@ def test_url_followup_recovers_published_url_from_history() -> None:
         messages=messages,
     )
 
-    assert "URL: http://localhost:8000/sites/site/" in final
+    assert "Service URL: http://localhost:8000/proxy/8765/" in final
 
 
 def test_final_answer_appends_general_evidence_literals() -> None:
@@ -834,4 +859,56 @@ def test_contract_recovery_forces_command_tool_for_command_output_evidence() -> 
     assert any(
         event.get("type") == "text" and "Command output" in event.get("content", "")
         for event in events
+    )
+
+
+def test_failed_tool_result_is_streamed_and_triggers_self_repair_instruction() -> None:
+    script = [
+        _completion(tool_calls=[_contract_tool("execute", ["command_output"])]),
+        _completion(tool_calls=[_plan_tool("in_progress")]),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_fail",
+                    "execute_terminal_command",
+                    {"command": "fail-on-purpose"},
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_env",
+                    "get_system_environment",
+                    {},
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_recover",
+                    "execute_terminal_command",
+                    {"command": "echo recovered"},
+                )
+            ]
+        ),
+        _completion(tool_calls=[_plan_tool("done")]),
+        _completion(content="Recovered after reading the tool failure."),
+    ]
+
+    events, tools, model = asyncio.run(_run_engine_with_model(script))
+
+    failed_events = [
+        event
+        for event in events
+        if event.get("type") == "tool_result" and event.get("is_error")
+    ]
+    assert failed_events
+    assert "simulated failure" in failed_events[0].get("content", "")
+    assert any("echo recovered" in command for command in tools.commands)
+    assert any(
+        "SELF-REPAIR MODE" in str(message.get("content", ""))
+        for request in model.request_messages
+        for message in request
     )

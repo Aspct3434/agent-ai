@@ -24,9 +24,10 @@ from contract import (
     _expose_local_http_service_evidence_is_positive,
     _filesystem_process_evidence_is_positive,
     _last_host_command,
-    _publish_static_site_evidence_is_positive,
     _should_block_tool_for_action_task,
     _successful_command_output_evidence,
+    _terminal_failure_recovery_message,
+    _terminal_failure_since_diagnostic,
     _tool_names_for_contract_status,
     _write_text_file_evidence_is_positive,
 )
@@ -48,38 +49,11 @@ from planning import (
     _prune_message_window,
     _store_iteration_cap_memory,
 )
+from agent import _filesystem_process_evidence_has_negative_findings
 
 # ===========================================================================
 # contract.py — evidence parsers
 # ===========================================================================
-
-class TestPublishStaticSiteEvidence:
-    def test_positive(self):
-        content = json.dumps({"published": True, "index_exists": True, "url": "http://x"})
-        assert _publish_static_site_evidence_is_positive(content)
-
-    def test_missing_url(self):
-        content = json.dumps({"published": True, "index_exists": True})
-        assert not _publish_static_site_evidence_is_positive(content)
-
-    def test_invalid_json(self):
-        assert not _publish_static_site_evidence_is_positive("not-json")
-
-    def test_false_published(self):
-        content = json.dumps({"published": False, "index_exists": True, "url": "http://x"})
-        assert not _publish_static_site_evidence_is_positive(content)
-
-    def test_placeholder_quality_rejected(self):
-        content = json.dumps(
-            {
-                "published": True,
-                "index_exists": True,
-                "url": "http://x",
-                "artifact_quality": {"placeholder_detected": True},
-            }
-        )
-        assert not _publish_static_site_evidence_is_positive(content)
-
 
 class TestWriteTextFileEvidence:
     def test_positive(self):
@@ -108,8 +82,8 @@ class TestWriteTextFileEvidence:
         contract = {
             "mode": "execute",
             "summary": "Create a highly interactive website about sleep.",
-            "success_criteria": ["Highly interactive website is published"],
-            "evidence_requirements": ["published_static_site_url"],
+            "success_criteria": ["Highly interactive website file exists"],
+            "evidence_requirements": ["filesystem_artifact"],
         }
         messages = [
             {
@@ -131,9 +105,9 @@ class TestWriteTextFileEvidence:
                 kind="tool_result",
                 content=json.dumps(
                     {
-                        "published": True,
-                        "index_exists": True,
-                        "url": "http://x",
+                        "written": True,
+                        "exists": True,
+                        "size_bytes": 42,
                         "artifact_quality": {
                             "placeholder_detected": False,
                             "interactive_signal_count": 0,
@@ -142,7 +116,7 @@ class TestWriteTextFileEvidence:
                         },
                     }
                 ),
-                metadata={"tool_name": "publish_static_site", "is_error": False},
+                metadata={"tool_name": "write_text_file", "is_error": False},
             )
         ]
 
@@ -196,6 +170,31 @@ class TestFilesystemProcessEvidence:
         assert not _filesystem_process_evidence_is_positive("??")
 
 
+class TestFilesystemProcessEvidenceNegativeFindings:
+    def test_missing_path_is_negative_finding(self):
+        content = json.dumps({"paths": [{"path": "/usr/bin/java", "exists": False}]})
+        assert _filesystem_process_evidence_has_negative_findings(content)
+
+    def test_open_port_is_not_negative_finding(self):
+        content = json.dumps({"ports": [{"port": 25565, "connectable": True}]})
+        assert not _filesystem_process_evidence_has_negative_findings(content)
+
+    def test_mixed_ports_are_not_negative_when_one_target_is_open(self):
+        content = json.dumps(
+            {
+                "ports": [
+                    {"port": 25565, "connectable": True},
+                    {"port": 25575, "connectable": False},
+                ]
+            }
+        )
+        assert not _filesystem_process_evidence_has_negative_findings(content)
+
+    def test_all_closed_ports_are_negative(self):
+        content = json.dumps({"ports": [{"port": 25565, "connectable": False}]})
+        assert _filesystem_process_evidence_has_negative_findings(content)
+
+
 class TestSuccessfulCommandOutputEvidence:
     def test_terminal_exit0_with_stdout(self):
         content = json.dumps({"exit_code": 0, "stdout": "ok", "stderr": ""})
@@ -240,15 +239,25 @@ def _make_step(tool_name: str, content: str, is_error: bool = False) -> Executio
 
 
 class TestEvidenceRequirementSatisfied:
-    def test_published_static_site_url(self):
-        content = json.dumps({"published": True, "index_exists": True, "url": "http://x"})
-        steps = [_make_step("publish_static_site", content)]
-        assert _evidence_requirement_satisfied("published_static_site_url", steps)
-
     def test_running_http_service(self):
         content = json.dumps({"exposed": True, "connectable": True, "url": "http://localhost:5000"})
         steps = [_make_step("expose_local_http_service", content)]
         assert _evidence_requirement_satisfied("running_http_service", steps)
+
+    def test_running_tcp_service_via_wait_for_port(self):
+        content = json.dumps({"open": True, "port": 25565})
+        steps = [_make_step("wait_for_port", content)]
+        assert _evidence_requirement_satisfied("running_tcp_service", steps)
+
+    def test_running_tcp_service_via_process_evidence(self):
+        content = json.dumps({"ports": [{"port": 25565, "connectable": True}]})
+        steps = [_make_step("get_filesystem_process_evidence", content)]
+        assert _evidence_requirement_satisfied("running_tcp_service", steps)
+
+    def test_running_tcp_service_not_satisfied_by_existing_file(self):
+        content = json.dumps({"paths": [{"path": "/workspace/eula.txt", "exists": True}], "ports": []})
+        steps = [_make_step("get_filesystem_process_evidence", content)]
+        assert not _evidence_requirement_satisfied("running_tcp_service", steps)
 
     def test_filesystem_artifact_via_write_text_file(self):
         content = json.dumps({"written": True, "exists": True, "size_bytes": 10})
@@ -260,10 +269,10 @@ class TestEvidenceRequirementSatisfied:
         steps = [_make_step("get_filesystem_process_evidence", content)]
         assert _evidence_requirement_satisfied("filesystem_artifact", steps)
 
-    def test_filesystem_artifact_via_publish(self):
-        content = json.dumps({"published": True, "index_exists": True, "url": "http://x"})
-        steps = [_make_step("publish_static_site", content)]
-        assert _evidence_requirement_satisfied("filesystem_artifact", steps)
+    def test_filesystem_artifact_requires_all_checked_paths(self):
+        content = json.dumps({"paths": [{"path": "/usr/bin/java", "exists": False}, {"path": "/workspace/eula.txt", "exists": True}]})
+        steps = [_make_step("get_filesystem_process_evidence", content)]
+        assert not _evidence_requirement_satisfied("filesystem_artifact", steps)
 
     def test_database_mutation(self):
         steps = [_make_step("create_table", "ok")]
@@ -285,7 +294,7 @@ class TestEvidenceRequirementSatisfied:
 
     def test_wrong_tool_not_satisfied(self):
         steps = [_make_step("some_tool", "ok")]
-        assert not _evidence_requirement_satisfied("published_static_site_url", steps)
+        assert not _evidence_requirement_satisfied("running_http_service", steps)
 
 
 class TestToolNamesForContractStatus:
@@ -302,6 +311,14 @@ class TestToolNamesForContractStatus:
             {"missing": ["filesystem_artifact"]},
         )
         assert "write_text_file" in names or "execute_terminal_command" in names
+
+    def test_missing_tcp_evidence(self):
+        names = _tool_names_for_contract_status(
+            {"evidence_requirements": ["running_tcp_service"]},
+            {"missing": ["running_tcp_service"]},
+        )
+        assert "wait_for_port" in names
+        assert "get_filesystem_process_evidence" in names
 
     def test_missing_plan_open_steps(self):
         names = _tool_names_for_contract_status(
@@ -365,6 +382,24 @@ class TestDuplicateCommandMessage:
     def test_message_contains_tool_name(self):
         msg = _duplicate_command_message("execute_terminal_command")
         assert "execute_terminal_command" in msg
+
+
+class TestTerminalFailureRecovery:
+    def test_detects_terminal_failure_until_diagnostic(self):
+        failed = _make_step(
+            "execute_terminal_command",
+            json.dumps({"exit_code": 127, "stderr": "java: not found"}),
+            is_error=True,
+        )
+        assert _terminal_failure_since_diagnostic([failed])
+
+        diagnostic = _make_step("get_system_environment", "{}", is_error=False)
+        assert not _terminal_failure_since_diagnostic([failed, diagnostic])
+
+    def test_recovery_message_mentions_diagnostic_tools(self):
+        msg = _terminal_failure_recovery_message("java -version")
+        assert "get_system_environment" in msg
+        assert "java -version" in msg
 
 
 class TestBuildIncompleteContractCapMessage:

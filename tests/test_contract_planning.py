@@ -150,6 +150,48 @@ class TestNormaliseTaskContract:
         assert err is None
         assert contract["evidence_requirements"].count("filesystem_artifact") == 1
 
+    def test_running_tcp_service_evidence_is_valid(self):
+        contract, err = _normalise_task_contract({
+            "mode": "execute",
+            "summary": "start a generic TCP service",
+            "success_criteria": ["port listens"],
+            "evidence_requirements": ["running_tcp_service"],
+        })
+        assert err is None
+        assert contract["evidence_requirements"] == ["running_tcp_service"]
+
+    def test_non_http_service_contract_corrects_http_evidence_to_tcp(self):
+        contract, err = _normalise_task_contract({
+            "mode": "execute",
+            "summary": "Install a generic server process",
+            "success_criteria": ["Server binds to port 25565"],
+            "evidence_requirements": ["running_http_service"],
+        })
+        assert err is None
+        assert contract["evidence_requirements"] == ["running_tcp_service"]
+
+    def test_contract_sanitizes_host_wording(self):
+        contract, err = _normalise_task_contract({
+            "mode": "execute",
+            "summary": "Install a simple server on the host",
+            "success_criteria": ["host system has a listening port"],
+            "evidence_requirements": ["running_tcp_service"],
+        })
+        assert err is None
+        assert "host" not in contract["summary"].lower()
+        assert "host" not in contract["success_criteria"][0].lower()
+
+    def test_downloaded_artifact_adds_filesystem_evidence(self):
+        contract, err = _normalise_task_contract({
+            "mode": "execute",
+            "summary": "Install and start a server",
+            "success_criteria": ["Server JAR is downloaded", "TCP port listens"],
+            "evidence_requirements": ["running_tcp_service"],
+        })
+        assert err is None
+        assert "running_tcp_service" in contract["evidence_requirements"]
+        assert "filesystem_artifact" in contract["evidence_requirements"]
+
     def test_run_set_task_contract_ok(self):
         result, is_error = _run_set_task_contract({
             "mode": "answer",
@@ -436,11 +478,11 @@ def _tool_result_step(tool_name: str, is_error: bool = False) -> ExecutionStep:
 
 
 class TestBuildContractExecutionInstruction:
-    _PUBLISH_CONTRACT = {
+    _HTTP_CONTRACT = {
         "mode": "execute",
-        "summary": "build sleep website",
-        "success_criteria": ["site published"],
-        "evidence_requirements": ["published_static_site_url"],
+        "summary": "serve sleep website",
+        "success_criteria": ["site is served over HTTP"],
+        "evidence_requirements": ["running_http_service"],
     }
     _MSGS = [{"role": "user", "content": "build site"}]
 
@@ -456,43 +498,18 @@ class TestBuildContractExecutionInstruction:
         instruction = _build_contract_execution_instruction(contract, status, messages)
         assert "update_plan" in instruction.lower()
 
-    def test_write_text_file_immediate_when_not_yet_called(self):
-        """When published_static_site_url is missing and write_text_file hasn't
-        been called yet, the instruction must say to call write_text_file immediately.
-        This was the root cause of the agent stalling after update_plan."""
+    def test_http_service_evidence_guides_runtime_work(self):
         status = {
             "complete": False,
-            "missing": ["plan_open_steps", "published_static_site_url"],
+            "missing": ["plan_open_steps", "running_http_service"],
             "plan_open": True,
         }
         steps = [_tool_result_step("set_task_contract"), _tool_result_step("update_plan")]
         instruction = _build_contract_execution_instruction(
-            self._PUBLISH_CONTRACT, status, self._MSGS, steps
+            self._HTTP_CONTRACT, status, self._MSGS, steps
         )
         low = instruction.lower()
-        assert "write_text_file" in low
-        assert "immediate" in low or "right now" in low
-        # Must NOT suggest update_plan again at this point
-        assert "do not call update_plan" in low or "not call update_plan" in low
-
-    def test_publish_static_site_next_when_file_already_written(self):
-        """Once write_text_file has been called, the instruction must point to
-        publish_static_site as the next step."""
-        status = {
-            "complete": False,
-            "missing": ["plan_open_steps", "published_static_site_url"],
-            "plan_open": True,
-        }
-        steps = [
-            _tool_result_step("set_task_contract"),
-            _tool_result_step("update_plan"),
-            _tool_result_step("write_text_file"),
-        ]
-        instruction = _build_contract_execution_instruction(
-            self._PUBLISH_CONTRACT, status, self._MSGS, steps
-        )
-        low = instruction.lower()
-        assert "publish_static_site" in low
+        assert "execute_background_service" in low or "expose_local_http_service" in low
         assert "do not call update_plan" in low or "not call update_plan" in low
 
     def test_tools_called_so_far_appears_in_instruction(self):
@@ -500,12 +517,12 @@ class TestBuildContractExecutionInstruction:
         model can see its own progress without re-reading the full history."""
         status = {
             "complete": False,
-            "missing": ["plan_open_steps", "published_static_site_url"],
+            "missing": ["plan_open_steps", "running_http_service"],
             "plan_open": True,
         }
         steps = [_tool_result_step("update_plan")]
         instruction = _build_contract_execution_instruction(
-            self._PUBLISH_CONTRACT, status, self._MSGS, steps
+            self._HTTP_CONTRACT, status, self._MSGS, steps
         )
         assert "update_plan" in instruction
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -17,7 +17,7 @@ from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller  # noqa
 
 def _trajectory() -> ExecutionTrajectory:
     return ExecutionTrajectory(
-        prompt="Create and publish a reusable static site for a topic",
+        prompt="Create and serve a reusable static site for a topic",
         steps=[
             ExecutionStep(
                 kind="tool_result",
@@ -32,19 +32,19 @@ def _trajectory() -> ExecutionTrajectory:
                 kind="tool_result",
                 content=json.dumps(
                     {
-                        "published": True,
-                        "index_exists": True,
-                        "url": "http://localhost:8000/sites/example/",
+                        "exposed": True,
+                        "connectable": True,
+                        "url": "http://localhost:8000/proxy/8765/",
                     }
                 ),
                 metadata={
-                    "tool_name": "publish_static_site",
+                    "tool_name": "expose_local_http_service",
                     "is_error": False,
-                    "arguments": {"source_path": "/tmp/site", "slug": "example"},
+                    "arguments": {"port": 8765},
                 },
             ),
         ],
-        final_output="Published http://localhost:8000/sites/example/",
+        final_output="Served http://localhost:8000/proxy/8765/",
     )
 
 
@@ -65,6 +65,7 @@ def test_skill_distiller_without_model_creates_no_skill() -> None:
 
 
 async def _fake_synthesis_completion(**kwargs: Any) -> Any:
+    _fake_synthesis_completion.calls.append(kwargs)
     code = """```python
 from __future__ import annotations
 from _skill import skill
@@ -83,9 +84,13 @@ def write_topic_site(topic: str, output_dir: str = "/tmp/topic-site") -> str:
     )
 
 
+_fake_synthesis_completion.calls = []
+
+
 async def _distill_with_model() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         original_completion = evaluator_module.litellm.acompletion
+        _fake_synthesis_completion.calls.clear()
         evaluator_module.litellm.acompletion = _fake_synthesis_completion
         try:
             trajectory = _trajectory()
@@ -105,10 +110,29 @@ async def _distill_with_model() -> None:
         assert "def write_topic_site(topic: str" in source
         assert "Path(output_dir)" in source
         assert trajectory.final_output not in source
+        assert _fake_synthesis_completion.calls[-1]["temperature"] == 0.2
 
 
 def test_skill_distiller_writes_parameterized_skill_from_model() -> None:
     asyncio.run(_distill_with_model())
+
+
+async def _distill_with_moonshot_model() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        original_completion = evaluator_module.litellm.acompletion
+        _fake_synthesis_completion.calls.clear()
+        evaluator_module.litellm.acompletion = _fake_synthesis_completion
+        try:
+            distiller = SkillDistiller(skills_dir=tmp, model="moonshot/kimi-k2.6")
+            await distiller._distill(_trajectory())
+        finally:
+            evaluator_module.litellm.acompletion = original_completion
+
+        assert _fake_synthesis_completion.calls[-1]["temperature"] == 1.0
+
+
+def test_skill_distiller_uses_moonshot_temperature() -> None:
+    asyncio.run(_distill_with_moonshot_model())
 
 
 if __name__ == "__main__":

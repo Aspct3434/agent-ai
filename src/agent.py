@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -39,9 +39,11 @@ from contract import (
     _repeated_tool_call_message,
     _run_set_task_contract,
     _should_block_tool_for_action_task,
+    _terminal_failure_recovery_message,
+    _terminal_failure_since_diagnostic,
     _tool_names_for_contract_status,
 )
-from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller
+from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller, extract_and_update_user_profile
 from llm_utils import (
     _acompletion_stream_with_retry,
     _is_async_iterable,
@@ -66,7 +68,8 @@ from tools import ToolManager
 from toolsets import filter_tools_by_toolset
 
 if TYPE_CHECKING:
-    from memory import HybridMemory
+    from memory import HybridMemory, UserProfileStore
+    from scheduler import CronScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -131,12 +134,6 @@ def _evidence_items_from_payload(
 
     items: list[tuple[str, str]] = []
     url = payload.get("url")
-    if payload.get("published") and payload.get("index_exists"):
-        if isinstance(url, str) and url.startswith(("http://", "https://")):
-            items.append(("URL", url))
-        published_path = payload.get("published_path")
-        if isinstance(published_path, str) and published_path:
-            items.append(("Published path", published_path))
     if payload.get("exposed") and payload.get("connectable"):
         if isinstance(url, str) and url.startswith(("http://", "https://")):
             items.append(("Service URL", url))
@@ -222,7 +219,7 @@ def _should_include_evidence_summary(
         for token in (
             "url",
             "link",
-            "published",
+            "served",
             "site",
             "website",
             "open",
@@ -315,12 +312,6 @@ def _preferred_recovery_tool_name(
             if "write_text_file" in available_tool_names:
                 return "write_text_file"
 
-        if requirement == "published_static_site_url":
-            if "write_text_file" not in succeeded and "write_text_file" in available_tool_names:
-                return "write_text_file"
-            if "publish_static_site" in available_tool_names:
-                return "publish_static_site"
-
         if requirement == "running_http_service":
             if (
                 "execute_background_service" not in succeeded
@@ -329,6 +320,17 @@ def _preferred_recovery_tool_name(
                 return "execute_background_service"
             if "expose_local_http_service" in available_tool_names:
                 return "expose_local_http_service"
+
+        if requirement == "running_tcp_service":
+            if (
+                "execute_background_service" not in succeeded
+                and "execute_background_service" in available_tool_names
+            ):
+                return "execute_background_service"
+            if "wait_for_port" in available_tool_names:
+                return "wait_for_port"
+            if "get_filesystem_process_evidence" in available_tool_names:
+                return "get_filesystem_process_evidence"
 
         if requirement == "database_mutation":
             for name in ("write_query", "create_table"):
@@ -350,6 +352,100 @@ def _preferred_recovery_tool_name(
                     return name
 
     return None
+
+
+def _recent_tool_failures(steps: list[ExecutionStep], limit: int = 3) -> list[ExecutionStep]:
+    failures: list[ExecutionStep] = []
+    for step in reversed(steps):
+        if step.kind != "tool_result":
+            continue
+        if step.metadata.get("is_error"):
+            failures.append(step)
+            if len(failures) >= limit:
+                break
+        elif failures:
+            break
+    return list(reversed(failures))
+
+
+def _build_self_repair_instruction(steps: list[ExecutionStep]) -> str:
+    failures = _recent_tool_failures(steps)
+    lines = []
+    for step in failures:
+        tool_name = str(step.metadata.get("tool_name") or "unknown_tool")
+        _, text = _classify_tool_result(tool_name, step.content)
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if first_line:
+            lines.append(f"- {tool_name}: {first_line[:220]}")
+        else:
+            lines.append(f"- {tool_name}: failed with no output")
+    failure_block = "\n".join(lines) or "- unknown failure"
+    return (
+        "SELF-REPAIR MODE: one or more tool calls failed.\n"
+        f"Recent failures:\n{failure_block}\n"
+        "Before running another mutating command, diagnose the failure and choose a "
+        "different strategy. Use get_system_environment to confirm the execution "
+        "environment, get_filesystem_process_evidence to inspect actual files, "
+        "processes, and ports, expand_tool_output for truncated logs, and web_search "
+        "or web_fetch for unfamiliar error messages. Do not keep rephrasing the same "
+        "shell operation with different wrappers. If the error proves the requested "
+        "execution environment is unavailable, report that blocker clearly and stop "
+        "instead of mutating the wrong host."
+    )
+
+
+def _json_tool_result_has_error(content: str, *, false_open_is_error: bool = False) -> bool:
+    try:
+        data = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("error"):
+        return True
+    if false_open_is_error and data.get("open") is False:
+        return True
+    return False
+
+
+def _filesystem_process_evidence_has_negative_findings(content: str) -> bool:
+    """True when an evidence probe disproves the thing it was asked to verify."""
+    try:
+        data = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    if data.get("error"):
+        return True
+
+    paths = data.get("paths")
+    if isinstance(paths, list) and any(
+        isinstance(path, dict) and path.get("exists") is False for path in paths
+    ):
+        return True
+
+    pids = data.get("pids")
+    if isinstance(pids, list) and any(
+        isinstance(pid, dict) and pid.get("running") is False for pid in pids
+    ):
+        return True
+
+    process_names = data.get("process_names")
+    process_entries = [
+        process for process in process_names or [] if isinstance(process, dict)
+    ] if isinstance(process_names, list) else []
+    if process_entries and not any(
+        int(process.get("count") or 0) > 0 for process in process_entries
+    ):
+        return True
+
+    ports = data.get("ports")
+    port_entries = [port for port in ports or [] if isinstance(port, dict)] if isinstance(ports, list) else []
+    if port_entries and not any(port.get("connectable") is True for port in port_entries):
+        return True
+
+    return False
 
 
 MAX_REACT_ITERATIONS = int(os.getenv("AGENT_MAX_REACT_ITERATIONS", "16"))
@@ -415,7 +511,7 @@ _PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset(
     {
         "get_system_environment",
         "get_filesystem_process_evidence",
-        # Web tools are read-only network calls — safe to run concurrently
+        # Web tools are read-only network calls â€” safe to run concurrently
         "web_fetch",
         "web_search",
         "expand_tool_output",
@@ -448,6 +544,17 @@ _TOOL_OUTPUT_PREVIEW_TAIL_LINES = 20
 # Hard cap on a single expand_tool_output window so paging can't re-bloat context.
 _EXPAND_MAX_LINES = 500
 
+_SELF_REPAIR_TOOLS: frozenset[str] = frozenset(
+    {
+        "get_system_environment",
+        "get_filesystem_process_evidence",
+        "web_search",
+        "web_fetch",
+        "expand_tool_output",
+        "wait_for_port",
+    }
+)
+
 SYSTEM_DIRECTIVE = (
     "You are an autonomous engineering framework, not a conversational chatbot. "
     "NEVER output generic greetings, and NEVER ask the user what they want to do. "
@@ -455,7 +562,7 @@ SYSTEM_DIRECTIVE = (
     "Instead, proactively use your tools: inspect the database schema, check the "
     "ChromaDB memory state, or look at the skills directory, and report a highly "
     "technical summary of the system state. Act immediately. Execute silently. "
-    # ── Task contract ────────────────────────────────────────────────────────
+    # â”€â”€ Task contract â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "For every new user task, your FIRST tool call is set_task_contract. Use it to "
     "declare whether the task is a pure text answer or requires real host-side "
     "execution evidence. For any execute-mode task that needs more than one step, "
@@ -465,24 +572,27 @@ SYSTEM_DIRECTIVE = (
     "the plan in sync with what has actually happened, use it to avoid repeating "
     "steps that are already done, and do not give a final answer until every step "
     "is 'done' or 'failed'. "
-    # ── Web tools ────────────────────────────────────────────────────────────
+    # â”€â”€ Web tools â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "You have two web tools that make you general-purpose without custom skills: "
     "web_search and web_fetch. Use them freely. "
     "web_search: find information, look up docs, research a topic, locate solutions "
     "to errors. Returns titles + URLs + snippets. "
-    "web_fetch: read any URL — documentation, GitHub files, API endpoints, search "
+    "web_fetch: read any URL â€” documentation, GitHub files, API endpoints, search "
     "results, news, technical specs. Returns clean readable text. "
     "Standard research pattern: web_search to find candidate URLs, then web_fetch "
     "the most relevant ones to read the full content, then synthesise your answer. "
-    "NEVER write a custom skill just to do web research — use these tools directly. "
+    "NEVER write a custom skill just to do web research â€” use these tools directly. "
     "When you encounter an error (build failure, missing dependency, unfamiliar API), "
-    "web_search the error message before assuming you need a custom workaround. "
-    # ── Terminal ─────────────────────────────────────────────────────────────
+    "read the tool result, identify the root cause, and web_search the exact error "
+    "message before assuming you need a custom workaround. A failed tool call is "
+    "not a reason to ask the user to debug for you: use your environment, evidence, "
+    "web, and log-inspection tools to repair your own approach. "
+    # â”€â”€ Terminal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "You have root access to a terminal shell tool. If the user requests an "
     "installation, setup, or file-system operation, DO NOT explain how the user "
     "can do it manually. Immediately use execute_terminal_command or "
     "execute_background_service to perform the operation, configure the "
-    "environment, and verify that the process is running natively. "
+    "active execution environment, and verify that the process is running there. "
     "After setting the task contract, if the task requires creating, making, "
     "building, scaffolding, writing, editing, serving, or configuring artifacts, "
     "continue with tool calls that perform the work. Do not say 'I'll create it' "
@@ -492,8 +602,8 @@ SYSTEM_DIRECTIVE = (
     "downloaded or an installation succeeded based on the command printout. "
     "Every time you create a file, download a package, or start a server, you "
     "MUST execute a follow-up verification check (e.g., ls -la, cat, or ps aux) "
-    "in the very next iteration to verify the physical state of the host system "
-    "before declaring a task finished. "
+    "in the very next iteration to verify the physical state inside the active "
+    "execution environment before declaring a task finished. "
     "If you are asked to START or RUN a server or continuous process (one that never "
     "terminates on its own), you MUST use the execute_background_service tool; using "
     "the standard terminal for such a process will deadlock. "
@@ -520,7 +630,7 @@ SYSTEM_DIRECTIVE = (
     "never repeat a step already listed under Completed_Actions in the executive "
     "summary; build on finished work and respect ordering (do not start a service "
     "before its prerequisites are installed and in place). "
-    # ── Check tooling once; never assume, never repeat-probe ──────────────────
+    # â”€â”€ Check tooling once; never assume, never repeat-probe â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "Tooling availability is environment-specific, so it is NEVER safe to assume a "
     "runtime exists. Call get_system_environment ONCE and read its 'runtimes' block "
     "to learn what is actually on PATH (node, npm, npx, python, rustc, cargo, ...). "
@@ -531,7 +641,7 @@ SYSTEM_DIRECTIVE = (
     "will only fail). If a runtime is genuinely absent and you cannot install it, do "
     "NOT keep retrying the same command -- switch to an approach that does not need "
     "it (for a website, that means plain HTML/CSS/JS, which needs no toolchain). "
-    # ── Honor the requested technology (no silent substitution) ───────────────
+    # â”€â”€ Honor the requested technology (no silent substitution) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "When the user names a specific framework, language, library, or tool (for "
     "example 'using React', 'in Rust', 'with Next.js', 'a Flask API'), you MUST "
     "deliver exactly that. NEVER silently substitute a different stack -- e.g. do "
@@ -542,11 +652,11 @@ SYSTEM_DIRECTIVE = (
     "truly unavailable and cannot be installed, say so explicitly in your answer "
     "rather than quietly shipping a different deliverable and claiming the task is "
     "done. "
-    # ── Content generation ───────────────────────────────────────────────────
+    # â”€â”€ Content generation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "When asked to produce content (a website, a document, sample data, copy), "
     "generate complete, realistic content yourself -- do NOT ask the user what to "
     "include or leave placeholder text unless they explicitly request a skeleton. "
-    # ── Choosing a web stack: simplest that works (DEFAULT to vanilla HTML) ───
+    # â”€â”€ Choosing a web stack: simplest that works (DEFAULT to vanilla HTML) â”€â”€â”€
     "Choosing how to build a website: pick the SIMPLEST approach that satisfies the "
     "request. If the user asks for 'a website', 'a web page', 'an interactive "
     "website', a landing page, or an info/marketing page WITHOUT naming a framework, "
@@ -554,14 +664,14 @@ SYSTEM_DIRECTIVE = (
     "<style> CSS and vanilla <script> JavaScript. Vanilla JS is fully interactive "
     "(buttons, tabs, toggles, accordions, quizzes, counters, sliders, canvas "
     "animations, charts) and needs NO build step, NO Node.js, and NO npm, so it works "
-    "in every environment and publishes immediately. Write it with write_text_file, "
-    "then publish_static_site, then verify -- typically three tool calls, no scaffold, "
-    "no install. Reach for React, Vue, Svelte, Vite, or Next -- or any npm-based "
+    "in every environment and servees immediately. Write it with write_text_file, "
+    "then serve it from the Docker workspace with a simple HTTP server, wait for "
+    "the port, expose that port, then verify -- no scaffold, no install. Reach for React, Vue, Svelte, Vite, or Next -- or any npm-based "
     "build -- ONLY when the user EXPLICITLY names that framework; in that case first "
     "confirm node/npm exist via get_system_environment, then follow the build recipe "
     "below. Do NOT default to a heavy toolchain the user did not ask for, and do not "
     "scaffold a React/Vite project for a request that never mentioned React. "
-    # ── Website quality bar ──────────────────────────────────────────────────
+    # â”€â”€ Website quality bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "CRITICAL QUALITY RULE for every website you create: a bare skeleton with "
     "unstyled HTML tags is NEVER acceptable. Every website deliverable MUST have: "
     "(1) a complete CSS design with a colour palette, typography (font-family, "
@@ -571,17 +681,18 @@ SYSTEM_DIRECTIVE = (
     "background colours/gradients, border-radius, box-shadow, hover/transition "
     "effects, and a cohesive visual hierarchy; (4) at minimum 100+ words of visible "
     "content. Think of the output as a page you would show a client, not a code "
-    "snippet. Generate ALL content yourself — do not leave blank sections or TODOs. "
-    "If the file is getting large, that is FINE — write the complete content in a "
+    "snippet. Generate ALL content yourself â€” do not leave blank sections or TODOs. "
+    "If the file is getting large, that is FINE â€” write the complete content in a "
     "single write_text_file call. The tool supports large content payloads. "
-    "If the user asks to host, publish, serve, or get a browser URL for a static "
-    "website, use publish_static_site instead of starting python http.server on "
-    "container-only ports. The public URL must use the backend's exposed /sites path. "
-    "A static website deliverable is not complete when files merely exist: after "
-    "creating or editing the site, publish it automatically with publish_static_site, "
-    "verify the published result, and include the working localhost URL in the final "
+    "If the user asks to host, serve, serve, or get a browser URL for a static "
+    "website, start a normal HTTP server in the Docker workspace with "
+    "execute_background_service (for example python -m http.server from the site "
+    "directory), wait_for_port, then expose_local_http_service. The public URL "
+    "must use the backend's generic /proxy/<port>/ path. A website deliverable "
+    "is not complete when files merely exist: after creating or editing the site, "
+    "serve it, verify it, and include the working localhost proxy URL in the final "
     "answer. The user must not need to ask separately for hosting or port setup. "
-    # ── React / Vite / SPA build-and-publish recipe (only when requested) ─────
+    # â”€â”€ React / Vite / SPA build-and-serve recipe (only when requested) â”€â”€â”€â”€â”€
     "When the user EXPLICITLY asked for React/Vue/Svelte/Vite/Next (otherwise use "
     "the vanilla single-file approach above): such a single-page app is NOT a static "
     "site until it is BUILT, and it needs node/npm. Follow this exact sequence: "
@@ -597,20 +708,21 @@ SYSTEM_DIRECTIVE = (
     "(2) run 'npm install' in the project directory and let it finish. "
     "(3) run 'npm run build' -- this produces the production bundle in the 'dist/' "
     "folder (Vite) or 'build/' folder (CRA). "
-    "(4) call publish_static_site on that built output directory (the 'dist/' or "
-    "'build/' folder that contains the compiled index.html) -- NEVER on the project "
-    "root, which has only source files and no compiled index.html. "
-    "(5) verify the returned URL. "
+    "(4) serve the built output directory (the 'dist/' or 'build/' folder that "
+    "contains the compiled index.html) with execute_background_service, then "
+    "wait_for_port and expose_local_http_service -- NEVER serve the project root, "
+    "which has only source files and no compiled index.html. "
+    "(5) verify the returned proxy URL. "
     "If the user instead wants a live dev server, run 'npm run dev' with "
     "execute_background_service and expose it with expose_local_http_service. "
-    "Do not declare the task done until the built app is published or served and "
+    "Do not declare the task done until the built app is served or served and "
     "verified -- and do not waste turns re-writing the same source file you already "
     "wrote; check Completed_Actions first. "
     "If you start any HTTP app, API, dashboard, notebook, frontend dev server, or "
     "browser UI on an internal container port, call expose_local_http_service after "
     "the service is listening and give the returned /proxy URL. Do not ask the user "
     "to manually open ports or edit Docker Compose for normal HTTP access. "
-    # ── Output format ────────────────────────────────────────────────────────
+    # â”€â”€ Output format â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "Final answers must use clear GitHub-flavored Markdown. Use bold section labels "
     "and concise bullets when helpful. Include one to three relevant emoji characters "
     "in user-facing status summaries, but keep the tone professional and do not "
@@ -641,6 +753,14 @@ _SUB_AGENT_DIRECTIVES: dict[str, str] = {
         "Report every finding with: file, line number, severity (CRITICAL/HIGH/MEDIUM/"
         "LOW), a one-line description, and a concrete remediation. Miss nothing. "
         "Do not soften findings. If the code is clean, say so explicitly."
+    ),
+    "planner": (
+        "You are a specialist planning sub-agent. Break the given goal into a concrete, "
+        "ordered sequence of verifiable steps. Each step must be atomic (one action), "
+        "testable (a clear done/not-done condition), and assigned to the right agent "
+        "type (researcher/coder/auditor). Output a JSON array of steps: "
+        '[{"step": 1, "agent": "coder", "action": "...", "done_when": "..."}]. '
+        "Do not implement anything. Plan only."
     ),
 }
 
@@ -681,15 +801,13 @@ class AgentEngine:
         fast_model: str | None = None,
         strong_model: str | None = None,
         require_task_contract: bool = True,
+        profile_store: UserProfileStore | None = None,
+        scheduler: CronScheduler | None = None,
+        persona_content: str = "",
     ) -> None:
         self._memory = memory
         self._tools = tools
         self._model = model
-        # Model tiers: routine work runs on the cheap fast model and only escalates
-        # to the strong model when a step needs it (repeated failures, or a coder/
-        # auditor delegation). Both default to *model*, so tiering is a no-op until
-        # configured. Tiers are assumed to share a provider (all Claude) -- caching
-        # is only enabled when BOTH tiers accept Anthropic cache_control markers.
         self._fast_model = fast_model or model
         self._strong_model = strong_model or model
         self._caching_enabled = _model_supports_caching(
@@ -697,11 +815,32 @@ class AgentEngine:
         ) and _model_supports_caching(self._strong_model)
         self._distiller = distiller
         self._checkpointer = checkpointer
-        self._system_directive = system_directive if system_directive is not None else SYSTEM_DIRECTIVE
+        base_directive = system_directive if system_directive is not None else SYSTEM_DIRECTIVE
+        # Prepend persona content (SOUL.md + AGENTS.md + TOOLS.md) when available.
+        self._system_directive = (
+            f"{persona_content}\n\n{base_directive}" if persona_content else base_directive
+        )
         self._require_task_contract = require_task_contract
-        # Durable conversation history per session_id. Each turn appends to the
-        # same list so follow-ups ("yes", "continue") resolve against prior work.
+        self._profile_store = profile_store
+        self._scheduler = scheduler
         self._histories: dict[str, list[dict[str, Any]]] = {}
+
+    def update_models(
+        self,
+        model: str | None = None,
+        fast_model: str | None = None,
+        strong_model: str | None = None,
+    ) -> None:
+        """Hot-swap model tiers without restarting the engine."""
+        if model:
+            self._model = model
+        if fast_model:
+            self._fast_model = fast_model
+        if strong_model:
+            self._strong_model = strong_model
+        self._caching_enabled = _model_supports_caching(
+            self._fast_model
+        ) and _model_supports_caching(self._strong_model)
 
     # ------------------------------------------------------------------
     # Public API
@@ -739,6 +878,10 @@ class AgentEngine:
                 {"role": "system", "content": _build_system_prompt(context)},
                 self._build_host_environment_message(),
             ]
+            # Inject user profile if available — gives the agent personalization context.
+            user_ctx = self._build_user_profile_message()
+            if user_ctx:
+                messages.append(user_ctx)
             if _BOOTSTRAP_SESSIONS:
                 messages.extend(await self._bootstrap_session(tool_index, all_tools))
             self._histories[message.session_id] = messages
@@ -902,7 +1045,7 @@ class AgentEngine:
                         ),
                     }
                 )
-                yield {"type": "status", "message": "Still working autonomouslyâ€¦"}
+                yield {"type": "status", "message": "Still working autonomouslyÃ¢â‚¬Â¦"}
                 continue
 
             # Auto-continue exhausted or no progress: surface the paused message.
@@ -1030,6 +1173,13 @@ class AgentEngine:
                     else:
                         forced_recovery_tool = None
                         recovery_note = ""
+                        if _recent_tool_failures(steps):
+                            allowed_tool_names.update(
+                                name
+                                for name in _SELF_REPAIR_TOOLS
+                                if name in available_tool_names
+                            )
+                            recovery_note = "\n" + _build_self_repair_instruction(steps)
                     request_messages = [
                         *request_messages,
                         {
@@ -1079,7 +1229,7 @@ class AgentEngine:
                 # Disable parallel tool calls during contract-enforced iterations.
                 # When the contract gate narrows tools to a single option (e.g.
                 # only update_plan is allowed), the model sometimes emits two calls
-                # to the same tool in one turn — the second call overwrites the
+                # to the same tool in one turn â€” the second call overwrites the
                 # first (collapsing a 3-step plan to 1 step) before any result is
                 # seen. Forcing sequential calls (one per turn) eliminates this.
                 if must_set_contract or needs_execution:
@@ -1248,12 +1398,21 @@ class AgentEngine:
                     yield {"type": "tool_call", "tool": tc.function.name, "params": args}
                     calls.append((str(tc.id), str(tc.function.name), args))
 
-                iter_error_count = await self._dispatch_tool_calls(
+                iter_error_count, tool_result_events = await self._dispatch_tool_calls(
                     calls=calls,
                     messages=messages,
                     steps=steps,
                     tool_index=tool_index,
                 )
+                for result_event in tool_result_events:
+                    yield result_event
+                if iter_error_count:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": _build_self_repair_instruction(steps),
+                        }
+                    )
                 forced_recovery_tool = None
                 contract_text_rejections = 0
 
@@ -1272,7 +1431,7 @@ class AgentEngine:
                         "Escalating to strong model %s for session %s after repeated errors",
                         active_model, session_id,
                     )
-                    yield {"type": "status", "message": f"Escalating to {active_model}…"}
+                    yield {"type": "status", "message": f"Escalating to {active_model}â€¦"}
 
                 # Checkpoint on the first iteration and then every Nth, rather than
                 # every iteration, to cut redundant full-history writes. Replay
@@ -1476,9 +1635,19 @@ class AgentEngine:
                     "available_tools": [t["name"] for t in all_tools],
                 },
             )
-            asyncio.create_task(  # noqa: RUF006 - fire-and-forget; distillation runs after the session
+            asyncio.create_task(  # noqa: RUF006
                 self._distiller.submit(trajectory),
                 name=f"distill:{session_id}",
+            )
+
+        # Fire-and-forget: update user profile from this conversation.
+        if self._profile_store is not None and not hit_cap and final_response:
+            convo = f"User: {original_prompt}\nAssistant: {final_response}"
+            asyncio.create_task(  # noqa: RUF006
+                extract_and_update_user_profile(
+                    self._profile_store, convo, self._fast_model
+                ),
+                name=f"profile:{session_id}",
             )
 
     async def _dispatch_tool_calls(
@@ -1488,14 +1657,15 @@ class AgentEngine:
         messages: list[dict[str, Any]],
         steps: list[ExecutionStep],
         tool_index: dict[str, str],
-    ) -> int:
+    ) -> tuple[int, list[dict[str, Any]]]:
         """Execute one iteration's tool calls and record results.
 
         Read-only tools run concurrently via ``asyncio.gather``; side-effecting
         tools (terminal, background, MCP writes) run serially in call order so
         filesystem mutations and write ordering stay deterministic.
 
-        Returns the number of calls that returned an error in this batch.
+        Returns the number of calls that returned an error in this batch plus
+        UI-safe tool-result events.
         """
         results: dict[str, tuple[str, bool, str | None]] = {}
         parallel = [c for c in calls if c[1] in _PARALLEL_SAFE_TOOLS]
@@ -1557,6 +1727,15 @@ class AgentEngine:
                 results[tc_id] = (_blocked_action_tool_message(name), True, "__builtin__")
             elif (
                 name == "execute_terminal_command"
+                and _terminal_failure_since_diagnostic(steps)
+            ):
+                results[tc_id] = (
+                    _terminal_failure_recovery_message(args.get("command")),
+                    True,
+                    "__builtin__",
+                )
+            elif (
+                name == "execute_terminal_command"
                 and local_terminal_run_count >= _MAX_CONSECUTIVE_TERMINAL_COMMANDS
             ):
                 # Varied-spin guard: too many terminal commands in a row with no
@@ -1598,6 +1777,7 @@ class AgentEngine:
 
         # Record steps and tool messages in the original call order.
         iter_error_count = 0
+        tool_result_events: list[dict[str, Any]] = []
         for tc_id, tool_name, arguments in calls:
             content, is_error, server = results[tc_id]
             if is_error:
@@ -1616,8 +1796,16 @@ class AgentEngine:
                 )
             )
             messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})
+            tool_result_events.append(
+                _make_tool_result_event(
+                    tool_name=tool_name,
+                    tool_call_id=tc_id,
+                    content=content,
+                    is_error=is_error,
+                )
+            )
 
-        return iter_error_count
+        return iter_error_count, tool_result_events
 
     async def _execute_single_tool(
         self,
@@ -1640,10 +1828,18 @@ class AgentEngine:
         if tool_name == "execute_terminal_command":
             try:
                 result = await self._tools.execute_terminal_command(arguments["command"])
-                return json.dumps(result), result["exit_code"] > 0, "__builtin__"
+                return json.dumps(result), int(result.get("exit_code", -1)) != 0, "__builtin__"
             except Exception as exc:
-                logger.warning("execute_terminal_command raised: %s", exc)
-                return f"[execute_terminal_command error] {exc}", True, "__builtin__"
+                logger.warning(
+                    "execute_terminal_command raised: %s: %r",
+                    type(exc).__name__,
+                    exc,
+                )
+                return (
+                    f"[execute_terminal_command error] {type(exc).__name__}: {exc}",
+                    True,
+                    "__builtin__",
+                )
         if tool_name == "execute_background_service":
             try:
                 result = self._tools.execute_background_service(arguments["command"])
@@ -1655,7 +1851,8 @@ class AgentEngine:
             return self._tools.get_system_environment(), False, "__builtin__"
         if tool_name == "web_fetch":
             try:
-                return await self._tools.web_fetch(**arguments), False, "__builtin__"
+                content = await self._tools.web_fetch(**arguments)
+                return content, _json_tool_result_has_error(content), "__builtin__"
             except Exception as exc:
                 logger.warning("web_fetch raised: %s", exc)
                 return f"[web_fetch error] {exc}", True, "__builtin__"
@@ -1665,7 +1862,7 @@ class AgentEngine:
             except Exception as exc:
                 logger.warning("web_search raised: %s", exc)
                 return f"[web_search error] {exc}", True, "__builtin__"
-        # Browser tools — stateful, run serially (not in _PARALLEL_SAFE_TOOLS)
+        # Browser tools â€” stateful, run serially (not in _PARALLEL_SAFE_TOOLS)
         if tool_name == "browser_navigate":
             try:
                 return await self._tools.browser_navigate(**arguments), False, "__builtin__"
@@ -1704,9 +1901,10 @@ class AgentEngine:
                 return f"[browser_evaluate error] {exc}", True, "__builtin__"
         if tool_name == "get_filesystem_process_evidence":
             try:
+                content = self._tools.get_filesystem_process_evidence(**arguments)
                 return (
-                    self._tools.get_filesystem_process_evidence(**arguments),
-                    False,
+                    content,
+                    _filesystem_process_evidence_has_negative_findings(content),
                     "__builtin__",
                 )
             except Exception as exc:
@@ -1714,9 +1912,10 @@ class AgentEngine:
                 return f"[get_filesystem_process_evidence error] {exc}", True, "__builtin__"
         if tool_name == "wait_for_port":
             try:
+                content = await self._tools.wait_for_port(**arguments)
                 return (
-                    await self._tools.wait_for_port(**arguments),
-                    False,
+                    content,
+                    _json_tool_result_has_error(content, false_open_is_error=True),
                     "__builtin__",
                 )
             except Exception as exc:
@@ -1732,16 +1931,6 @@ class AgentEngine:
             except Exception as exc:
                 logger.warning("write_text_file raised: %s", exc)
                 return f"[write_text_file error] {exc}", True, "__builtin__"
-        if tool_name == "publish_static_site":
-            try:
-                return (
-                    self._tools.publish_static_site(**arguments),
-                    False,
-                    "__builtin__",
-                )
-            except Exception as exc:
-                logger.warning("publish_static_site raised: %s", exc)
-                return f"[publish_static_site error] {exc}", True, "__builtin__"
         if tool_name == "expose_local_http_service":
             try:
                 return (
@@ -1762,6 +1951,23 @@ class AgentEngine:
             content, is_error = _run_set_task_contract(arguments)
             return content, is_error, "__builtin__"
 
+        if tool_name == "analyze_image":
+            try:
+                return await self._tools.analyze_image(**arguments), False, "__builtin__"
+            except Exception as exc:
+                return f"[analyze_image error] {exc}", True, "__builtin__"
+        if tool_name == "generate_image":
+            try:
+                return await self._tools.generate_image(**arguments), False, "__builtin__"
+            except Exception as exc:
+                return f"[generate_image error] {exc}", True, "__builtin__"
+        if tool_name == "schedule_task":
+            try:
+                result = await self._schedule_task(arguments, messages)
+                return result, False, "__builtin__"
+            except Exception as exc:
+                return f"[schedule_task error] {exc}", True, "__builtin__"
+
         server = tool_index.get(tool_name)
         if server is None:
             return (
@@ -1771,6 +1977,46 @@ class AgentEngine:
             )
         mcp_result = await self._tools.call_tool(server, tool_name, arguments)
         return _extract_tool_text(mcp_result), mcp_result.isError, server
+
+    def _build_user_profile_message(self) -> dict[str, Any] | None:
+        """Return a system message with the user profile summary, or None if empty."""
+        if self._profile_store is None:
+            return None
+        ctx = self._profile_store.as_context_string()
+        if not ctx:
+            return None
+        return {
+            "role": "system",
+            "content": f"User context: {ctx}",
+        }
+
+    async def _schedule_task(
+        self,
+        arguments: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> str:
+        if self._scheduler is None:
+            return json.dumps({"error": "Scheduler is not configured on this engine."})
+        # Derive session_id from the current conversation context
+        session_id = next(
+            (m.get("session_id") for m in messages if m.get("session_id")),
+            "scheduled",
+        )
+        # The session_id is stored in metadata on history list — retrieve from messages owner
+        job = await self._scheduler.add_job(
+            schedule_type=arguments["schedule_type"],
+            schedule_spec=arguments["schedule_spec"],
+            prompt=arguments["prompt"],
+            session_id=session_id,
+            label=arguments.get("label", ""),
+        )
+        return json.dumps({
+            "job_id": job.job_id,
+            "schedule_type": job.schedule_type,
+            "schedule_spec": job.schedule_spec,
+            "next_run": job.next_run.isoformat() if job.next_run else None,
+            "label": job.label,
+        }, indent=2)
 
     def _directive_system_message(self) -> dict[str, Any]:
         """Build the durable system-directive message.
@@ -1812,7 +2058,17 @@ class AgentEngine:
             except Exception:  # never let env probing break session seeding
                 raw = ""
         sandbox_failed = getattr(self._tools, "sandbox_startup_failed", False)
-        return {"role": "system", "content": _summarize_host_environment(raw, sandbox_failed=sandbox_failed)}
+        host_execution_disabled_reason = getattr(
+            self._tools, "host_execution_disabled_reason", None
+        )
+        return {
+            "role": "system",
+            "content": _summarize_host_environment(
+                raw,
+                sandbox_failed=sandbox_failed,
+                host_execution_disabled_reason=host_execution_disabled_reason,
+            ),
+        }
 
     def _compact_context_window(
         self, messages: list[dict[str, Any]]
@@ -1895,16 +2151,49 @@ class AgentEngine:
         ])
 
     async def _execute_delegate_task(self, arguments: dict[str, Any]) -> str:
-        """Spin up an isolated sub-AgentEngine and run it to completion.
+        """Spin up one or more isolated sub-AgentEngines and run them.
 
-        The sub-agent shares the same memory and tool connections as the parent
-        but receives a role-specific system directive and has no checkpointer or
-        distiller -- its work is captured only in its return value.
+        Supports two calling forms:
+        1. Single task (backward compat):
+           {agent_type, task_description, context_payload}
+        2. Parallel batch:
+           {tasks: [{agent_type, task_description, context_payload},...], mode: "parallel"}
         """
-        agent_type: str = arguments["agent_type"]
-        task_description: str = arguments["task_description"]
+        # -- Parallel / batch form ----------------------------------------
+        if "tasks" in arguments:
+            tasks_list: list[dict[str, Any]] = arguments["tasks"]
+            mode = arguments.get("mode", "sequential")
+            if mode == "parallel":
+                results = await asyncio.gather(
+                    *(self._run_single_delegate(t) for t in tasks_list),
+                    return_exceptions=True,
+                )
+                return json.dumps(
+                    [
+                        {"task": t.get("task_description", "")[:80],
+                         "agent_type": t.get("agent_type"),
+                         "result": r if isinstance(r, str) else f"[error] {r}"}
+                        for t, r in zip(tasks_list, results, strict=False)
+                    ],
+                    indent=2,
+                )
+            else:
+                parts: list[str] = []
+                for task_args in tasks_list:
+                    result = await self._run_single_delegate(task_args)
+                    parts.append(f"[{task_args.get('agent_type')}] {result}")
+                return "\n\n".join(parts)
+
+        # -- Single task form (backward compat) ---------------------------
+        return await self._run_single_delegate(arguments)
+
+    async def _run_single_delegate(self, arguments: dict[str, Any]) -> str:
+        agent_type: str = arguments.get("agent_type", "researcher")
+        task_description: str = arguments.get("task_description", "")
         context_payload: dict[str, Any] = arguments.get("context_payload") or {}
 
+        if agent_type not in _SUB_AGENT_DIRECTIVES:
+            agent_type = "researcher"
         directive = _SUB_AGENT_DIRECTIVES[agent_type]
 
         prompt = task_description
@@ -1914,14 +2203,14 @@ class AgentEngine:
                 f"Task:\n{task_description}"
             )
 
-        # Route by role: gathering is cheap (fast tier); code generation and
-        # auditing get the strong tier where quality matters most.
         sub_model = {
             "researcher": self._fast_model,
             "coder": self._strong_model,
             "auditor": self._strong_model,
+            "planner": self._fast_model,
         }.get(agent_type, self._fast_model)
 
+        sub_session_id = f"sub_{agent_type}_{uuid.uuid4().hex[:8]}"
         sub_agent = AgentEngine(
             memory=self._memory,
             tools=self._tools,
@@ -1933,16 +2222,13 @@ class AgentEngine:
         )
 
         sub_message = NormalizedMessage(
-            session_id=f"sub_{agent_type}_{uuid.uuid4().hex[:8]}",
+            session_id=sub_session_id,
             role="user",
             content=prompt,
         )
-
         logger.debug(
             "Delegating to %r sub-agent (session %s, prompt_len=%d)",
-            agent_type,
-            sub_message.session_id,
-            len(prompt),
+            agent_type, sub_session_id, len(prompt),
         )
         return await sub_agent.process_task(sub_message)
 
@@ -2067,6 +2353,42 @@ def _summarize_tool_output(text: str, handle: str, tool_name: str) -> str:
     )
 
 
+def _make_tool_result_event(
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    content: str,
+    is_error: bool,
+) -> dict[str, Any]:
+    """Build a compact UI event for a tool result without hiding failures."""
+    _, text = _classify_tool_result(tool_name, content)
+    display = _summarize_tool_output(text, tool_call_id, tool_name)
+    if not display.strip():
+        display = "Tool executed successfully (no output)."
+    metadata: dict[str, Any] = {"tool_call_id": tool_call_id}
+    if tool_name in {
+        "execute_terminal_command",
+        "execute_background_service",
+        "wait_for_port",
+        "get_filesystem_process_evidence",
+    }:
+        try:
+            parsed = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            for key in ("exit_code", "status", "port", "open", "scope"):
+                if key in parsed:
+                    metadata[key] = parsed[key]
+    return {
+        "type": "tool_result",
+        "tool": tool_name,
+        "is_error": is_error,
+        "content": display,
+        "metadata": metadata,
+    }
+
+
 def _lookup_tool_output(
     messages: list[dict[str, Any]], handle: str
 ) -> tuple[str, str] | None:
@@ -2143,12 +2465,18 @@ _OS_PACKAGE_MANAGERS: tuple[str, ...] = (
 )
 
 
-def _summarize_host_environment(raw: str, *, sandbox_failed: bool = False) -> str:
+def _summarize_host_environment(
+    raw: str,
+    *,
+    sandbox_failed: bool = False,
+    host_execution_disabled_reason: str | None = None,
+) -> str:
     """Render the get_system_environment JSON into a concise, directive summary.
 
     ``sandbox_failed=True`` adds a prominent warning when AGENT_SANDBOX=docker
-    was configured but Docker could not be reached; the agent (and the operator)
-    can see that commands are running on the bare host, not a container.
+    was configured but Docker could not be reached. When host fallback is
+    disabled, the agent is told that host-changing tools are blocked instead of
+    silently running on the bare host.
     """
     try:
         data = json.loads(raw) if raw else {}
@@ -2156,7 +2484,7 @@ def _summarize_host_environment(raw: str, *, sandbox_failed: bool = False) -> st
         data = {}
     if not isinstance(data, dict) or not data:
         return (
-            "=== HOST ENVIRONMENT ===\n"
+            "=== EXECUTION ENVIRONMENT ===\n"
             "Unavailable. Call get_system_environment BEFORE any install or setup "
             "command so you target the right OS, shell, and package manager. Never "
             "guess the platform.\n"
@@ -2183,18 +2511,28 @@ def _summarize_host_environment(raw: str, *, sandbox_failed: bool = False) -> st
         image = sandbox.get("image", "")
         workdir = sandbox.get("container_workdir", "/workspace")
         sandbox_line = (
-            f"Sandbox: {mode} (image={image}; workdir={workdir}) — "
+            f"Sandbox: {mode} (image={image}; workdir={workdir}) â€” "
             f"commands run inside an isolated Linux container; apt-get IS available.\n"
+        )
+    elif host_execution_disabled_reason:
+        sandbox_line = (
+            "SANDBOX: FAILED TO START; HOST EXECUTION IS BLOCKED. Terminal, "
+            "background-service, process, and port tools will return a blocking "
+            "error until Docker Desktop is started and the backend is restarted. "
+            "Do NOT try Windows/cmd/PowerShell variants to work around this; the "
+            "correct repair is to restore the sandbox or explicitly enable "
+            "AGENT_SANDBOX_HOST_FALLBACK=true.\n"
+            f"Sandbox blocker: {host_execution_disabled_reason}\n"
         )
     elif sandbox_failed:
         sandbox_line = (
             "SANDBOX: FAILED TO START (Docker Desktop is not running or unreachable). "
-            "All commands execute DIRECTLY on the host OS below — treat it as a plain "
+            "All commands execute DIRECTLY on the host OS below â€” treat it as a plain "
             "host session; do NOT assume a Linux container environment.\n"
         )
 
     return (
-        "=== HOST ENVIRONMENT (authoritative — do not guess the platform) ===\n"
+        "=== EXECUTION ENVIRONMENT (authoritative - do not guess the platform) ===\n"
         f"{sandbox_line}"
         f"OS: {os_label}    Shell: {shell_name} ({'POSIX' if posix else 'non-POSIX'})\n"
         f"Privileges: {'root' if is_root else 'non-root'}; "

@@ -70,7 +70,7 @@ def _run_update_plan(arguments: dict[str, Any]) -> tuple[str, bool]:
             "Now execute the next not-done step. "
             "Do NOT call update_plan again in this same turn — proceed "
             "immediately with write_text_file, execute_terminal_command, "
-            "or publish_static_site to do the actual work."
+            "execute_background_service, or expose_local_http_service to do the actual work."
         )
     )
     return (
@@ -192,44 +192,26 @@ def _build_contract_execution_instruction(
                     "  • Visual polish: backgrounds, shadows, rounded corners, transitions\n"
                     "  • Working JavaScript if interaction was requested\n"
                     "Write the ENTIRE file content in one write_text_file call — do not "
-                    "hold back or truncate. Then publish/verify again."
+                    "hold back or truncate. Then verify the file or serve it if access is required."
                 )
-            elif "published_static_site_url" in evidence_missing:
-                file_written = "write_text_file" in succeeded
-                site_published = "publish_static_site" in attempted
-                if not file_written:
-                    next_action = (
-                        "IMMEDIATE ACTION — call write_text_file RIGHT NOW.\n"
-                        "  • path: 'generated_sites/site/index.html'\n"
-                        "  • content: the full, complete, self-contained HTML file "
-                        "(embed all CSS and JavaScript inside the single file).\n"
-                        "Do NOT call update_plan before writing the file. "
-                        "After write_text_file succeeds, call publish_static_site "
-                        "with source_path='generated_sites/site'."
-                    )
-                elif not site_published:
-                    next_action = (
-                        "The file was written successfully. "
-                        "Call publish_static_site NOW with source_path set to the "
-                        "directory containing index.html. "
-                        "Do NOT call update_plan before publishing."
-                    )
-                else:
-                    next_action = (
-                        "publish_static_site was attempted but the URL evidence is "
-                        "not yet confirmed. Check the result — if it succeeded, call "
-                        "update_plan to close the remaining steps. If it failed, "
-                        "re-check the file (write_text_file if needed), then retry "
-                        "publish_static_site or use get_filesystem_process_evidence."
-                    )
+            elif "running_tcp_service" in evidence_missing:
+                next_action = (
+                    "A non-HTTP TCP service still needs proof. First read the latest "
+                    "evidence: if it shows a missing runtime, missing binary/JAR, "
+                    "missing config, or an empty port/process list, repair that with "
+                    "execute_terminal_command. Only after prerequisites exist should "
+                    "you use execute_background_service once, then wait_for_port for "
+                    "the target port. Do NOT call expose_local_http_service unless "
+                    "the service is actually HTTP."
+                )
             else:
                 next_action = (
                     "The available tools have been narrowed to tools that can produce "
                     "the missing structured evidence. Call one of those tools now. "
-                    "Use write_text_file for concrete text artifacts, publish_static_site "
-                    "for static-site URLs, and get_filesystem_process_evidence for "
-                    "verification. Do not call update_plan again until after the missing "
-                    "evidence is produced."
+                    "Use write_text_file for concrete text artifacts, execute/background "
+                    "tools for runtime work, expose_local_http_service for HTTP access, "
+                    "and get_filesystem_process_evidence for verification. Do not call "
+                    "update_plan again until after the missing evidence is produced."
                 )
         elif "plan_open_steps" in missing:
             next_action = (
@@ -303,6 +285,16 @@ def _classify_tool_result(tool_name: str, content: str) -> tuple[bool, str]:
             return data.get("exit_code", 0) > 0, merged
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass  # fall through to generic heuristic
+
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            if data.get("error"):
+                return True, str(data.get("error"))
+            if tool_name == "wait_for_port" and data.get("open") is False:
+                return True, json.dumps(data)
+    except (json.JSONDecodeError, TypeError):
+        pass
 
     # Generic heuristic: bracketed error prefix produced by all builtin
     # dispatch branches and _extract_tool_text.

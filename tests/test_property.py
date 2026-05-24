@@ -64,8 +64,9 @@ def test_normalize_command_idempotent(text: str, _ignored: str) -> None:
 _VALID_MODES = st.sampled_from(["answer", "execute"])
 _VALID_EVIDENCE = st.lists(
     st.sampled_from(
-        ["filesystem_artifact", "published_static_site_url",
-         "running_http_service", "database_mutation", "command_output", "none"]
+        ["filesystem_artifact",
+         "running_http_service", "running_tcp_service", "database_mutation",
+         "command_output", "none"]
     ),
     min_size=1,
     max_size=4,

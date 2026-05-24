@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { MessageSquare, Plus, Send, Square, Trash2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, MessageSquare, Plus, Send, Square, Trash2 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAgentStream, type AgentEvent } from "./useAgentStream";
@@ -139,6 +139,37 @@ function StreamingTextBubble({ text }: { text: string }) {
   );
 }
 
+function ToolResultBubble({
+  toolName,
+  isError,
+  content,
+}: {
+  toolName: string;
+  isError: boolean;
+  content: string;
+}) {
+  const Icon = isError ? AlertTriangle : CheckCircle2;
+  const tone = isError
+    ? "border-red-500/40 bg-red-950/30 text-red-100"
+    : "border-emerald-500/30 bg-emerald-950/20 text-emerald-100";
+  return (
+    <div className="flex justify-start">
+      <div className={`max-w-[86%] overflow-hidden rounded-lg border ${tone}`}>
+        <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2 text-xs font-semibold">
+          <Icon size={14} className="shrink-0" />
+          <span className="truncate">{toolName}</span>
+          <span className="ml-auto shrink-0 font-mono text-[11px] uppercase opacity-70">
+            {isError ? "error" : "result"}
+          </span>
+        </div>
+        <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-xs leading-relaxed">
+          {content}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
 function ThinkingIndicator() {
   return (
     <div className="flex justify-start">
@@ -158,6 +189,15 @@ function ThinkingIndicator() {
 function EventRow({ event }: { event: AgentEvent }) {
   if (event.type === "tool_call") {
     return <ToolBadge toolName={event.tool} params={event.params} />;
+  }
+  if (event.type === "tool_result") {
+    return (
+      <ToolResultBubble
+        toolName={event.tool}
+        isError={event.is_error}
+        content={event.content}
+      />
+    );
   }
   return <AgentTextBubble content={event.content} />;
 }
@@ -195,11 +235,11 @@ export function ChatInterface() {
   const executionStatus: "idle" | "thinking" | "executing_tool" | "success" =
     activeUserText === null
       ? "idle"
-      : events.length === 0
-        ? "thinking"
+      : lastEvent?.type === "text" || lastEvent?.type === "final_answer"
+        ? "success"
         : lastEvent?.type === "tool_call"
           ? "executing_tool"
-          : "success";
+          : "thinking";
 
   const isAgentBusy =
     executionStatus === "thinking" || executionStatus === "executing_tool";

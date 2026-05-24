@@ -31,8 +31,8 @@ _TASK_CONTRACT_TOOL = "set_task_contract"
 _TASK_CONTRACT_EVIDENCE: frozenset[str] = frozenset(
     {
         "filesystem_artifact",
-        "published_static_site_url",
         "running_http_service",
+        "running_tcp_service",
         "database_mutation",
         "command_output",
         "none",
@@ -47,29 +47,40 @@ _CONTRACT_CONTROL_TOOLS: frozenset[str] = frozenset(
     {"update_plan", "expand_tool_output"}
 )
 
+_RECOVERY_DIAGNOSTIC_TOOLS: frozenset[str] = frozenset(
+    {
+        "get_system_environment",
+        "get_filesystem_process_evidence",
+        "web_search",
+        "web_fetch",
+        "expand_tool_output",
+        "wait_for_port",
+    }
+)
+
 _CONTRACT_EVIDENCE_TOOLS: dict[str, frozenset[str]] = {
     "filesystem_artifact": frozenset(
         {
             "write_text_file",
             "execute_terminal_command",
             "get_filesystem_process_evidence",
-            "publish_static_site",
-        }
-    ),
-    "published_static_site_url": frozenset(
-        {
-            "write_text_file",
-            "execute_terminal_command",
-            "get_filesystem_process_evidence",
-            "publish_static_site",
         }
     ),
     "running_http_service": frozenset(
         {
+            "write_text_file",
             "execute_background_service",
             "execute_terminal_command",
             "get_filesystem_process_evidence",
             "expose_local_http_service",
+        }
+    ),
+    "running_tcp_service": frozenset(
+        {
+            "execute_background_service",
+            "execute_terminal_command",
+            "get_filesystem_process_evidence",
+            "wait_for_port",
         }
     ),
     "database_mutation": frozenset(
@@ -79,7 +90,7 @@ _CONTRACT_EVIDENCE_TOOLS: dict[str, frozenset[str]] = {
         {"execute_terminal_command", "execute_background_service"}
     ),
     "artifact_quality": frozenset(
-        {"write_text_file", "publish_static_site", "browser_navigate", "browser_screenshot"}
+        {"write_text_file", "browser_navigate", "browser_screenshot"}
     ),
 }
 
@@ -319,6 +330,22 @@ def _split_criteria_string(text: str) -> list[str]:
     return [stripped for stripped in (item.strip() for item in items) if stripped]
 
 
+def _sanitize_contract_environment_wording(text: str) -> str:
+    """Keep model-authored task contracts from re-scoping sandbox work to the host."""
+    replacements = (
+        (r"\bon the host system\b", "in the active execution environment"),
+        (r"\bon the host\b", "in the active execution environment"),
+        (r"\bhost system\b", "active execution environment"),
+        (r"\bhost OS\b", "active execution environment"),
+        (r"\bhost filesystem\b", "active workspace"),
+        (r"\bhost machine\b", "active execution environment"),
+    )
+    cleaned = text
+    for pattern, replacement in replacements:
+        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
 def _normalise_task_contract(
     arguments: dict[str, Any],
 ) -> tuple[dict[str, Any], str | None]:
@@ -326,7 +353,9 @@ def _normalise_task_contract(
     if mode not in {"answer", "execute"}:
         return {}, "mode must be 'answer' or 'execute'"
 
-    summary = " ".join(str(arguments.get("summary", "")).split())
+    summary = _sanitize_contract_environment_wording(
+        " ".join(str(arguments.get("summary", "")).split())
+    )
     if not summary:
         return {}, "summary must be a non-empty string"
 
@@ -339,7 +368,9 @@ def _normalise_task_contract(
     if not isinstance(raw_criteria, list):
         return {}, "success_criteria must be an array of strings"
     success_criteria = [
-        " ".join(str(item).split()) for item in raw_criteria if str(item).strip()
+        _sanitize_contract_environment_wording(" ".join(str(item).split()))
+        for item in raw_criteria
+        if str(item).strip()
     ]
     if not success_criteria:
         return {}, "success_criteria must contain at least one item"
@@ -358,6 +389,39 @@ def _normalise_task_contract(
         evidence = [item for item in evidence if item != "none"]
         if not evidence:
             return {}, "execute mode requires at least one non-'none' evidence requirement"
+        request_text = " ".join([summary, *success_criteria]).lower()
+        http_hints = ("http", "web", "browser", "url", "html", "api", "endpoint", "site")
+        if "running_http_service" in evidence and not any(
+            hint in request_text for hint in http_hints
+        ):
+            # Generic services are proven by process/port evidence, not by an
+            # HTTP proxy. If the task doesn't mention HTTP/web semantics, correct
+            # the over-broad HTTP evidence choice to TCP evidence.
+            evidence = [
+                "running_tcp_service" if item == "running_http_service" else item
+                for item in evidence
+            ]
+        artifact_hints = (
+            "artifact",
+            "file",
+            "folder",
+            "directory",
+            "path",
+            "download",
+            "downloaded",
+            "jar",
+            "archive",
+            "config",
+            "configuration",
+            "created",
+            "written",
+            "saved",
+            "exists",
+        )
+        if "filesystem_artifact" not in evidence and any(
+            hint in request_text for hint in artifact_hints
+        ):
+            evidence.append("filesystem_artifact")
 
     # Optional toolset selection — narrows available tools for subsequent iterations.
     toolset = str(arguments.get("toolset", "all"))
@@ -468,16 +532,16 @@ def _evidence_requirement_satisfied(
             continue
         tool_name = step.metadata.get("tool_name")
 
-        if requirement == "published_static_site_url":
-            if tool_name == "publish_static_site" and _publish_static_site_evidence_is_positive(step.content):
-                return True
-        elif requirement == "running_http_service":
+        if requirement == "running_http_service":
             if tool_name == "expose_local_http_service" and _expose_local_http_service_evidence_is_positive(step.content):
                 return True
-        elif requirement == "filesystem_artifact":
-            if tool_name == "get_filesystem_process_evidence" and _filesystem_process_evidence_is_positive(step.content):
+        elif requirement == "running_tcp_service":
+            if tool_name == "get_filesystem_process_evidence" and _tcp_service_evidence_is_positive(step.content):
                 return True
-            if tool_name == "publish_static_site" and _publish_static_site_evidence_is_positive(step.content):
+            if tool_name == "wait_for_port" and _wait_for_port_evidence_is_positive(step.content):
+                return True
+        elif requirement == "filesystem_artifact":
+            if tool_name == "get_filesystem_process_evidence" and _filesystem_artifact_evidence_is_positive(step.content):
                 return True
             if tool_name == "write_text_file" and _write_text_file_evidence_is_positive(step.content):
                 return True
@@ -508,17 +572,12 @@ def _successful_command_output_evidence(tool_name: str | None, content: str) -> 
     )
 
 
-def _publish_static_site_evidence_is_positive(content: str) -> bool:
+def _wait_for_port_evidence_is_positive(content: str) -> bool:
     try:
         data = json.loads(content)
     except (TypeError, json.JSONDecodeError):
         return False
-    return bool(
-        data.get("published")
-        and data.get("index_exists")
-        and data.get("url")
-        and _artifact_quality_payload_is_acceptable(data)
-    )
+    return bool(data.get("open") and data.get("port"))
 
 
 def _write_text_file_evidence_is_positive(content: str) -> bool:
@@ -561,7 +620,7 @@ def _latest_artifact_quality(steps: list[ExecutionStep]) -> dict[str, Any] | Non
     for step in reversed(steps):
         if step.kind != "tool_result" or step.metadata.get("is_error"):
             continue
-        if step.metadata.get("tool_name") not in {"write_text_file", "publish_static_site"}:
+        if step.metadata.get("tool_name") != "write_text_file":
             continue
         try:
             data = json.loads(step.content)
@@ -621,15 +680,25 @@ def _expose_local_http_service_evidence_is_positive(content: str) -> bool:
     return bool(data.get("exposed") and data.get("connectable") and data.get("url"))
 
 
-def _filesystem_process_evidence_is_positive(content: str) -> bool:
+def _filesystem_artifact_evidence_is_positive(content: str) -> bool:
     try:
         data = json.loads(content)
     except (TypeError, json.JSONDecodeError):
         return False
 
-    for path in data.get("paths", []):
-        if path.get("exists"):
-            return True
+    paths = data.get("paths", [])
+    if not isinstance(paths, list) or not paths:
+        return False
+    path_entries = [path for path in paths if isinstance(path, dict)]
+    return bool(path_entries) and all(bool(path.get("exists")) for path in path_entries)
+
+
+def _tcp_service_evidence_is_positive(content: str) -> bool:
+    try:
+        data = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return False
+
     for pid in data.get("pids", []):
         if pid.get("running"):
             return True
@@ -641,6 +710,11 @@ def _filesystem_process_evidence_is_positive(content: str) -> bool:
             return True
     background_log = data.get("background_log") or {}
     return bool(background_log.get("exists") and background_log.get("tail"))
+
+
+def _filesystem_process_evidence_is_positive(content: str) -> bool:
+    """Backward-compatible broad evidence check for older tests/callers."""
+    return _filesystem_artifact_evidence_is_positive(content) or _tcp_service_evidence_is_positive(content)
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +757,6 @@ def _duplicate_command_message(tool_name: str) -> str:
 _STATE_CHANGING_TOOLS: frozenset[str] = frozenset(
     {
         "write_text_file",
-        "publish_static_site",
         "expose_local_http_service",
         "create_table",
         "write_query",
@@ -749,11 +822,45 @@ def _repeated_command_message(tool_name: str, command: Any) -> str:
         "was NOT executed again:\n"
         f"  {_normalize_command(command)[:200]}\n"
         "Repeating an identical command cannot produce a new result. If it FAILED "
-        "before, it is wrong for THIS host -- re-read the HOST ENVIRONMENT summary "
-        "from the start of the session (OS, shell, available package managers) and "
-        "switch to a command that fits this platform, or change your approach. If it "
-        "already SUCCEEDED, stop re-running it and move on to the next step. Do not "
-        "issue this command again."
+        "before, it is wrong for the active execution environment -- re-read the "
+        "execution-environment summary from the start of the session (OS, shell, "
+        "available package managers) and switch to a command that fits this platform, "
+        "or change your approach. If it already SUCCEEDED, stop re-running it and "
+        "move on to the next step. Do not issue this command again."
+    )
+
+
+def _terminal_failure_since_diagnostic(steps: list[ExecutionStep]) -> bool:
+    """True if the latest relevant event is a failed terminal command.
+
+    This forces a non-terminal diagnostic step between "command failed" and
+    "try another shell command", which prevents platform-guessing loops like
+    java/java -version/which/cmd/powershell variants.
+    """
+    for step in reversed(steps):
+        if step.kind != "tool_result":
+            continue
+        tool_name = step.metadata.get("tool_name")
+        if tool_name in _RECOVERY_DIAGNOSTIC_TOOLS:
+            return False
+        if tool_name in _STATE_CHANGING_TOOLS and not step.metadata.get("is_error"):
+            return False
+        if tool_name == "execute_terminal_command":
+            return bool(step.metadata.get("is_error"))
+    return False
+
+
+def _terminal_failure_recovery_message(command: Any) -> str:
+    return (
+        "[blocked: unresolved terminal failure] The previous terminal command "
+        "failed, so this new terminal command was NOT executed:\n"
+        f"  {_normalize_command(command)[:200]}\n"
+        "First diagnose the failure with a non-terminal tool: call "
+        "get_system_environment to confirm OS/shell/runtimes, "
+        "get_filesystem_process_evidence to inspect actual files/processes/ports, "
+        "expand_tool_output for truncated logs, or web_search/web_fetch for an "
+        "unfamiliar error. Then choose a different command that matches the active "
+        "execution environment. Do not keep trying shell/path variants."
     )
 
 
@@ -959,7 +1066,7 @@ def _should_block_tool_for_action_task(
 
 def _blocked_action_tool_message(tool_name: str) -> str:
     return (
-        f"[{tool_name} blocked] This is a host-changing task and the requested "
+        f"[{tool_name} blocked] This is an environment-changing task and the requested "
         "artifacts have not been verified yet. Use execute_terminal_command or "
         "execute_background_service directly, then verify the result."
     )
@@ -981,10 +1088,16 @@ def _build_task_contract_instruction() -> str:
     return (
         "Before doing any other work, call set_task_contract for the current user "
         "task. Choose mode='answer' for pure text answers. Choose mode='execute' "
-        "when success requires changing or verifying host state. For execute mode, "
+        "when success requires changing or verifying the active tool environment. "
+        "Do not claim a host target unless the user explicitly asked to bypass the "
+        "sandbox and host fallback is enabled. For execute mode, "
         "choose the evidence requirement(s) that would prove completion: "
-        "filesystem_artifact, published_static_site_url, running_http_service, "
-        "database_mutation, or command_output. Use 'none' only with answer mode."
+        "filesystem_artifact, running_http_service, "
+        "running_tcp_service, database_mutation, or command_output. Use "
+        "'running_http_service' only for HTTP servers that can be exposed through "
+        "the proxy; use 'running_tcp_service' for non-HTTP services such as game "
+        "servers, databases, queues, SSH-like daemons, or any process whose proof "
+        "is a listening TCP port. Use 'none' only with answer mode."
     )
 
 

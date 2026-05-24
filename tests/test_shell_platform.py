@@ -1,6 +1,8 @@
 """Tests for platform-aware shell detection and command safety gate."""
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +16,8 @@ from tools import (
     _detect_posix_shell,
     _DockerSandbox,
     _is_dangerous_command,
+    _wrong_environment_command_reason,
+    ToolManager,
 )
 
 # ---------------------------------------------------------------------------
@@ -105,6 +109,38 @@ class TestIsDangerousCommand:
             assert not _is_dangerous_command(cmd), f"Should NOT be blocked: {cmd!r}"
 
 
+class TestWrongEnvironmentCommandReason:
+    def test_blocks_windows_shell_inside_docker_sandbox(self):
+        reason = _wrong_environment_command_reason(
+            'cmd /c "java -version"',
+            sandbox_active=True,
+        )
+        assert reason is not None
+        assert "Windows shell" in reason
+
+    def test_blocks_powershell_inside_docker_sandbox(self):
+        reason = _wrong_environment_command_reason(
+            'powershell -Command "java -version"',
+            sandbox_active=True,
+        )
+        assert reason is not None
+        assert "Windows shell" in reason
+
+    def test_blocks_windows_path_inside_docker_sandbox(self):
+        reason = _wrong_environment_command_reason(
+            r"mkdir C:\Users\karim\example-server",
+            sandbox_active=True,
+        )
+        assert reason is not None
+        assert "Windows absolute path" in reason
+
+    def test_allows_posix_command_inside_docker_sandbox(self):
+        assert _wrong_environment_command_reason(
+            "mkdir -p /workspace/server && java -version",
+            sandbox_active=True,
+        ) is None
+
+
 # ---------------------------------------------------------------------------
 # Background log path portability
 # ---------------------------------------------------------------------------
@@ -132,3 +168,62 @@ def test_docker_sandbox_keeps_package_install_capabilities():
     for cap in _SANDBOX_PACKAGE_CAPS:
         assert ["--cap-add", cap] in cap_pairs
     assert ["--cap-add", "NET_BIND_SERVICE"] in cap_pairs
+
+
+def test_terminal_command_blocked_when_sandbox_required_but_unavailable():
+    manager = ToolManager.__new__(ToolManager)
+    manager._host_execution_disabled_reason = "Docker unavailable"
+    manager.current_cwd = "C:/workspace"
+
+    result = asyncio.run(manager.execute_terminal_command("echo should-not-run"))
+
+    assert result["exit_code"] == -1
+    assert result["scope"] == "sandbox_unavailable"
+    assert "Host execution is blocked" in result["stdout"]
+    assert "should-not-run" in result["stdout"]
+
+
+def test_background_service_blocked_when_sandbox_required_but_unavailable():
+    manager = ToolManager.__new__(ToolManager)
+    manager._host_execution_disabled_reason = "Docker unavailable"
+    manager.current_cwd = "C:/workspace"
+    manager._sandbox = None
+
+    result = manager.execute_background_service("python -m http.server")
+
+    assert result["status"] == "error"
+    assert result["scope"] == "sandbox_unavailable"
+    assert "Host execution is blocked" in result["message"]
+
+
+def _sandbox_file_manager(tmp_path: Path) -> ToolManager:
+    class FakeSandbox:
+        def write_text_file(self, path: str, content: str):
+            target = tmp_path / path.removeprefix("/workspace/").replace("/", "\\")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            return {"path": path, "exists": True, "size_bytes": target.stat().st_size}
+
+    manager = ToolManager.__new__(ToolManager)
+    manager._sandbox = FakeSandbox()
+    manager._host_workdir = str(tmp_path)
+    manager.current_cwd = "/workspace"
+    manager.public_base_url = "http://localhost:8000"
+    return manager
+
+
+def test_write_text_file_reports_sandbox_path(tmp_path):
+    manager = _sandbox_file_manager(tmp_path)
+
+    result = json.loads(
+        manager.write_text_file(
+            "generated_sites/site/index.html",
+            "<!doctype html><html><head><style>body{color:black}</style></head>"
+            "<body><h1>Site</h1><p>Content</p></body></html>",
+        )
+    )
+
+    assert result["scope"] == "docker_sandbox"
+    assert result["path"] == "/workspace/generated_sites/site/index.html"
+    assert "C:" not in result["path"]
+    assert (tmp_path / "generated_sites" / "site" / "index.html").is_file()
