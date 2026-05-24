@@ -66,6 +66,8 @@ function assertIncludes(text, expected) {
   assertIncludes(result.stdout, 'AGENT_MODEL="gpt-4o"');
   assertIncludes(result.stdout, 'AGENT_SANDBOX_HOST_FALLBACK="false"');
   assertIncludes(result.stdout, "Start later with: npx @aspct3434/agent-ai start");
+  assertIncludes(result.stdout, "QuickStart setup summary");
+  assertIncludes(result.stdout, "Model API key:     missing");
 }
 
 {
@@ -91,6 +93,7 @@ function assertIncludes(text, expected) {
   assertIncludes(result.stdout, 'AGENT_SANDBOX_HOST_FALLBACK="true"');
   assertIncludes(result.stdout, "TELEGRAM_BOT_TOKEN=");
   assertIncludes(result.stdout, "DISCORD_BOT_TOKEN=");
+  assertIncludes(result.stdout, "WARN TELEGRAM_BOT_TOKEN is blank.");
 }
 
 {
