@@ -90,10 +90,6 @@ is_agent_repo() {
 }
 
 ensure_repo() {
-  if [[ "$REPO_URL" == "$DEFAULT_REPO_URL" && "$DRY_RUN" -ne 1 ]]; then
-    echo "Repo URL still uses the placeholder. Pass --repo-url or set AGENT_BOOTSTRAP_REPO_URL." >&2
-    exit 2
-  fi
   if [[ -e "$INSTALL_DIR" ]]; then
     if is_agent_repo "$INSTALL_DIR"; then
       step "Found existing Agent AI checkout at $INSTALL_DIR"

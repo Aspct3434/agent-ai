@@ -30,12 +30,6 @@ function Run-Cmd([string]$Description, [string]$File, [string[]]$CommandArgs) {
     & $File @CommandArgs
 }
 
-function Ensure-RealRepoUrl {
-    if ($RepoUrl -eq $DefaultRepoUrl -and -not $DryRun) {
-        throw "RepoUrl still uses the placeholder. Pass -RepoUrl or set AGENT_BOOTSTRAP_REPO_URL."
-    }
-}
-
 function Ensure-Git {
     if (Has-Command "git") { Step "Git is available"; return }
     if (Has-Command "winget") {
@@ -71,7 +65,6 @@ function Is-AgentRepo([string]$Path) {
 }
 
 function Ensure-Repo {
-    Ensure-RealRepoUrl
     if (Test-Path $InstallDir) {
         if (Is-AgentRepo $InstallDir) {
             Step "Found existing Agent AI checkout at $InstallDir"
