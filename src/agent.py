@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from checkpointer import StateCheckpointer
 from contract import (
     _HOST_EXECUTION_TOOLS,
+    _MAX_IDENTICAL_COMMAND_RUNS,
     _TASK_CONTRACT_TOOL,
     _attempted_tool_names,
     _blocked_action_tool_message,
@@ -24,9 +25,11 @@ from contract import (
     _contract_completion_status,
     _duplicate_command_message,
     _filter_tool_schemas,
+    _host_command_runs_since_state_change,
     _last_host_command,
     _latest_task_contract,
     _normalize_command,
+    _repeated_command_message,
     _run_set_task_contract,
     _should_block_tool_for_action_task,
     _tool_names_for_contract_status,
@@ -721,6 +724,7 @@ class AgentEngine:
             messages = [
                 self._directive_system_message(),
                 {"role": "system", "content": _build_system_prompt(context)},
+                self._build_host_environment_message(),
             ]
             if _BOOTSTRAP_SESSIONS:
                 messages.extend(await self._bootstrap_session(tool_index, all_tools))
@@ -1498,18 +1502,35 @@ class AgentEngine:
         # identical one is short-circuited -- the real anti-spin guard
         # (e.g. the model issuing `mkdir -p x` twice).
         last_host_cmd = _last_host_command(steps)
+        # Count identical-command repeats accumulated *within this iteration* so a
+        # command emitted several times in one turn also trips the cap; the
+        # cross-iteration count is recovered from `steps` via the helper.
+        local_repeat_counts: dict[str, int] = {}
         for tc_id, name, args in serial:
             cmd = _normalize_command(args.get("command")) if name in _HOST_EXECUTION_TOOLS else ""
+            repeat_runs = (
+                _host_command_runs_since_state_change(steps, cmd)
+                + local_repeat_counts.get(cmd, 0)
+                if cmd
+                else 0
+            )
             if _should_block_tool_for_action_task(
                 _latest_task_contract(messages), messages, steps, name
             ):
                 results[tc_id] = (_blocked_action_tool_message(name), True, "__builtin__")
+            elif cmd and repeat_runs >= _MAX_IDENTICAL_COMMAND_RUNS:
+                # Identical command re-run too many times with no state change in
+                # between -- a spin. Hard-block it (is_error=True) so the loop also
+                # escalates the model tier instead of burning the whole budget.
+                local_repeat_counts[cmd] = local_repeat_counts.get(cmd, 0) + 1
+                results[tc_id] = (_repeated_command_message(name, cmd), True, "__builtin__")
             elif cmd and cmd == last_host_cmd:
                 results[tc_id] = (_duplicate_command_message(name), False, "__builtin__")
             else:
                 results[tc_id] = await self._execute_single_tool(name, args, messages, tool_index)
                 if cmd:
                     last_host_cmd = cmd
+                    local_repeat_counts[cmd] = local_repeat_counts.get(cmd, 0) + 1
 
         # Record steps and tool messages in the original call order.
         iter_error_count = 0
@@ -1696,6 +1717,24 @@ class AgentEngine:
                 ],
             }
         return {"role": "system", "content": self._system_directive}
+
+    def _build_host_environment_message(self) -> dict[str, Any]:
+        """Inject an authoritative host-environment summary once per session.
+
+        Surfacing the OS, shell, privilege level, and which package managers /
+        runtimes are actually on PATH -- up front, without the model having to
+        call get_system_environment -- stops it from guessing the platform wrong
+        (e.g. running apt-get on a Windows host) and from spinning on
+        trial-and-error which/where probes.
+        """
+        raw = ""
+        getter = getattr(self._tools, "get_system_environment", None)
+        if callable(getter):
+            try:
+                raw = getter()
+            except Exception:  # never let env probing break session seeding
+                raw = ""
+        return {"role": "system", "content": _summarize_host_environment(raw)}
 
     def _compact_context_window(
         self, messages: list[dict[str, Any]]
@@ -2017,6 +2056,68 @@ def _run_expand_tool_output(
         f"[expand_tool_output] {tool_name} handle={handle}, lines {start}-{end} "
         f"of {total}.{more}\n" + "\n".join(chunk),
         False,
+    )
+
+
+_OS_PACKAGE_MANAGERS: tuple[str, ...] = (
+    "apt-get", "apt", "yum", "dnf", "pacman", "apk", "brew",
+    "choco", "scoop", "winget",
+)
+
+
+def _summarize_host_environment(raw: str) -> str:
+    """Render the get_system_environment JSON into a concise, directive summary."""
+    try:
+        data = json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict) or not data:
+        return (
+            "=== HOST ENVIRONMENT ===\n"
+            "Unavailable. Call get_system_environment BEFORE any install or setup "
+            "command so you target the right OS, shell, and package manager. Never "
+            "guess the platform.\n"
+            "========================"
+        )
+
+    os_label = str(data.get("os") or "unknown")
+    shell = data.get("shell") if isinstance(data.get("shell"), dict) else {}
+    shell_name = str(shell.get("shell") or "unknown")
+    posix = bool(shell.get("posix"))
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    is_root = bool(user.get("is_root"))
+    sudo = bool(user.get("sudo_available"))
+    runtimes = data.get("runtimes") if isinstance(data.get("runtimes"), dict) else {}
+    available = sorted(name for name, present in runtimes.items() if present)
+    sandbox = data.get("sandbox") if isinstance(data.get("sandbox"), dict) else {}
+
+    pkg_present = [name for name in _OS_PACKAGE_MANAGERS if name in available]
+    runtime_present = [name for name in available if name not in _OS_PACKAGE_MANAGERS]
+
+    sandbox_line = ""
+    if sandbox:
+        mode = sandbox.get("mode", "unknown")
+        image = sandbox.get("image", "")
+        workdir = sandbox.get("container_workdir", "/workspace")
+        sandbox_line = (
+            f"Sandbox: {mode} (image={image}; workdir={workdir}) — "
+            f"commands run inside an isolated Linux container; apt-get IS available.\n"
+        )
+
+    return (
+        "=== HOST ENVIRONMENT (authoritative — do not guess the platform) ===\n"
+        f"{sandbox_line}"
+        f"OS: {os_label}    Shell: {shell_name} ({'POSIX' if posix else 'non-POSIX'})\n"
+        f"Privileges: {'root' if is_root else 'non-root'}; "
+        f"sudo {'available' if sudo else 'unavailable'}\n"
+        f"Package managers on PATH: {', '.join(pkg_present) or 'none detected'}\n"
+        f"Runtimes on PATH: {', '.join(runtime_present) or 'none detected'}\n"
+        "Run only commands that fit THIS OS and shell. Do NOT run apt-get/yum/brew "
+        "on Windows, and do NOT run choco/scoop/winget on Linux. Install only with a "
+        "package manager listed above; if none is available but the runtime you need "
+        "is already on PATH, just use it directly. These facts are stated here, so do "
+        "NOT re-probe them with repeated which/where/--version commands.\n"
+        "===================================================================="
     )
 
 

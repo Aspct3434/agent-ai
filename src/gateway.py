@@ -1,4 +1,6 @@
+# ruff: noqa: E402, I001
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -8,12 +10,16 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-import httpx
+# Load .env BEFORE any local imports so module-level os.getenv() calls in
+# agent.py / tools.py see the values (e.g. AGENT_SANDBOX, AGENT_MODEL, etc.).
 from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / "an-api.env")
+
+import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -100,7 +106,6 @@ class ReplayCheckpointRequest(BaseModel):
 Handler = Callable[[Message], Awaitable[Any]]
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / "an-api.env")
 PUBLISHED_SITES_DIR = Path(
     os.getenv("PUBLISHED_SITES_DIR", str(_PROJECT_ROOT / "published_sites"))
 ).expanduser()
@@ -298,6 +303,12 @@ async def lifespan(app: FastAPI):
     data_dir = Path(os.getenv("AGENT_DATA_DIR", str(_PROJECT_ROOT / "data")))
     checkpointer = StateCheckpointer(checkpoint_db_path)
 
+    from tools import _SANDBOX_ENABLED, _SANDBOX_IMAGE
+    if _SANDBOX_ENABLED:
+        logger.info("Docker sandbox mode ENABLED (image=%s)", _SANDBOX_IMAGE)
+    else:
+        logger.info("Docker sandbox mode disabled — running commands on host")
+
     tools = ToolManager()
     await tools.connect_server(
         name="sqlite",
@@ -340,10 +351,17 @@ async def lifespan(app: FastAPI):
     app.state.checkpointer = checkpointer
     app.state.memory = memory
     app.state.gateway = Gateway(handler)
+    app.state.active_stream_tasks = {}
 
     try:
         yield
     finally:
+        for task in list(app.state.active_stream_tasks.values()):
+            task.cancel()
+        await asyncio.gather(
+            *list(app.state.active_stream_tasks.values()),
+            return_exceptions=True,
+        )
         await app.state.gateway.shutdown()
         await distiller.shutdown()
         await tools.close()
@@ -381,6 +399,15 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/api/sessions/{session_id}/cancel")
+async def cancel_session(session_id: str) -> dict[str, Any]:
+    task = app.state.active_stream_tasks.get(session_id)
+    if task is None or task.done():
+        return {"cancelled": False, "session_id": session_id}
+    task.cancel()
+    return {"cancelled": True, "session_id": session_id}
+
+
 @app.api_route(
     "/proxy/{port}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
@@ -407,6 +434,37 @@ async def proxy_local_http_service(
         for key, value in request.headers.items()
         if key.lower() not in _PROXY_REQUEST_SKIP_HEADERS
     }
+
+    tools = getattr(app.state, "tools", None)
+    if tools is not None and getattr(tools, "sandbox_active", False):
+        try:
+            upstream_payload = await asyncio.to_thread(
+                tools.proxy_local_http_service,
+                port=port,
+                path=path,
+                query=request.url.query,
+                method=request.method,
+                headers=headers,
+                body=await request.body(),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Sandbox service proxy failed for port {port}: {exc}",
+            ) from exc
+
+        body = base64.b64decode(str(upstream_payload.get("body_b64") or ""))
+        response_headers = {
+            key: value
+            for key, value in (upstream_payload.get("headers") or {}).items()
+            if key.lower() not in _PROXY_RESPONSE_SKIP_HEADERS
+        }
+        return Response(
+            content=body,
+            status_code=int(upstream_payload.get("status_code") or 502),
+            headers=response_headers,
+            media_type=response_headers.get("content-type"),
+        )
 
     try:
         async with httpx.AsyncClient(follow_redirects=False, timeout=30.0) as client:
@@ -519,24 +577,73 @@ async def ws_stream(websocket: WebSocket) -> None:
       {"type": "text",      "content": "..."}
     """
     await websocket.accept()
+    current_task: asyncio.Task[None] | None = None
+
+    async def stream_turn(msg: NormalizedMessage) -> None:
+        try:
+            async for event in app.state.engine.stream_task(msg):
+                await websocket.send_text(json.dumps(event))
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "final_answer",
+                            "reason": "cancelled",
+                            "content": "Stopped by user.",
+                        }
+                    )
+                )
+            raise
+
+    def cleanup_stream_task(session_id: str, task: asyncio.Task[None]) -> None:
+        if app.state.active_stream_tasks.get(session_id) is task:
+            app.state.active_stream_tasks.pop(session_id, None)
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
     try:
         while True:
             raw = await websocket.receive_text()
             data = json.loads(raw)
+            session_id = data.get("session_id", "__anon__")
+            if data.get("type") == "cancel":
+                task = app.state.active_stream_tasks.get(session_id)
+                if task is not None and not task.done():
+                    task.cancel()
+                continue
+
+            if current_task is not None and not current_task.done():
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "detail": "A task is already running for this connection.",
+                        }
+                    )
+                )
+                continue
+
             try:
-                await _rate_limiter.check(data.get("session_id", "__anon__"))
+                await _rate_limiter.check(session_id)
             except HTTPException as exc:
                 await websocket.send_text(json.dumps({"type": "error", "detail": exc.detail}))
                 continue
             msg = NormalizedMessage(
-                session_id=data["session_id"],
+                session_id=session_id,
                 role="user",
                 content=data["text"],
             )
-            async for event in app.state.engine.stream_task(msg):
-                await websocket.send_text(json.dumps(event))
+            current_task = asyncio.create_task(stream_turn(msg))
+            app.state.active_stream_tasks[session_id] = current_task
+            current_task.add_done_callback(
+                lambda task, sid=session_id: cleanup_stream_task(sid, task)
+            )
     except WebSocketDisconnect:
-        pass
+        if current_task is not None and not current_task.done():
+            current_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await current_task
 
 
 # ---------------------------------------------------------------------------

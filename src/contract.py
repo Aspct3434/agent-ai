@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -671,6 +672,88 @@ def _duplicate_command_message(tool_name: str) -> str:
         "was NOT executed again. Its previous result still applies -- do not repeat "
         "it. Move on to the next step, or change the command if you intended "
         "something different."
+    )
+
+
+# Tools whose successful result means host state actually changed -- so an
+# identical command run afterwards may legitimately produce a different result
+# (e.g. `cargo build` after editing a source file, or `curl` after starting a
+# server). Deliberately EXCLUDES the host-execution tools themselves so a trivial
+# command like `echo`/`whoami` can never "unblock" its own repetition.
+_STATE_CHANGING_TOOLS: frozenset[str] = frozenset(
+    {
+        "write_text_file",
+        "publish_static_site",
+        "expose_local_http_service",
+        "create_table",
+        "write_query",
+        # MCP filesystem writes
+        "write_file",
+        "edit_file",
+        "create_directory",
+        "move_file",
+        "copy_file",
+        "delete_file",
+    }
+)
+
+# Anti-thrash cap: how many times one identical host command may run since the
+# last host-state change before further repeats are short-circuited. Re-running
+# the same command with nothing changed in between cannot produce a new result;
+# past this many attempts the model must change approach instead of spinning.
+# A state change resets the count, so a legitimate edit-then-rebuild or
+# start-then-poll loop is never blocked.
+_MAX_IDENTICAL_COMMAND_RUNS = max(
+    1, int(os.getenv("AGENT_MAX_IDENTICAL_COMMAND_RUNS", "3"))
+)
+
+
+def _host_command_runs_since_state_change(
+    steps: list[ExecutionStep], command: Any
+) -> int:
+    """Count prior runs of *command* since the most recent state-changing success.
+
+    Only host-execution results count, and any successful ``_STATE_CHANGING_TOOLS``
+    call resets the window, so commands repeated with no intervening host-state
+    change are the only ones that accumulate toward the cap.
+    """
+    target = _normalize_command(command)
+    if not target:
+        return 0
+
+    start = 0
+    for index, step in enumerate(steps):
+        if (
+            step.kind == "tool_result"
+            and not step.metadata.get("is_error")
+            and step.metadata.get("tool_name") in _STATE_CHANGING_TOOLS
+        ):
+            start = index + 1
+
+    count = 0
+    for step in steps[start:]:
+        if step.kind != "tool_result":
+            continue
+        if step.metadata.get("tool_name") not in _HOST_EXECUTION_TOOLS:
+            continue
+        arguments = step.metadata.get("arguments") or {}
+        if _normalize_command(arguments.get("command")) == target:
+            count += 1
+    return count
+
+
+def _repeated_command_message(tool_name: str, command: Any) -> str:
+    return (
+        f"[skipped: repeated command] You have already run this exact {tool_name} "
+        "command several times in this task with nothing changed in between, so it "
+        "was NOT executed again:\n"
+        f"  {_normalize_command(command)[:200]}\n"
+        "Repeating an identical command cannot produce a new result. If it FAILED "
+        "before, it is wrong for THIS host -- re-read the HOST ENVIRONMENT summary "
+        "from the start of the session (OS, shell, available package managers) and "
+        "switch to a command that fits this platform, or change your approach. If it "
+        "already SUCCEEDED, stop re-running it and move on to the next step. Do not "
+        "issue this command again."
     )
 
 

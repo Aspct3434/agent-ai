@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -133,6 +135,10 @@ _PROBED_RUNTIMES = (
     "rustc", "cargo", "gcc", "g++", "make", "cmake",
     # Package / download utilities
     "curl", "wget", "git",
+    # OS package managers — reported so the agent installs with one that actually
+    # exists for THIS host instead of guessing (e.g. apt-get on a Windows box).
+    "apt-get", "yum", "dnf", "pacman", "apk", "brew",
+    "choco", "scoop", "winget",
     # Container / orchestration
     "docker", "docker-compose",
     # Package managers / scaffolders — npx is how React/Vite/Next apps are created
@@ -196,6 +202,451 @@ _CD_RE = re.compile(
 _LEADING_CD_RE = re.compile(
     r'^\s*cd\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))\s*(?:&&\s*)?'
 )
+
+# ---------------------------------------------------------------------------
+# Docker sandbox mode
+#
+# When AGENT_SANDBOX=docker, all terminal and background commands are routed
+# through an isolated Docker container instead of running on the Windows/host
+# shell. This gives the agent a consistent Linux environment with safe package
+# install access (apt-get etc.) without touching the host OS.
+#
+# Configuration env vars:
+#   AGENT_SANDBOX          — set to "docker" to enable
+#   AGENT_SANDBOX_IMAGE    — container image (default: python:3.12-slim)
+#   AGENT_SANDBOX_MEMORY   — memory limit (default: 1g)
+#   AGENT_SANDBOX_CPUS     — CPU limit (default: 1.0)
+#   AGENT_SANDBOX_PIDS     — PID limit (default: 256)
+# ---------------------------------------------------------------------------
+
+_SANDBOX_ENABLED = os.getenv("AGENT_SANDBOX", "").lower() == "docker"
+_SANDBOX_IMAGE = os.getenv("AGENT_SANDBOX_IMAGE", "python:3.12-slim")
+_SANDBOX_WORKDIR = "/workspace"
+_SANDBOX_MEMORY = os.getenv("AGENT_SANDBOX_MEMORY", "1g")
+_SANDBOX_CPUS = os.getenv("AGENT_SANDBOX_CPUS", "1.0")
+_SANDBOX_PIDS = os.getenv("AGENT_SANDBOX_PIDS", "256")
+_SANDBOX_PACKAGE_CAPS = (
+    # apt/dpkg drop privileges to the _apt user and adjust package-owned files.
+    # Keep the sandbox otherwise locked down, but allow normal package installs.
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETUID",
+)
+
+
+class _DockerSandbox:
+    """A long-lived Docker container used as an isolated command execution sandbox.
+
+    One instance is created per ``ToolManager`` when ``AGENT_SANDBOX=docker``.
+    The container runs ``sleep infinity`` so it stays alive between commands;
+    each command is executed via ``docker exec``.  The host workspace directory
+    is bind-mounted to ``/workspace`` inside the container so file-tool writes
+    (which happen on the host) are immediately visible to terminal commands.
+    """
+
+    def __init__(self, image: str, host_workdir: str) -> None:
+        self._image = image
+        self._host_workdir = host_workdir
+        self._container_id: str | None = None
+        self._name = f"agent-sandbox-{os.getpid()}"
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def start(self) -> None:
+        """Pull image (if needed) and start the sandbox container."""
+        # Stop any leftover container from a previous run with the same name.
+        subprocess.run(
+            ["docker", "stop", "-t", "2", self._name],
+            capture_output=True, timeout=10,
+        )
+
+        result = subprocess.run(
+            self._docker_run_command(),
+            capture_output=True, text=True, timeout=120,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Docker sandbox failed to start (exit {result.returncode}): "
+                f"{result.stderr.strip()}"
+            )
+
+        self._container_id = result.stdout.strip()
+        # Ensure the workspace dir exists inside the container.
+        subprocess.run(
+            ["docker", "exec", self._container_id, "mkdir", "-p", _SANDBOX_WORKDIR],
+            capture_output=True, timeout=10,
+        )
+        logger.info(
+            "Docker sandbox started: container=%s image=%s workdir=%s",
+            self._container_id[:12], self._image, self._host_workdir,
+        )
+
+    def _docker_run_command(self) -> list[str]:
+        """Return the docker run command used to create the sandbox."""
+        command = [
+            "docker", "run", "-d", "--rm",
+            "--name", self._name,
+            "--memory", _SANDBOX_MEMORY,
+            "--cpus", _SANDBOX_CPUS,
+            "--pids-limit", _SANDBOX_PIDS,
+            "--cap-drop", "ALL",
+        ]
+        for cap in _SANDBOX_PACKAGE_CAPS:
+            command.extend(["--cap-add", cap])
+        command.extend(
+            [
+                "--cap-add", "NET_BIND_SERVICE",
+                "--security-opt", "no-new-privileges",
+                # Bind-mount the host workspace so file-tool writes are visible.
+                "-v", f"{self._host_workdir}:{_SANDBOX_WORKDIR}",
+                "-w", _SANDBOX_WORKDIR,
+                self._image,
+                "sleep", "infinity",
+            ]
+        )
+        return command
+
+    def stop(self) -> None:
+        """Stop and remove the sandbox container."""
+        if self._container_id:
+            subprocess.run(
+                ["docker", "stop", "-t", "3", self._container_id],
+                capture_output=True, timeout=15,
+            )
+            self._container_id = None
+            logger.info("Docker sandbox stopped.")
+
+    @property
+    def container_id(self) -> str:
+        if not self._container_id:
+            raise RuntimeError("Docker sandbox is not running.")
+        return self._container_id
+
+    # ------------------------------------------------------------------
+    # Command execution
+    # ------------------------------------------------------------------
+
+    async def exec_async(
+        self, command: str, cwd: str, timeout: float
+    ) -> tuple[int, str, str]:
+        """Run *command* inside the container at *cwd* and await its output."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", "-w", cwd, self.container_id,
+            "bash", "-c", command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.CancelledError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise
+        except TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise
+        rc = proc.returncode if proc.returncode is not None else -1
+        return rc, stdout_bytes.decode(errors="replace"), stderr_bytes.decode(errors="replace")
+
+    def exec_background(self, command: str, cwd: str, log_path: str) -> int | None:
+        """Launch *command* detached inside the container; output appends to *log_path*."""
+        wrapped = (
+            f"cd {shlex.quote(cwd)} && "
+            f"nohup bash -lc {shlex.quote(command)} "
+            f">> {shlex.quote(log_path)} 2>&1 < /dev/null & echo $!"
+        )
+        try:
+            result = subprocess.run(
+                ["docker", "exec", self.container_id, "bash", "-c", wrapped],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                logger.warning("sandbox exec_background failed: %s", result.stderr)
+                return None
+            return int(result.stdout.strip().splitlines()[-1])
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            logger.warning("sandbox exec_background failed: %s", exc)
+            return None
+
+    def collect_evidence_json(
+        self,
+        *,
+        paths: list[str] | None = None,
+        pids: list[int] | None = None,
+        process_names: list[str] | None = None,
+        ports: list[int] | None = None,
+        include_background_log: bool = True,
+        cwd: str = _SANDBOX_WORKDIR,
+    ) -> dict[str, Any]:
+        """Inspect paths, processes, ports, and logs from inside the sandbox."""
+        script = r"""
+import json, os, socket, sys, time
+
+req = json.load(sys.stdin)
+
+def preview(path, max_bytes=1200):
+    try:
+        with open(path, "rb") as f:
+            return f.read(max_bytes).decode("utf-8", "replace")
+    except OSError as exc:
+        return "[preview error] " + str(exc)
+
+def inspect_path(raw, cwd):
+    path = raw if os.path.isabs(raw) else os.path.join(cwd, raw)
+    path = os.path.normpath(path)
+    info = {"input": raw, "path": path, "exists": os.path.exists(path)}
+    if not info["exists"]:
+        return info
+    try:
+        st = os.stat(path)
+        info.update({
+            "is_file": os.path.isfile(path),
+            "is_dir": os.path.isdir(path),
+            "size_bytes": st.st_size,
+            "modified_at_unix": st.st_mtime,
+            "modified_age_seconds": round(time.time() - st.st_mtime, 3),
+        })
+        if info["is_dir"]:
+            children = []
+            for name in sorted(os.listdir(path), key=str.lower)[:50]:
+                child = os.path.join(path, name)
+                children.append({
+                    "name": name,
+                    "is_file": os.path.isfile(child),
+                    "is_dir": os.path.isdir(child),
+                    "size_bytes": os.path.getsize(child) if os.path.exists(child) else None,
+                })
+            info["children"] = children
+        elif info["is_file"]:
+            info["preview"] = preview(path)
+    except OSError as exc:
+        info["error"] = str(exc)
+    return info
+
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+def inspect_pid(pid):
+    info = {"pid": pid, "running": os.path.exists(f"/proc/{pid}")}
+    if info["running"]:
+        line = cmdline(pid)
+        if line:
+            info["cmdline"] = line
+    return info
+
+def inspect_process_name(name):
+    needle = name.lower()
+    matches = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        line = cmdline(pid)
+        try:
+            with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip()
+        except OSError:
+            comm = ""
+        haystack = f"{comm} {line}".lower()
+        if needle in haystack:
+            matches.append({"pid": int(pid), "comm": comm, "cmdline": line})
+            if len(matches) >= 20:
+                break
+    return {"name": name, "matches": matches, "count": len(matches)}
+
+def inspect_port(port):
+    info = {"port": port, "host": "127.0.0.1", "connectable": False}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1.0)
+    try:
+        info["connectable"] = sock.connect_ex(("127.0.0.1", int(port))) == 0
+    except OSError as exc:
+        info["error"] = str(exc)
+    finally:
+        sock.close()
+    return info
+
+def tail_file(path, max_bytes=4000):
+    info = {"path": path, "exists": os.path.exists(path)}
+    if not info["exists"]:
+        return info
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            info["tail"] = f.read().decode("utf-8", "replace")
+            info["size_bytes"] = size
+    except OSError as exc:
+        info["error"] = str(exc)
+    return info
+
+cwd = req.get("cwd") or "/workspace"
+out = {
+    "scope": "docker_sandbox",
+    "current_working_directory": cwd,
+    "paths": [inspect_path(p, cwd) for p in req.get("paths") or []],
+    "pids": [inspect_pid(int(p)) for p in req.get("pids") or []],
+    "process_names": [inspect_process_name(p) for p in req.get("process_names") or []],
+    "ports": [inspect_port(int(p)) for p in req.get("ports") or []],
+}
+if req.get("include_background_log", True):
+    out["background_log"] = tail_file("/tmp/background_task.log")
+print(json.dumps(out))
+"""
+        payload = json.dumps(
+            {
+                "cwd": cwd,
+                "paths": paths or [],
+                "pids": pids or [],
+                "process_names": process_names or [],
+                "ports": ports or [],
+                "include_background_log": include_background_log,
+            }
+        )
+        result = subprocess.run(
+            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "sandbox evidence failed")
+        return json.loads(result.stdout)
+
+    def fetch_http_json(
+        self,
+        *,
+        port: int,
+        path: str,
+        query: str,
+        method: str,
+        headers: dict[str, str],
+        body_b64: str,
+    ) -> dict[str, Any]:
+        """Fetch an HTTP URL from inside the sandbox for the backend proxy."""
+        script = r"""
+import base64, json, sys, urllib.error, urllib.request
+
+req = json.load(sys.stdin)
+url = f"http://127.0.0.1:{int(req['port'])}/{req.get('path','').lstrip('/')}"
+if req.get("query"):
+    url += "?" + req["query"]
+body = base64.b64decode(req.get("body_b64") or "")
+data = body if body else None
+request = urllib.request.Request(
+    url,
+    data=data,
+    method=req.get("method") or "GET",
+    headers=req.get("headers") or {},
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = response.read()
+        print(json.dumps({
+            "status_code": response.status,
+            "headers": dict(response.headers.items()),
+            "body_b64": base64.b64encode(payload).decode("ascii"),
+        }))
+except urllib.error.HTTPError as exc:
+    payload = exc.read()
+    print(json.dumps({
+        "status_code": exc.code,
+        "headers": dict(exc.headers.items()),
+        "body_b64": base64.b64encode(payload).decode("ascii"),
+    }))
+"""
+        payload = json.dumps(
+            {
+                "port": int(port),
+                "path": path,
+                "query": query,
+                "method": method,
+                "headers": headers,
+                "body_b64": body_b64,
+            }
+        )
+        result = subprocess.run(
+            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=35,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "sandbox HTTP fetch failed")
+        return json.loads(result.stdout)
+
+    # ------------------------------------------------------------------
+    # Environment introspection
+    # ------------------------------------------------------------------
+
+    def collect_environment_json(self) -> str:
+        """Return a JSON snapshot of the *container's* environment."""
+        probe_script = (
+            "python3 -c \""
+            "import json, shutil, subprocess, os, platform; "
+            "runtimes = {n: shutil.which(n) is not None for n in ["
+            "'java','python','python3','node','ruby','go',"
+            "'rustc','cargo','gcc','g++','make','cmake',"
+            "'curl','wget','git',"
+            "'apt-get','yum','dnf','pacman','apk','brew','choco','scoop','winget',"
+            "'docker','docker-compose','npm','npx','pip','pip3']}; "
+            "import getpass; "
+            "try: user = getpass.getuser()\nexcept: user = os.environ.get('USER','unknown'); "
+            "is_root = os.geteuid() == 0; "
+            "sudo_av = shutil.which('sudo') is not None; "
+            "import shutil as _s; u = _s.disk_usage('/'); "
+            "disk = {'total_gb': round(u.total/1073741824,2),'used_gb': round(u.used/1073741824,2),'free_gb': round(u.free/1073741824,2)}; "
+            "print(json.dumps({'os':'Linux','machine':platform.machine(),"
+            "'disk_cwd':disk,'runtimes':runtimes,"
+            "'shell':{'shell':'bash','posix':True},"
+            "'user':{'username':user,'is_root':is_root,'sudo_available':sudo_av},"
+            "'sandbox':{'mode':'docker','image':os.environ.get('SANDBOX_IMAGE','unknown'),"
+            "'container_workdir':'/workspace'}}))"
+            "\""
+        )
+        try:
+            result = subprocess.run(
+                ["docker", "exec",
+                 "-e", f"SANDBOX_IMAGE={self._image}",
+                 self.container_id, "bash", "-c", probe_script],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception as exc:
+            logger.warning("sandbox environment probe failed: %s", exc)
+
+        # Fallback: minimal JSON so the agent knows it's in Linux Docker
+        return json.dumps({
+            "os": "Linux",
+            "sandbox": {"mode": "docker", "image": self._image,
+                        "container_workdir": _SANDBOX_WORKDIR},
+            "shell": {"shell": "bash", "posix": True},
+            "note": "environment probe unavailable; apt-get is available for installs",
+        }, indent=2)
+
 
 GET_SYSTEM_ENVIRONMENT_TOOL: dict[str, Any] = {
     "server": "__builtin__",
@@ -612,15 +1063,44 @@ class ToolManager:
         # when a server connects or disconnects, so caching it avoids a
         # list_tools round-trip to every MCP server on every agent turn.
         self._tools_cache: list[dict[str, Any]] | None = None
-        self._env_snapshot: str = _collect_system_environment()
         default_cwd = Path(os.getenv("AGENT_WORKDIR", str(_PROJECT_ROOT))).expanduser()
         if not default_cwd.exists():
             default_cwd = _PROJECT_ROOT
-        self.current_cwd: str = str(default_cwd.resolve())
+        host_workdir = str(default_cwd.resolve())
+
+        # Docker sandbox — started eagerly so the container is ready before the
+        # first terminal command arrives and so get_system_environment reflects
+        # the container's Linux environment from the very first session message.
+        self._sandbox: _DockerSandbox | None = None
+        if _SANDBOX_ENABLED:
+            try:
+                sandbox = _DockerSandbox(image=_SANDBOX_IMAGE, host_workdir=host_workdir)
+                sandbox.start()
+                self._sandbox = sandbox
+                # Inside the container all commands run under /workspace.
+                self.current_cwd: str = _SANDBOX_WORKDIR
+                self._env_snapshot: str = sandbox.collect_environment_json()
+                logger.info("Sandbox mode: docker (image=%s)", _SANDBOX_IMAGE)
+            except Exception as exc:
+                logger.error(
+                    "Docker sandbox failed to start — falling back to host execution: %s", exc
+                )
+                self._sandbox = None
+                self.current_cwd = host_workdir
+                self._env_snapshot = _collect_system_environment()
+        else:
+            self.current_cwd = host_workdir
+            self._env_snapshot = _collect_system_environment()
+
         self.published_sites_dir = Path(
             os.getenv("PUBLISHED_SITES_DIR", str(_PROJECT_ROOT / "published_sites"))
         ).expanduser()
         self.public_base_url = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+        # When sandbox is active, _host_workdir is the real host path mounted
+        # into the container as /workspace. File tools use it to remap container
+        # paths back to host paths so write_text_file("/workspace/x") resolves
+        # correctly on the host.
+        self._host_workdir: str = host_workdir
         # Lazy browser session — started on first browser_* tool call.
         self._browser_session: _BrowserSession | None = None
 
@@ -800,6 +1280,10 @@ class ToolManager:
         """Return the cached JSON environment snapshot collected at init time."""
         return self._env_snapshot
 
+    @property
+    def sandbox_active(self) -> bool:
+        return self._sandbox is not None
+
     async def web_fetch(
         self,
         url: str,
@@ -955,6 +1439,19 @@ class ToolManager:
         include_background_log: bool = True,
     ) -> str:
         """Return JSON evidence for files/folders, processes, ports, and logs."""
+        if self._sandbox is not None:
+            return json.dumps(
+                self._sandbox.collect_evidence_json(
+                    paths=paths,
+                    pids=pids,
+                    process_names=process_names,
+                    ports=ports,
+                    include_background_log=include_background_log,
+                    cwd=self.current_cwd,
+                ),
+                indent=2,
+            )
+
         payload: dict[str, Any] = {
             "current_working_directory": self.current_cwd,
             "paths": [
@@ -973,7 +1470,7 @@ class ToolManager:
 
     def write_text_file(self, path: str, content: str) -> str:
         """Create or overwrite a UTF-8 text file and return structured evidence."""
-        target = _resolve_tool_path(path, self.current_cwd)
+        target = self._resolve_file_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         payload = {
@@ -998,7 +1495,7 @@ class ToolManager:
         of starting throwaway HTTP servers on ports that are internal to the
         container.
         """
-        source = _resolve_tool_path(source_path or self.current_cwd, self.current_cwd)
+        source = self._resolve_file_path(source_path or self.current_cwd)
         if not source.exists():
             raise FileNotFoundError(f"Static site source does not exist: {source}")
         if not source.is_dir():
@@ -1054,13 +1551,25 @@ class ToolManager:
         if service_port < 1 or service_port > 65535:
             raise ValueError(f"Port out of range: {service_port}")
 
-        connectable = False
-        error: str | None = None
-        try:
-            with socket.create_connection(("127.0.0.1", service_port), timeout=1.0):
-                connectable = True
-        except OSError as exc:
-            error = str(exc)
+        if self._sandbox is not None:
+            evidence = self._sandbox.collect_evidence_json(
+                ports=[service_port],
+                include_background_log=False,
+                cwd=self.current_cwd,
+            )
+            port_info = (evidence.get("ports") or [{}])[0]
+            connectable = bool(port_info.get("connectable"))
+            error = port_info.get("error")
+            scope = "docker_sandbox"
+        else:
+            connectable = False
+            error: str | None = None
+            scope = "host"
+            try:
+                with socket.create_connection(("127.0.0.1", service_port), timeout=1.0):
+                    connectable = True
+            except OSError as exc:
+                error = str(exc)
 
         if not connectable:
             raise ConnectionError(
@@ -1076,8 +1585,31 @@ class ToolManager:
             "path": suffix,
             "url": f"{self.public_base_url}/proxy/{service_port}{suffix}",
             "connectable": connectable,
+            "scope": scope,
         }
         return json.dumps(payload, indent=2)
+
+    def proxy_local_http_service(
+        self,
+        *,
+        port: int,
+        path: str,
+        query: str,
+        method: str,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> dict[str, Any]:
+        """Fetch a proxied HTTP service from the same place tools run."""
+        if self._sandbox is None:
+            raise RuntimeError("proxy_local_http_service is only for sandbox mode")
+        return self._sandbox.fetch_http_json(
+            port=port,
+            path=path,
+            query=query,
+            method=method,
+            headers=headers,
+            body_b64=base64.b64encode(body).decode("ascii"),
+        )
 
     async def execute_terminal_command(self, command: str) -> dict[str, Any]:
         """Run *command* inside ``self.current_cwd`` and return a structured result dict.
@@ -1116,7 +1648,10 @@ class ToolManager:
         cd_match = _LEADING_CD_RE.match(command)
         if cd_match:
             raw = next(g for g in cd_match.groups() if g is not None)
-            resolved = _resolve_cd_target(f"cd {raw}", self.current_cwd)
+            if self._sandbox is not None:
+                resolved = _resolve_sandbox_cd(f"cd {raw}", self.current_cwd)
+            else:
+                resolved = _resolve_cd_target(f"cd {raw}", self.current_cwd)
             if resolved is not None:
                 self.current_cwd = resolved
 
@@ -1134,70 +1669,100 @@ class ToolManager:
         # â"€â"€ Step 2: run the (possibly trimmed) command in current_cwd â"€â"€â"€â"€â"€â"€â"€â"€
         cwd_snapshot = self.current_cwd
 
-        try:
-            # On Windows use bash (Git Bash / WSL) when available so POSIX
-            # commands (mkdir -p, cat, etc.) work correctly.  On POSIX systems
-            # create_subprocess_shell already uses /bin/sh.
-            if _POSIX_SHELL is not None:
-                proc = await asyncio.create_subprocess_exec(
-                    *_POSIX_SHELL, command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd_snapshot,
-                )
-            else:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=cwd_snapshot,
-                )
-        except (FileNotFoundError, NotADirectoryError) as exc:
-            return {
-                "exit_code": -1,
-                "stdout": (
-                    f"SYSTEM ALERT: Command execution failed with error code -1. "
-                    f"You must troubleshoot this failure before executing "
-                    f"subsequent commands.\n"
-                    f"Working directory does not exist: {cwd_snapshot} ({exc})"
-                ),
-                "stderr": "",
-                "current_working_directory": cwd_snapshot,
-            }
-
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=_TERMINAL_TIMEOUT_SECONDS
-            )
-        except TimeoutError:
-            # wait_for only cancels the communicate() await -- the spawned shell
-            # keeps running and would otherwise leak and hold the event loop.
-            # Physically kill it, then reap so it does not become a zombie.
-            proc.kill()
+        if self._sandbox is not None:
+            # ── Sandbox path: run inside the Docker container ──────────────
             try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-            return {
-                "exit_code": -1,
-                "stdout": (
-                    f"SYSTEM ALERT: Command execution failed with error code -1. "
-                    f"You must troubleshoot this failure before executing subsequent "
-                    f"commands.\nCommand exceeded the {_TERMINAL_TIMEOUT_SECONDS}s "
-                    f"timeout and was killed. Only move a command to "
-                    f"execute_background_service if it is a process that NEVER "
-                    f"terminates (a server/daemon/watcher). A finite command that is "
-                    f"merely slow (install, download, build) should NOT be "
-                    f"backgrounded -- re-run it here, or split it into smaller steps; "
-                    f"do not poll a background log waiting for it."
-                ),
-                "stderr": "",
-                "current_working_directory": cwd_snapshot,
-            }
+                exit_code, stdout, stderr = await self._sandbox.exec_async(
+                    command, cwd_snapshot, _TERMINAL_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                return {
+                    "exit_code": -1,
+                    "stdout": (
+                        f"SYSTEM ALERT: Command execution failed with error code -1. "
+                        f"You must troubleshoot this failure before executing subsequent "
+                        f"commands.\nCommand exceeded the {_TERMINAL_TIMEOUT_SECONDS}s "
+                        f"timeout and was killed inside the Docker sandbox. Only move a "
+                        f"command to execute_background_service if it NEVER terminates "
+                        f"(a server/daemon). A finite slow command should be re-run or "
+                        f"split into smaller steps."
+                    ),
+                    "stderr": "",
+                    "current_working_directory": cwd_snapshot,
+                }
+        else:
+            # ── Host path: run directly on the OS ──────────────────────────
+            try:
+                # On Windows use bash (Git Bash / WSL) when available so POSIX
+                # commands (mkdir -p, cat, etc.) work correctly.  On POSIX systems
+                # create_subprocess_shell already uses /bin/sh.
+                if _POSIX_SHELL is not None:
+                    proc = await asyncio.create_subprocess_exec(
+                        *_POSIX_SHELL, command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd_snapshot,
+                    )
+                else:
+                    proc = await asyncio.create_subprocess_shell(
+                        command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=cwd_snapshot,
+                    )
+            except (FileNotFoundError, NotADirectoryError) as exc:
+                return {
+                    "exit_code": -1,
+                    "stdout": (
+                        f"SYSTEM ALERT: Command execution failed with error code -1. "
+                        f"You must troubleshoot this failure before executing "
+                        f"subsequent commands.\n"
+                        f"Working directory does not exist: {cwd_snapshot} ({exc})"
+                    ),
+                    "stderr": "",
+                    "current_working_directory": cwd_snapshot,
+                }
 
-        stdout = stdout_bytes.decode(errors="replace")
-        stderr = stderr_bytes.decode(errors="replace")
-        exit_code: int = proc.returncode if proc.returncode is not None else -1
+            try:
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(), timeout=_TERMINAL_TIMEOUT_SECONDS
+                )
+            except asyncio.CancelledError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                raise
+            except TimeoutError:
+                # wait_for only cancels the communicate() await -- the spawned shell
+                # keeps running and would otherwise leak and hold the event loop.
+                # Physically kill it, then reap so it does not become a zombie.
+                proc.kill()
+                try:
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                return {
+                    "exit_code": -1,
+                    "stdout": (
+                        f"SYSTEM ALERT: Command execution failed with error code -1. "
+                        f"You must troubleshoot this failure before executing subsequent "
+                        f"commands.\nCommand exceeded the {_TERMINAL_TIMEOUT_SECONDS}s "
+                        f"timeout and was killed. Only move a command to "
+                        f"execute_background_service if it is a process that NEVER "
+                        f"terminates (a server/daemon/watcher). A finite command that is "
+                        f"merely slow (install, download, build) should NOT be "
+                        f"backgrounded -- re-run it here, or split it into smaller steps; "
+                        f"do not poll a background log waiting for it."
+                    ),
+                    "stderr": "",
+                    "current_working_directory": cwd_snapshot,
+                }
+
+            stdout = stdout_bytes.decode(errors="replace")
+            stderr = stderr_bytes.decode(errors="replace")
+            exit_code = proc.returncode if proc.returncode is not None else -1
 
         if exit_code > 0:
             stdout = (
@@ -1215,7 +1780,10 @@ class ToolManager:
 
         # â"€â"€ Step 3: track any embedded cd calls (e.g. mkdir /x && cd /x) â"€â"€â"€â"€
         if result["exit_code"] == 0:
-            new_cwd = _resolve_cd_target(command, cwd_snapshot)
+            if self._sandbox is not None:
+                new_cwd = _resolve_sandbox_cd(command, cwd_snapshot)
+            else:
+                new_cwd = _resolve_cd_target(command, cwd_snapshot)
             if new_cwd is not None:
                 self.current_cwd = new_cwd
 
@@ -1230,14 +1798,36 @@ class ToolManager:
         servers and other long-running / non-terminating processes that would
         otherwise block the ReAct loop and deadlock the frontend.
 
-        Combined stdout and stderr are appended to ``_BACKGROUND_LOG_PATH`` so the
-        agent can inspect them later by ``cat``-ing that file.  The process runs in
-        ``self.current_cwd`` and is started in its own session so it survives
-        independently of this server.
+        In sandbox mode the process runs inside the Docker container and output
+        is appended to ``/tmp/background_task.log`` inside the container.
+        On the host the log path is ``_BACKGROUND_LOG_PATH``.
 
         Returns a dict with keys ``pid`` (int, or ``None`` on failure),
         ``status`` (``"launched"`` or ``"error"``), ``message``, and ``log_file``.
         """
+        if self._sandbox is not None:
+            # ── Sandbox path: launch inside Docker ────────────────────────
+            sandbox_log = "/tmp/background_task.log"
+            pid = self._sandbox.exec_background(command, self.current_cwd, sandbox_log)
+            if pid is None:
+                return {
+                    "pid": None,
+                    "status": "error",
+                    "message": "Failed to launch background service inside Docker sandbox.",
+                    "log_file": sandbox_log,
+                }
+            return {
+                "pid": pid,
+                "status": "launched",
+                "message": (
+                    f"Background service launched inside Docker sandbox. "
+                    f"Output is appended to {sandbox_log} inside the container; "
+                    f"run `cat {sandbox_log}` to inspect it."
+                ),
+                "log_file": sandbox_log,
+            }
+
+        # ── Host path: launch directly on the OS ──────────────────────────
         try:
             log_handle = open(_BACKGROUND_LOG_PATH, "ab")
         except OSError as exc:
@@ -1298,12 +1888,15 @@ class ToolManager:
         await self._disconnect(name)
 
     async def close(self) -> None:
-        """Shut down all connected servers and the browser session (if open)."""
+        """Shut down all connected servers, the browser session, and the sandbox."""
         for name in list(self._stacks):
             await self._disconnect(name)
         if self._browser_session is not None:
             await self._browser_session.close()
             self._browser_session = None
+        if self._sandbox is not None:
+            self._sandbox.stop()
+            self._sandbox = None
 
     # ------------------------------------------------------------------
     # Browser convenience methods (delegates to lazy _BrowserSession)
@@ -1368,6 +1961,26 @@ class ToolManager:
         if stack:
             await stack.aclose()
 
+    def _resolve_file_path(self, raw_path: str) -> Path:
+        """Resolve a path for file tools (write_text_file, publish_static_site, etc.).
+
+        In sandbox mode the agent's cwd is ``/workspace`` (a container path).
+        Absolute paths starting with ``/workspace`` are remapped to the actual
+        host workdir so that host-side file writes land in the right place.
+        In normal (non-sandbox) mode this is identical to
+        ``_resolve_tool_path(raw_path, self.current_cwd)``.
+        """
+        if self._sandbox is not None:
+            # Remap /workspace/* → host_workdir/*
+            p = raw_path.replace("\\", "/")
+            if p == "/workspace" or p.startswith("/workspace/"):
+                suffix = p[len("/workspace"):]
+                raw_path = self._host_workdir + suffix.replace("/", os.sep)
+            elif not Path(raw_path).is_absolute():
+                # Relative paths resolve against the host workdir.
+                return _resolve_tool_path(raw_path, self._host_workdir)
+        return _resolve_tool_path(raw_path, self.current_cwd)
+
 
 # ---------------------------------------------------------------------------
 # System environment helpers
@@ -1419,6 +2032,56 @@ def _resolve_cd_target(command: str, current_cwd: str) -> str | None:
         return str(candidate.resolve())
     except OSError:
         return str(candidate)
+
+
+def _resolve_sandbox_cd(command: str, current_cwd: str) -> str | None:
+    """POSIX-aware cd tracker for sandbox mode.
+
+    On a Windows host, ``Path("/workspace")`` resolves to ``C:\\workspace``,
+    breaking container path tracking.  This function does pure string-based
+    POSIX path resolution so that ``/workspace/mydir`` stays as-is.
+    """
+    bare_cd = re.search(r'(?:^|[;&|])\s*cd\s*(?:[;&|]|$)', command, re.MULTILINE)
+    matches = _CD_RE.findall(command)
+    if not matches and not bare_cd:
+        return None
+    if not matches:
+        return "/root"  # cd with no args goes to ~ which is /root in most containers
+
+    raw = next(g for g in reversed(matches[-1]) if g)
+    if raw == '-':
+        return None
+    if raw in ('~', '/root', '$HOME'):
+        return "/root"
+    if raw.startswith('~/'):
+        return "/root/" + raw[2:]
+
+    if raw.startswith('/'):
+        # Absolute POSIX path — normalise .. without using os.path
+        parts = []
+        for segment in raw.split('/'):
+            if segment in ('', '.'):
+                continue
+            if segment == '..':
+                if parts:
+                    parts.pop()
+            else:
+                parts.append(segment)
+        return '/' + '/'.join(parts)
+
+    # Relative path — join against current_cwd
+    base = current_cwd.rstrip('/')
+    combined = base + '/' + raw
+    parts = []
+    for segment in combined.split('/'):
+        if segment in ('', '.'):
+            continue
+        if segment == '..':
+            if parts:
+                parts.pop()
+        else:
+            parts.append(segment)
+    return '/' + '/'.join(parts)
 
 
 def _collect_system_environment() -> str:
