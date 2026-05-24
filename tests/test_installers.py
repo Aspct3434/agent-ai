@@ -155,5 +155,7 @@ def test_readme_empty_pc_commands_use_bootstrap() -> None:
 
     assert "scripts/bootstrap.ps1" in text
     assert "scripts/bootstrap.sh" in text
+    assert "https://raw.githubusercontent.com/Aspct3434/agent-ai/main/scripts/bootstrap.ps1" in text
+    assert "https://raw.githubusercontent.com/Aspct3434/agent-ai/main/scripts/bootstrap.sh" in text
     assert "scripts/install.ps1 | iex" not in text
     assert "scripts/install.sh | bash" not in text
