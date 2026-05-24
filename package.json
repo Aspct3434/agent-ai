@@ -1,6 +1,6 @@
 {
   "name": "@aspct3434/agent-ai",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "OpenClaw-style onboarding installer and lifecycle CLI for Agent AI.",
   "bin": {
     "agent-ai": "bin/agent-ai.js"
