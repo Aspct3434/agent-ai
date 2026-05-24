@@ -235,6 +235,20 @@ _SANDBOX_PACKAGE_CAPS = (
     "SETUID",
 )
 
+# Baseline packages installed automatically inside every new sandbox container.
+# Slim Docker images (python:*-slim, debian-slim, etc.) ship with almost nothing
+# — no curl, wget, git, or even unzip — so any task that downloads a file, clones
+# a repo, or extracts an archive would fail immediately without these.
+# Env-tunable: set AGENT_SANDBOX_BASELINE_PACKAGES to a comma-separated list.
+_SANDBOX_BASELINE_PACKAGES: list[str] = [
+    p.strip()
+    for p in os.getenv(
+        "AGENT_SANDBOX_BASELINE_PACKAGES",
+        "curl,wget,git,unzip,procps",
+    ).split(",")
+    if p.strip()
+]
+
 # Path the agent should read to inspect the background-service log, expressed
 # from the agent's OWN vantage point: inside the container under sandbox mode,
 # on the host otherwise. Tool *descriptions* and prompts must reference this --
@@ -291,10 +305,38 @@ class _DockerSandbox:
             ["docker", "exec", self._container_id, "mkdir", "-p", _SANDBOX_WORKDIR],
             capture_output=True, timeout=10,
         )
+        # Install baseline packages (curl, wget, git, …) that slim images lack.
+        self._install_baseline_packages()
         logger.info(
             "Docker sandbox started: container=%s image=%s workdir=%s",
             self._container_id[:12], self._image, self._host_workdir,
         )
+
+    def _install_baseline_packages(self) -> None:
+        """Install essential packages that slim Docker images do not include.
+
+        Without these, nearly every real task fails on the first download,
+        clone, or archive extraction. The list is env-tunable via
+        ``AGENT_SANDBOX_BASELINE_PACKAGES``.
+        """
+        if not _SANDBOX_BASELINE_PACKAGES:
+            return
+        pkgs = " ".join(_SANDBOX_BASELINE_PACKAGES)
+        logger.info("Installing sandbox baseline packages: %s …", pkgs)
+        result = subprocess.run(
+            [
+                "docker", "exec", self._container_id, "bash", "-c",
+                f"apt-get update -qq && apt-get install -y -qq {pkgs} 2>&1 | tail -5",
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Sandbox baseline package install failed (exit %d): %s",
+                result.returncode, (result.stderr or result.stdout)[:300],
+            )
+        else:
+            logger.info("Sandbox baseline packages installed successfully.")
 
     def _docker_run_command(self) -> list[str]:
         """Return the docker run command used to create the sandbox."""
