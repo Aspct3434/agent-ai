@@ -791,6 +791,18 @@ _MAX_IDENTICAL_TOOL_CALLS = max(
     1, int(os.getenv("AGENT_MAX_IDENTICAL_TOOL_CALLS", "3"))
 )
 
+# Maximum number of consecutive execute_terminal_command calls allowed without
+# any other tool type (evidence check, file write, etc.) in between.
+#
+# A long unbroken run of terminal-only calls — varied or identical — means the
+# agent is trying many command variants without pausing to inspect state. The
+# identical-call guard above catches *exact* repeats; this cap catches the
+# harder "varied spin" pattern where each command is slightly different but the
+# agent is still not making progress. Tunable via env var.
+_MAX_CONSECUTIVE_TERMINAL_COMMANDS = max(
+    4, int(os.getenv("AGENT_MAX_CONSECUTIVE_TERMINAL_COMMANDS", "8"))
+)
+
 
 def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
     """Stable signature for a (tool, args) pair so identical calls compare equal."""
@@ -845,18 +857,26 @@ def _identical_tool_call_runs_since_state_change(
 
 
 def _repeated_tool_call_message(tool_name: str, arguments: dict[str, Any]) -> str:
-    """Block message for a repeated identical tool call, tailored per tool."""
+    """Block message for a repeated identical tool call.
+
+    The redirect is keyed off the *resource being polled* (the ``ports``
+    argument), not off any single tool name, so it applies to every tool that
+    can poll a port. Anything else gets the general "wait once / fix the cause"
+    guidance below.
+    """
     args = arguments or {}
-    # Port checks are the most common poll-loop — point at the right primitive.
-    if tool_name == "get_filesystem_process_evidence" and args.get("ports"):
-        ports = ", ".join(str(p) for p in args["ports"])
+    # A repeated port check is the most common poll-loop and it has a dedicated
+    # blocking primitive. Trigger on the argument, regardless of which tool.
+    ports = args.get("ports")
+    if ports:
+        port_list = ", ".join(str(p) for p in ports)
         return (
-            f"[skipped: poll loop] You have checked port(s) {ports} repeatedly with "
+            f"[skipped: poll loop] You have checked port(s) {port_list} repeatedly with "
             "no change, so this was NOT run again. Polling burns API calls and the "
             "rate-limit budget. Call wait_for_port instead — it blocks internally "
             "until the port opens (or times out) in a single turn. If the service "
-            "failed to start, read the log first: "
-            "execute_terminal_command('cat /tmp/background_task.log')."
+            "failed to start, read the background-service log first (the start "
+            "call returned its exact path)."
         )
     return (
         f"[skipped: repeated call] You have already called {tool_name} with these "
@@ -866,6 +886,54 @@ def _repeated_tool_call_message(tool_name: str, arguments: dict[str, Any]) -> st
         "finish, wait ONCE (wait_for_port for a service port, or a single blocking "
         "command) instead of polling; if a previous step failed, fix the underlying "
         "cause rather than re-checking the same thing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Consecutive terminal-command run-length guard
+#
+# The identical-call guard (above) catches EXACT repeats. This guard catches
+# the complementary "varied spin" pattern: many DIFFERENT commands in a row
+# with no evidence check, file write, or other tool type in between. Any task
+# where the agent runs N consecutive execute_terminal_command calls without
+# pausing to inspect state or create an artifact is almost certainly stuck in
+# a trial-and-error loop that will hit rate limits before making real progress.
+# ---------------------------------------------------------------------------
+
+def _consecutive_terminal_run_length(steps: list[ExecutionStep]) -> int:
+    """Count how many consecutive ``execute_terminal_command`` tool results appear
+    at the tail of *steps* with no other tool type in between.
+
+    Only ``execute_terminal_command`` is counted (not ``execute_background_service``
+    — that is a one-shot service launch, never a spin target). ``tool_result``
+    steps from other tools break the streak.
+    """
+    count = 0
+    for step in reversed(steps):
+        if step.kind != "tool_result":
+            continue
+        if step.metadata.get("tool_name") == "execute_terminal_command":
+            count += 1
+        else:
+            break
+    return count
+
+
+def _consecutive_terminal_cap_message(run_length: int) -> str:
+    """Block message for a consecutive terminal-command run that exceeded the cap."""
+    return (
+        f"[blocked: command-only run ({run_length})] You have issued {run_length} "
+        "execute_terminal_command calls in a row without any other tool call in "
+        "between. This almost always means a trial-and-error loop: each new command "
+        "variant is guesswork, not a reasoned next step. "
+        "STOP and do ONE of the following before running another command:\n"
+        "  1. Call get_system_environment if you have not confirmed the OS, shell, "
+        "     and available runtimes — never guess the platform.\n"
+        "  2. Call get_filesystem_process_evidence to verify what actually exists "
+        "     on disk or is running (do not assume a previous command succeeded).\n"
+        "  3. Read any error output you already have and reason about the root cause "
+        "     before choosing a new approach — do not just rephrase the same command.\n"
+        "Once you have inspected state and know what to do, you may run commands again."
     )
 
 

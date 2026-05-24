@@ -235,6 +235,16 @@ _SANDBOX_PACKAGE_CAPS = (
     "SETUID",
 )
 
+# Path the agent should read to inspect the background-service log, expressed
+# from the agent's OWN vantage point: inside the container under sandbox mode,
+# on the host otherwise. Tool *descriptions* and prompts must reference this --
+# never the host-only ``_BACKGROUND_LOG_PATH`` -- so the advice is correct in
+# whichever execution mode is active. Actual host file I/O still uses
+# ``_BACKGROUND_LOG_PATH`` directly.
+_AGENT_BACKGROUND_LOG_PATH = (
+    "/tmp/background_task.log" if _SANDBOX_ENABLED else _BACKGROUND_LOG_PATH
+)
+
 
 class _DockerSandbox:
     """A long-lived Docker container used as an isolated command execution sandbox.
@@ -705,7 +715,7 @@ GET_FILESYSTEM_PROCESS_EVIDENCE_TOOL: dict[str, Any] = {
             },
             "include_background_log": {
                 "type": "boolean",
-                "description": f"Include the tail of {_BACKGROUND_LOG_PATH}. Default true.",
+                "description": f"Include the tail of {_AGENT_BACKGROUND_LOG_PATH}. Default true.",
             },
         },
         "additionalProperties": False,
@@ -939,7 +949,7 @@ EXECUTE_BACKGROUND_SERVICE_TOOL: dict[str, Any] = {
     "description": (
         "Launch a process that NEVER terminates on its own -- a server, daemon, or "
         "watcher -- in the background WITHOUT waiting. The process is detached, its "
-        f"combined stdout/stderr is appended to {_BACKGROUND_LOG_PATH}, and the new "
+        f"combined stdout/stderr is appended to {_AGENT_BACKGROUND_LOG_PATH}, and the new "
         "PID is returned immediately. "
         "Use this ONLY for non-terminating processes. Do NOT use it for finite work "
         "such as package installs (apt-get/pip), downloads, or builds -- those finish "
@@ -947,7 +957,7 @@ EXECUTE_BACKGROUND_SERVICE_TOOL: dict[str, Any] = {
         "backgrounding them just forces you to poll this log and can deadlock on "
         "resource locks (e.g. apt/dpkg). Never launch the same install or service "
         "more than once. After starting a service, check "
-        f"'cat {_BACKGROUND_LOG_PATH}' at most once or twice -- do not poll it in a loop."
+        f"'cat {_AGENT_BACKGROUND_LOG_PATH}' at most once or twice -- do not poll it in a loop."
     ),
     "inputSchema": {
         "type": "object",
@@ -1110,6 +1120,7 @@ class ToolManager:
         # first terminal command arrives and so get_system_environment reflects
         # the container's Linux environment from the very first session message.
         self._sandbox: _DockerSandbox | None = None
+        self._sandbox_startup_failed: bool = False  # set True when AGENT_SANDBOX=docker but Docker unreachable
         if _SANDBOX_ENABLED:
             try:
                 sandbox = _DockerSandbox(image=_SANDBOX_IMAGE, host_workdir=host_workdir)
@@ -1124,6 +1135,7 @@ class ToolManager:
                     "Docker sandbox failed to start — falling back to host execution: %s", exc
                 )
                 self._sandbox = None
+                self._sandbox_startup_failed = True
                 self.current_cwd = host_workdir
                 self._env_snapshot = _collect_system_environment()
         else:
@@ -1322,6 +1334,15 @@ class ToolManager:
     @property
     def sandbox_active(self) -> bool:
         return self._sandbox is not None
+
+    @property
+    def sandbox_startup_failed(self) -> bool:
+        """True when AGENT_SANDBOX=docker was set but Docker could not be reached.
+
+        Exposed so the session-seeding environment message can warn the agent (and
+        the operator) that commands run on the host, not inside a container.
+        """
+        return self._sandbox_startup_failed
 
     async def web_fetch(
         self,
@@ -1689,7 +1710,7 @@ class ToolManager:
             "elapsed_seconds": elapsed,
             "hint": (
                 f"Port {port} did not open within {timeout}s. "
-                "Read the background log (cat /tmp/background_task.log) "
+                f"Read the background log (cat {_AGENT_BACKGROUND_LOG_PATH}) "
                 "to diagnose the failure before retrying."
             ),
         })
@@ -2859,13 +2880,18 @@ def _ensure_skills_dir(skills_dir: Path) -> None:
     _write_if_absent(skills_dir / "_skill.py", _SKILL_DECORATOR_SRC)
     _write_if_absent(skills_dir / "server.py", _SKILLS_SERVER_SRC)
 
-    # Deploy built-in skills unconditionally (overwrite so updates land on restart)
+    # Deploy built-in skills when their content changes. Avoid rewriting identical
+    # files: uvicorn --reload watches the repo root in local dev, and touching
+    # skills/*.py during startup causes a reload loop that drops WebSockets.
     if _BUILTIN_SKILLS_DIR.is_dir():
         for src_file in sorted(_BUILTIN_SKILLS_DIR.glob("*.py")):
             dest = skills_dir / src_file.name
             try:
-                dest.write_text(src_file.read_text(encoding="utf-8"), encoding="utf-8")
-                logger.debug("Deployed built-in skill: %s → %s", src_file.name, dest)
+                _write_if_changed(
+                    dest,
+                    src_file.read_text(encoding="utf-8"),
+                )
+                logger.debug("Deployed built-in skill: %s -> %s", src_file.name, dest)
             except OSError as exc:
                 logger.warning("Could not deploy built-in skill %s: %s", src_file.name, exc)
 
@@ -2873,6 +2899,16 @@ def _ensure_skills_dir(skills_dir: Path) -> None:
 def _write_if_absent(path: Path, content: str) -> None:
     if not path.exists():
         path.write_text(content, encoding="utf-8")
+
+
+def _write_if_changed(path: Path, content: str) -> None:
+    try:
+        if path.exists() and path.read_text(encoding="utf-8") == content:
+            return
+    except OSError:
+        # Fall through and try to repair the file by writing the desired content.
+        pass
+    path.write_text(content, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------

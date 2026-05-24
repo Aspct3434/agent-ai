@@ -16,6 +16,7 @@ from checkpointer import StateCheckpointer
 from contract import (
     _GENERIC_CAP_SKIP_TOOLS,
     _HOST_EXECUTION_TOOLS,
+    _MAX_CONSECUTIVE_TERMINAL_COMMANDS,
     _MAX_IDENTICAL_COMMAND_RUNS,
     _MAX_IDENTICAL_TOOL_CALLS,
     _TASK_CONTRACT_TOOL,
@@ -24,6 +25,8 @@ from contract import (
     _build_incomplete_contract_cap_message,
     _build_task_contract_instruction,
     _can_stream_text_before_final,
+    _consecutive_terminal_cap_message,
+    _consecutive_terminal_run_length,
     _contract_completion_status,
     _duplicate_command_message,
     _filter_tool_schemas,
@@ -498,14 +501,16 @@ SYSTEM_DIRECTIVE = (
     "that simply takes a while -- installing packages (apt-get/pip), downloading files, "
     "building, running tests -- MUST go through execute_terminal_command, which waits "
     "for the command to finish; do not background it. Backgrounding a finite command "
-    "forces you to poll /tmp/background_task.log and can deadlock on resource locks "
+    "forces you to poll the background-service log and can deadlock on resource locks "
     "(e.g. apt/dpkg). After you start a real background service, call wait_for_port "
     "to wait for it to bind -- that tool blocks internally and returns only once the "
     "port opens (or the timeout expires), so you never burn multiple API calls polling. "
-    "Read the background log at most once (cat /tmp/background_task.log) to confirm "
-    "startup or diagnose a failure; never call get_filesystem_process_evidence in a "
-    "loop checking the same port; and never launch the same service command again "
-    "while one is already running. "
+    "Read the background-service log at most once -- the start call returns its exact "
+    "path -- to confirm startup or diagnose a failure; NEVER poll any read-only tool in "
+    "a loop to wait for state to change (an identical call returns no new information "
+    "and just wastes your rate-limit budget -- wait once with a blocking primitive "
+    "instead); and never launch the same service command again while one is already "
+    "running. "
     "NEVER append '&' to a command in execute_terminal_command to background it: that "
     "tool is synchronous and returns only when the command exits, so a trailing '&' "
     "keeps nothing running and will mislead you -- use execute_background_service for "
@@ -1534,6 +1539,10 @@ class AgentEngine:
         # command emitted several times in one turn also trips the cap; the
         # cross-iteration count is recovered from `steps` via the helper.
         local_repeat_counts: dict[str, int] = {}
+        # Consecutive terminal-command run counter: cross-turn baseline + intra-turn
+        # accumulator. Catches "varied spin" where commands differ but the agent is
+        # still running terminal-only calls with no evidence/file-write in between.
+        local_terminal_run_count = _consecutive_terminal_run_length(steps)
         for tc_id, name, args in serial:
             cmd = _normalize_command(args.get("command")) if name in _HOST_EXECUTION_TOOLS else ""
             repeat_runs = (
@@ -1546,6 +1555,20 @@ class AgentEngine:
                 _latest_task_contract(messages), messages, steps, name
             ):
                 results[tc_id] = (_blocked_action_tool_message(name), True, "__builtin__")
+            elif (
+                name == "execute_terminal_command"
+                and local_terminal_run_count >= _MAX_CONSECUTIVE_TERMINAL_COMMANDS
+            ):
+                # Varied-spin guard: too many terminal commands in a row with no
+                # other tool type (evidence check, file write, etc.) in between.
+                # Unlike the identical-command cap, this triggers even when every
+                # command is different -- the problem is the *lack of inspection*,
+                # not the repetition of one specific command.
+                results[tc_id] = (
+                    _consecutive_terminal_cap_message(local_terminal_run_count),
+                    True,
+                    "__builtin__",
+                )
             elif cmd and repeat_runs >= _MAX_IDENTICAL_COMMAND_RUNS:
                 # Identical command re-run too many times with no state change in
                 # between -- a spin. Hard-block it (is_error=True) so the loop also
@@ -1568,6 +1591,10 @@ class AgentEngine:
                 if cmd:
                     last_host_cmd = cmd
                     local_repeat_counts[cmd] = local_repeat_counts.get(cmd, 0) + 1
+                # A successful execute_terminal_command extends the run; reset only
+                # when a non-terminal tool runs (handled by _consecutive_terminal_run_length).
+                if name == "execute_terminal_command":
+                    local_terminal_run_count += 1
 
         # Record steps and tool messages in the original call order.
         iter_error_count = 0
@@ -1773,6 +1800,9 @@ class AgentEngine:
         call get_system_environment -- stops it from guessing the platform wrong
         (e.g. running apt-get on a Windows host) and from spinning on
         trial-and-error which/where probes.
+
+        Also flags sandbox startup failures so the agent knows it is on the
+        host even when AGENT_SANDBOX=docker was requested.
         """
         raw = ""
         getter = getattr(self._tools, "get_system_environment", None)
@@ -1781,7 +1811,8 @@ class AgentEngine:
                 raw = getter()
             except Exception:  # never let env probing break session seeding
                 raw = ""
-        return {"role": "system", "content": _summarize_host_environment(raw)}
+        sandbox_failed = getattr(self._tools, "sandbox_startup_failed", False)
+        return {"role": "system", "content": _summarize_host_environment(raw, sandbox_failed=sandbox_failed)}
 
     def _compact_context_window(
         self, messages: list[dict[str, Any]]
@@ -2112,8 +2143,13 @@ _OS_PACKAGE_MANAGERS: tuple[str, ...] = (
 )
 
 
-def _summarize_host_environment(raw: str) -> str:
-    """Render the get_system_environment JSON into a concise, directive summary."""
+def _summarize_host_environment(raw: str, *, sandbox_failed: bool = False) -> str:
+    """Render the get_system_environment JSON into a concise, directive summary.
+
+    ``sandbox_failed=True`` adds a prominent warning when AGENT_SANDBOX=docker
+    was configured but Docker could not be reached; the agent (and the operator)
+    can see that commands are running on the bare host, not a container.
+    """
     try:
         data = json.loads(raw) if raw else {}
     except (TypeError, json.JSONDecodeError):
@@ -2149,6 +2185,12 @@ def _summarize_host_environment(raw: str) -> str:
         sandbox_line = (
             f"Sandbox: {mode} (image={image}; workdir={workdir}) — "
             f"commands run inside an isolated Linux container; apt-get IS available.\n"
+        )
+    elif sandbox_failed:
+        sandbox_line = (
+            "SANDBOX: FAILED TO START (Docker Desktop is not running or unreachable). "
+            "All commands execute DIRECTLY on the host OS below — treat it as a plain "
+            "host session; do NOT assume a Linux container environment.\n"
         )
 
     return (
