@@ -217,6 +217,11 @@ class TestTelegramAdapterHandling:
     @pytest.mark.asyncio
     async def test_shutdown_cancels_task_and_closes_client(self, echo_send_fn) -> None:
         http_mock = AsyncMock()
+        http_mock.get = AsyncMock(
+            return_value=MagicMock(
+                json=MagicMock(return_value={"ok": True, "result": {"username": "bot"}})
+            )
+        )
         http_mock.post = AsyncMock(
             return_value=MagicMock(json=MagicMock(return_value={"ok": True, "result": []}))
         )
@@ -230,3 +235,45 @@ class TestTelegramAdapterHandling:
 
         assert not a._running
         http_mock.aclose.assert_called_once()
+
+
+class TestTelegramWebhookHandling:
+    @pytest.mark.asyncio
+    async def test_prepare_deletes_webhook(self, adapter, mock_http) -> None:
+        """start()/_prepare must clear any webhook so long-polling works."""
+        mock_http.get = AsyncMock(
+            return_value=MagicMock(
+                json=MagicMock(return_value={"ok": True, "result": {"username": "bot"}})
+            )
+        )
+        await adapter._prepare()
+        delete_calls = [
+            c for c in mock_http.post.call_args_list if "deleteWebhook" in c.args[0]
+        ]
+        assert len(delete_calls) == 1
+        assert delete_calls[0].kwargs["json"]["drop_pending_updates"] is False
+
+    @pytest.mark.asyncio
+    async def test_get_updates_409_triggers_webhook_deletion(self, adapter, mock_http) -> None:
+        """A 409 conflict during polling must auto-delete the conflicting webhook."""
+        mock_http.post = AsyncMock(
+            return_value=MagicMock(
+                json=MagicMock(
+                    return_value={"ok": False, "error_code": 409, "description": "Conflict"}
+                )
+            )
+        )
+        result = await adapter._get_updates()
+        assert result == []
+        # One call to getUpdates + one recovery call to deleteWebhook
+        assert any("deleteWebhook" in c.args[0] for c in mock_http.post.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_get_updates_parses_ok_result(self, adapter, mock_http) -> None:
+        mock_http.post = AsyncMock(
+            return_value=MagicMock(
+                json=MagicMock(return_value={"ok": True, "result": [{"update_id": 5}]})
+            )
+        )
+        result = await adapter._get_updates()
+        assert result == [{"update_id": 5}]

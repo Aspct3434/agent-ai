@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -544,6 +545,12 @@ except urllib.error.HTTPError as exc:
         )
 
 
+def _is_missing_container_error(stderr: str) -> bool:
+    """True if *stderr* indicates the target container is gone or stopped."""
+    text = (stderr or "").lower()
+    return "no such container" in text or "is not running" in text
+
+
 class _DockerSandbox(_ScriptSandbox):
     """A long-lived Docker container used as an isolated command execution sandbox.
 
@@ -559,6 +566,8 @@ class _DockerSandbox(_ScriptSandbox):
         self._host_workdir = host_workdir
         self._container_id: str | None = None
         self._name = f"agent-sandbox-{os.getpid()}"
+        # Guards container (re)creation so concurrent commands rebuild it once.
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -566,10 +575,11 @@ class _DockerSandbox(_ScriptSandbox):
 
     def start(self) -> None:
         """Pull image (if needed) and start the sandbox container."""
-        # Stop any leftover container from a previous run with the same name.
+        # Force-remove any leftover container with the same name (running or
+        # stopped) so `docker run --name` cannot fail with a name collision.
         subprocess.run(
-            ["docker", "stop", "-t", "2", self._name],
-            capture_output=True, timeout=10,
+            ["docker", "rm", "-f", self._name],
+            capture_output=True, timeout=15,
         )
 
         result = subprocess.run(
@@ -655,6 +665,47 @@ class _DockerSandbox(_ScriptSandbox):
             self._container_id = None
             logger.info("Docker sandbox stopped.")
 
+    # ------------------------------------------------------------------
+    # Self-healing
+    # ------------------------------------------------------------------
+
+    def _is_running(self) -> bool:
+        """Return True only if the cached container exists and is running."""
+        if not self._container_id:
+            return False
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", self._container_id],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def _ensure_running(self) -> None:
+        """Recreate the container if it has died, been removed, or never started.
+
+        Containers run with ``--rm``, so a Docker daemon restart, host sleep, or
+        manual ``docker stop`` removes the container entirely; the cached id then
+        points at nothing and every ``docker exec`` fails with "No such
+        container". This makes the sandbox self-healing — it transparently
+        rebuilds on the next command instead of staying broken until the whole
+        process restarts.
+        """
+        if self._is_running():
+            return
+        with self._lock:
+            # Re-check inside the lock: another thread may have just rebuilt it.
+            if self._is_running():
+                return
+            if self._container_id:
+                logger.warning(
+                    "Docker sandbox container %s is gone; recreating it.",
+                    self._container_id[:12],
+                )
+                self._container_id = None
+            self.start()
+
     @property
     def container_id(self) -> str:
         if not self._container_id:
@@ -669,7 +720,7 @@ class _DockerSandbox(_ScriptSandbox):
         self, command: str, cwd: str, timeout: float
     ) -> tuple[int, str, str]:
         """Run *command* inside the container at *cwd* and await its output."""
-        def _run() -> subprocess.CompletedProcess[str]:
+        def _docker_exec() -> subprocess.CompletedProcess[str]:
             return subprocess.run(
                 [
                     "docker",
@@ -686,6 +737,17 @@ class _DockerSandbox(_ScriptSandbox):
                 timeout=timeout,
             )
 
+        def _run() -> subprocess.CompletedProcess[str]:
+            self._ensure_running()
+            result = _docker_exec()
+            # Reactive self-heal: the container can die in the narrow window
+            # between the liveness check and the exec. Rebuild once and retry.
+            if result.returncode != 0 and _is_missing_container_error(result.stderr):
+                self._container_id = None
+                self._ensure_running()
+                result = _docker_exec()
+            return result
+
         try:
             result = await asyncio.to_thread(_run)
         except subprocess.TimeoutExpired as exc:
@@ -694,6 +756,7 @@ class _DockerSandbox(_ScriptSandbox):
 
     def exec_background(self, command: str, cwd: str, log_path: str) -> int | None:
         """Launch *command* detached inside the container; output appends to *log_path*."""
+        self._ensure_running()
         wrapped = (
             f"cd {shlex.quote(cwd)} && "
             f"nohup bash -lc {shlex.quote(command)} "
@@ -720,6 +783,7 @@ class _DockerSandbox(_ScriptSandbox):
         self, script: str, payload: dict[str, Any], timeout: float
     ) -> dict[str, Any]:
         """Run *script* inside the container with *payload* JSON on stdin."""
+        self._ensure_running()
         result = subprocess.run(
             ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
             input=json.dumps(payload),
@@ -737,6 +801,7 @@ class _DockerSandbox(_ScriptSandbox):
 
     def collect_environment_json(self) -> str:
         """Return a JSON snapshot of the *container's* environment."""
+        self._ensure_running()
         probe_script = (
             "python3 -c \""
             "import json, shutil, subprocess, os, platform; "

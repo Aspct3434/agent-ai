@@ -114,11 +114,51 @@ class TelegramAdapter:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Open the HTTP client and begin long-polling in a background task."""
+        """Open the HTTP client, validate the bot, and begin long-polling."""
         self._http = httpx.AsyncClient(timeout=_HTTP_TIMEOUT_S)
         self._running = True
+        await self._prepare()
         self._task = asyncio.create_task(self._poll_loop(), name="telegram:poll")
         logger.info("Telegram adapter started")
+
+    async def _prepare(self) -> None:
+        """Validate the token and clear any webhook that would block polling.
+
+        Two silent-failure modes are surfaced/fixed here:
+        - A bad or empty token makes every call fail; ``getMe`` turns that into
+          one clear startup error instead of an endless warning loop.
+        - A previously registered webhook makes ``getUpdates`` fail with HTTP
+          409, so the bot would receive nothing; ``deleteWebhook`` restores
+          long-polling. Pending updates are kept (``drop_pending_updates`` off).
+
+        Failures here are non-fatal: the poll loop still starts and retries.
+        """
+        assert self._http is not None
+        try:
+            resp = await self._http.get(f"{self._base}/getMe", timeout=15.0)
+            data = resp.json()
+            if data.get("ok"):
+                logger.info(
+                    "Telegram bot authenticated as @%s",
+                    data.get("result", {}).get("username", "?"),
+                )
+            else:
+                logger.error("Telegram getMe failed — check TELEGRAM_BOT_TOKEN: %s", data)
+        except Exception as exc:
+            logger.warning("Telegram getMe check failed: %s", exc)
+        await self._delete_webhook()
+
+    async def _delete_webhook(self) -> None:
+        """Remove any registered webhook so long-polling can receive updates."""
+        assert self._http is not None
+        try:
+            await self._http.post(
+                f"{self._base}/deleteWebhook",
+                json={"drop_pending_updates": False},
+                timeout=15.0,
+            )
+        except Exception as exc:
+            logger.warning("Telegram deleteWebhook failed: %s", exc)
 
     async def shutdown(self) -> None:
         """Stop the polling loop and close the HTTP client gracefully."""
@@ -169,7 +209,13 @@ class TelegramAdapter:
         )
         data: dict[str, Any] = resp.json()
         if not data.get("ok"):
-            logger.warning("Telegram getUpdates error: %s", data)
+            # HTTP 409: a webhook was registered after startup — clear it so
+            # polling resumes on the next iteration.
+            if data.get("error_code") == 409:
+                logger.warning("Telegram getUpdates conflict (webhook active); deleting it")
+                await self._delete_webhook()
+            else:
+                logger.warning("Telegram getUpdates error: %s", data)
             return []
         return list(data.get("result") or [])
 
