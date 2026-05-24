@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { MessageSquare, Plus, Send, Trash2 } from "lucide-react";
+import { MessageSquare, Plus, Send, Square, Trash2 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAgentStream, type AgentEvent } from "./useAgentStream";
@@ -174,7 +174,8 @@ function TurnBlock({ turn }: { turn: Turn }) {
 }
 
 export function ChatInterface() {
-  const { events, streamingText, status, sendMessage, clearEvents } = useAgentStream(WS_URL);
+  const { events, streamingText, status, sendMessage, stopMessage, clearEvents } =
+    useAgentStream(WS_URL);
   const [initialState] = useState(loadHistoryState);
   const [conversations, setConversations] = useState<Conversation[]>(
     initialState.conversations,
@@ -334,6 +335,11 @@ export function ChatInterface() {
     setInput("");
   }
 
+  function handleStop() {
+    if (!activeConversation || !isAgentBusy) return;
+    stopMessage(activeConversation.sessionId);
+  }
+
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -491,6 +497,16 @@ export function ChatInterface() {
               disabled={status !== "connected" || isAgentBusy}
               className="min-h-11 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
             />
+            <button
+              type="button"
+              onClick={handleStop}
+              disabled={!isAgentBusy}
+              aria-label="Stop agent task"
+              title="Stop agent task"
+              className="flex size-11 shrink-0 items-center justify-center rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 transition-colors hover:border-red-400 hover:bg-red-500/20 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-30"
+            >
+              <Square size={15} fill="currentColor" />
+            </button>
             <button
               type="submit"
               disabled={!canSend}

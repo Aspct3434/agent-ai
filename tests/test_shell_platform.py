@@ -9,7 +9,12 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import tools as tools_module
-from tools import _detect_posix_shell, _is_dangerous_command
+from tools import (
+    _SANDBOX_PACKAGE_CAPS,
+    _detect_posix_shell,
+    _DockerSandbox,
+    _is_dangerous_command,
+)
 
 # ---------------------------------------------------------------------------
 # Shell detection
@@ -114,3 +119,16 @@ def test_background_log_path_is_portable():
     assert tempfile.gettempdir().lower() in log.lower() or Path(log).parent.exists(), (
         f"Expected log inside tempdir, got {log!r}"
     )
+
+
+def test_docker_sandbox_keeps_package_install_capabilities():
+    """apt/dpkg need these root capabilities inside the constrained sandbox."""
+    sandbox = _DockerSandbox(image="python:3.12-slim", host_workdir="C:/workspace")
+    command = sandbox._docker_run_command()
+    cap_pairs = [command[i : i + 2] for i in range(len(command) - 1)]
+
+    assert "--cap-drop" in command
+    assert ["--cap-drop", "ALL"] in cap_pairs
+    for cap in _SANDBOX_PACKAGE_CAPS:
+        assert ["--cap-add", cap] in cap_pairs
+    assert ["--cap-add", "NET_BIND_SERVICE"] in cap_pairs

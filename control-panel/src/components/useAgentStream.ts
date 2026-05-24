@@ -14,7 +14,12 @@ export type TextEvent = {
 export type FinalAnswerEvent = {
   type: "final_answer";
   /** "iteration_limit" - hit MAX_REACT_ITERATIONS; "exception" - unhandled Python error */
-  reason: "iteration_limit" | "exception" | "rate_limited" | "critical_failure";
+  reason:
+    | "iteration_limit"
+    | "exception"
+    | "rate_limited"
+    | "critical_failure"
+    | "cancelled";
   content: string;
 };
 
@@ -32,6 +37,7 @@ export interface UseAgentStreamReturn {
   streamingText: string;
   status: ConnectionStatus;
   sendMessage: (text: string, sessionId?: string) => void;
+  stopMessage: (sessionId?: string) => void;
   clearEvents: () => void;
 }
 
@@ -135,10 +141,18 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
     ws.send(JSON.stringify({ session_id: sessionId ?? sessionIdRef.current, text }));
   }, []);
 
+  const stopMessage = useCallback((sessionId?: string) => {
+    const targetSessionId = sessionId ?? sessionIdRef.current;
+    const ws = socketRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "cancel", session_id: targetSessionId }));
+    }
+  }, []);
+
   const clearEvents = useCallback(() => {
     setEvents([]);
     setStreamingText("");
   }, []);
 
-  return { events, streamingText, status, sendMessage, clearEvents };
+  return { events, streamingText, status, sendMessage, stopMessage, clearEvents };
 }
