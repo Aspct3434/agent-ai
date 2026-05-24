@@ -123,7 +123,7 @@ def test_powershell_bootstrap_dry_run_forwards_options(tmp_path: Path) -> None:
         ]
     )
 
-    assert "git clone --branch main https://github.com/example/agent-ai.git" in result.stdout
+    assert "git clone --branch master https://github.com/example/agent-ai.git" in result.stdout
     assert "scripts\\install.ps1" in result.stdout
     assert "-Provider openrouter" in result.stdout
     assert "-Sandbox off" in result.stdout
@@ -155,7 +155,7 @@ def test_readme_empty_pc_commands_use_bootstrap() -> None:
 
     assert "scripts/bootstrap.ps1" in text
     assert "scripts/bootstrap.sh" in text
-    assert "https://raw.githubusercontent.com/Aspct3434/agent-ai/main/scripts/bootstrap.ps1" in text
-    assert "https://raw.githubusercontent.com/Aspct3434/agent-ai/main/scripts/bootstrap.sh" in text
+    assert "https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.ps1" in text
+    assert "https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.sh" in text
     assert "scripts/install.ps1 | iex" not in text
     assert "scripts/install.sh | bash" not in text

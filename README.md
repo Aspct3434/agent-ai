@@ -36,17 +36,17 @@ tests/              -- Pytest suite (scripted streaming model, contract tests)
 For a fresh machine with no project files yet, use the bootstrap installer:
 
 ```powershell
-iwr -useb https://raw.githubusercontent.com/Aspct3434/agent-ai/main/scripts/bootstrap.ps1 | iex
+iwr -useb https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.ps1 | iex
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Aspct3434/agent-ai/main/scripts/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.sh | bash
 ```
 
 To install from a fork or branch, pass the repo URL explicitly:
 
 ```powershell
-& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/Aspct3434/agent-ai/main/scripts/bootstrap.ps1))) -RepoUrl "https://github.com/Aspct3434/agent-ai.git"
+& ([scriptblock]::Create((iwr -useb https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.ps1))) -RepoUrl "https://github.com/Aspct3434/agent-ai.git"
 ```
 
 The bootstrap checks prerequisites, clones the repo to `%USERPROFILE%\agent-ai` on Windows or `~/agent-ai` on Bash, then runs the interactive installer.

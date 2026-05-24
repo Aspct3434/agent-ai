@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 
 $DefaultRepoUrl = "https://github.com/Aspct3434/agent-ai.git"
 if ([string]::IsNullOrWhiteSpace($RepoUrl)) { $RepoUrl = $DefaultRepoUrl }
-if ([string]::IsNullOrWhiteSpace($Branch)) { $Branch = "main" }
+if ([string]::IsNullOrWhiteSpace($Branch)) { $Branch = "master" }
 if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = Join-Path $HOME "agent-ai" }
 
 function Step([string]$Message) { Write-Host "==> $Message" }
