@@ -153,6 +153,10 @@ def test_docker_compose_config_accepts_temp_env_file(tmp_path: Path) -> None:
 def test_readme_empty_pc_commands_use_bootstrap() -> None:
     text = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
+    assert "npx @aspct3434/agent-ai install" in text
+    assert "npx --yes github:Aspct3434/agent-ai install" in text
+    assert "npx @aspct3434/agent-ai doctor" in text
+    assert "npm i -g @aspct3434/agent-ai" in text
     assert "scripts/bootstrap.ps1" in text
     assert "scripts/bootstrap.sh" in text
     assert "https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.ps1" in text

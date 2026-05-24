@@ -33,7 +33,41 @@ tests/              -- Pytest suite (scripted streaming model, contract tests)
 
 ## One-click install
 
-For a fresh machine with no project files yet, use the bootstrap installer:
+The premium installer is the npm onboarding CLI:
+
+```powershell
+npx @aspct3434/agent-ai install
+```
+
+It opens an OpenClaw-style terminal onboarding flow with an Agent AI banner, a security warning, QuickStart/manual setup modes, model-provider setup, sandbox choice, messaging-app setup, startup, and health-check guidance.
+
+After install, manage the app with `npx`:
+
+```powershell
+npx @aspct3434/agent-ai doctor
+npx @aspct3434/agent-ai start
+npx @aspct3434/agent-ai stop
+npx @aspct3434/agent-ai restart
+npx @aspct3434/agent-ai update
+npx @aspct3434/agent-ai logs
+```
+
+For shorter repeat commands, install the CLI globally:
+
+```powershell
+npm i -g @aspct3434/agent-ai
+agent-ai doctor
+```
+
+The npm package is a thin installer. It clones or updates `https://github.com/Aspct3434/agent-ai.git`, writes `an-api.env`, and starts the selected runtime mode.
+
+Before the npm package is published, you can test the same CLI from GitHub after pushing this repo:
+
+```powershell
+npx --yes github:Aspct3434/agent-ai install
+```
+
+If Node/npm is not available yet, use the raw bootstrap installer instead:
 
 ```powershell
 iwr -useb https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.ps1 | iex
