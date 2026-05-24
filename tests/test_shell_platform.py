@@ -13,11 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import tools as tools_module
 from tools import (
     _SANDBOX_PACKAGE_CAPS,
+    ToolManager,
     _detect_posix_shell,
     _DockerSandbox,
     _is_dangerous_command,
     _wrong_environment_command_reason,
-    ToolManager,
 )
 
 # ---------------------------------------------------------------------------

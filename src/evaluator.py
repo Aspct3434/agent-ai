@@ -14,7 +14,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -413,7 +413,7 @@ class SkillRegistry:
         s["use_count"] += 1
         if success:
             s["success_count"] += 1
-        s["last_used"] = datetime.now(timezone.utc).isoformat()
+        s["last_used"] = datetime.now(UTC).isoformat()
         total = s["use_count"]
         s["success_rate"] = s["success_count"] / total if total else 1.0
         self._save_stats()
@@ -435,7 +435,6 @@ class SkillRegistry:
             return False
         s = self._stats.get(skill_name, {})
         use_count = s.get("use_count", 0)
-        last_improved_at = s.get("improved_at")
         last_improved_count = s.get("improved_at_count", 0)
 
         if use_count < self._improve_after_uses:
@@ -470,7 +469,7 @@ class SkillRegistry:
             return False
 
         s["version"] = version + 1
-        s["improved_at"] = datetime.now(timezone.utc).isoformat()
+        s["improved_at"] = datetime.now(UTC).isoformat()
         s["improved_at_count"] = use_count
         self._save_stats()
         logger.info("Skill %s improved to version %d", skill_name, version + 1)
@@ -491,7 +490,7 @@ class SkillRegistry:
             "version": stats.get("version", 1),
             "use_count": stats.get("use_count", 0),
             "success_rate": stats.get("success_rate", 1.0),
-            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "exported_at": datetime.now(UTC).isoformat(),
         }
 
     def import_skill(self, payload: dict[str, Any]) -> str:

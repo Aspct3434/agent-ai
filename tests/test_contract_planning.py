@@ -17,13 +17,13 @@ from contract import (
     _plan_has_open_steps,
     _run_set_task_contract,
 )
+from evaluator import ExecutionStep
 from llm_utils import (
     _is_async_iterable,
     _is_rate_limit_error,
     _make_final_answer,
     _sanitize_messages_for_llm,
 )
-from evaluator import ExecutionStep
 from planning import (
     _build_contract_execution_instruction,
     _build_executive_summary,

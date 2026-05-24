@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from agent import _filesystem_process_evidence_has_negative_findings
 from contract import (
     _blocked_action_tool_message,
     _build_incomplete_contract_cap_message,
@@ -49,7 +50,6 @@ from planning import (
     _prune_message_window,
     _store_iteration_cap_memory,
 )
-from agent import _filesystem_process_evidence_has_negative_findings
 
 # ===========================================================================
 # contract.py — evidence parsers

@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
@@ -62,7 +64,7 @@ def _find_sqlite_server() -> str:
     if scripts_dirs:
         return str(scripts_dirs[0])
 
-    raise RuntimeError(
+    pytest.skip(
         "mcp-server-sqlite not found. Install it with: python -m pip install mcp-server-sqlite"
     )
 

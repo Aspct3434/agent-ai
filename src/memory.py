@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -281,7 +281,7 @@ class UserProfileStore:
                 self._profile[key] = current[-20:]
             elif value:
                 self._profile[key] = value
-        self._profile["last_updated"] = datetime.now(timezone.utc).isoformat()
+        self._profile["last_updated"] = datetime.now(UTC).isoformat()
         self._profile["interaction_count"] = self._profile.get("interaction_count", 0) + 1
         self._save()
 

@@ -600,12 +600,12 @@ def test_parallel_tool_calls_disabled_during_contract_execution() -> None:
     events, tools, model = asyncio.run(_run_engine_with_model(script))
 
     # Every contract-enforced turn must have parallel_tool_calls=False.
-    # Turn 0: must_set_contract â†’ False
-    # Turn 1: needs_execution (plan missing) â†’ False
-    # Turn 2: needs_execution (evidence missing) â†’ False
-    # Turn 3: needs_execution (evidence missing) â†’ False
-    # Turn 4: needs_execution (plan still open) â†’ False
-    # Turn 5: final answer, not enforced â†’ None (absent)
+    # Turn 0: must_set_contract -> False
+    # Turn 1: needs_execution (plan missing) -> False
+    # Turn 2: needs_execution (evidence missing) -> False
+    # Turn 3: needs_execution (evidence missing) -> False
+    # Turn 4: needs_execution (plan still open) -> False
+    # Turn 5: final answer, not enforced -> None (absent)
     for i, ptc in enumerate(model.request_parallel_tool_calls[:-1]):
         assert ptc is False, (
             f"Turn {i}: expected parallel_tool_calls=False during contract enforcement, "

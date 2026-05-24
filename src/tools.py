@@ -794,12 +794,12 @@ class _SSHSandbox:
         argv = ["ssh", "-o", "StrictHostKeyChecking=no", "-p", str(self._port)]
         if self._key_path:
             argv += ["-i", self._key_path]
-        return argv + [f"{self._user}@{self._host}"]
+        return [*argv, f"{self._user}@{self._host}"]
 
     def start(self) -> None:
         """Verify connectivity and create the remote workspace directory."""
         result = subprocess.run(
-            self._ssh_argv() + [f"mkdir -p {shlex.quote(self._workdir)}"],
+            [*self._ssh_argv(), f"mkdir -p {shlex.quote(self._workdir)}"],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
@@ -815,7 +815,7 @@ class _SSHSandbox:
         self, command: str, cwd: str, timeout: float
     ) -> tuple[int, str, str]:
         full_cmd = f"cd {shlex.quote(cwd)} && {command}"
-        argv = self._ssh_argv() + [full_cmd]
+        argv = [*self._ssh_argv(), full_cmd]
 
         def _run() -> subprocess.CompletedProcess[str]:
             return subprocess.run(
@@ -836,7 +836,7 @@ class _SSHSandbox:
         )
         try:
             result = subprocess.run(
-                self._ssh_argv() + [wrapped],
+                [*self._ssh_argv(), wrapped],
                 capture_output=True, text=True, timeout=15,
             )
             if result.returncode != 0:
@@ -858,7 +858,7 @@ class _SSHSandbox:
         )
         try:
             result = subprocess.run(
-                self._ssh_argv() + [script],
+                [*self._ssh_argv(), script],
                 capture_output=True, text=True, timeout=15,
             )
             if result.returncode == 0 and result.stdout.strip():
@@ -2464,8 +2464,8 @@ class ToolManager:
     ) -> str:
         """Generate an image from *prompt* using DALL-E or a compatible API."""
         try:
-            import litellm as _litellm
             import httpx as _httpx
+            import litellm as _litellm
             response = await _litellm.aimage_generation(
                 model=_IMAGE_GEN_MODEL,
                 prompt=prompt,

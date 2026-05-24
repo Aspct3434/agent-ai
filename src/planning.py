@@ -162,7 +162,6 @@ def _build_contract_execution_instruction(
 ) -> str:
     _steps = steps or []
     attempted = set(_attempted_tool_names(_steps))     # all attempts (inc. errors)
-    succeeded = _successful_tool_names(_steps)          # only successful results
     plan = _latest_plan(messages)
     plan_guidance = (
         "No update_plan checklist exists yet; call update_plan before continuing."

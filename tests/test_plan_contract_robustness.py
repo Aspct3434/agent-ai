@@ -208,7 +208,7 @@ class TestLatestPlanWithAlias:
                 }
             ),
         ]
-        # "waiting" â†’ pending, which is an open status
+        # "waiting" -> pending, which is an open status
         assert _plan_has_open_steps(messages)
 
     def test_all_done_closes_plan(self):

@@ -15,9 +15,10 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Coroutine
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import aiosqlite
 
@@ -79,7 +80,7 @@ class ScheduledJob:
     prompt: str
     session_id: str
     label: str = ""
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     next_run: datetime | None = None
     last_run: datetime | None = None
     run_count: int = 0
@@ -103,16 +104,16 @@ class ScheduledJob:
         }
 
     def compute_next_run(self, after: datetime | None = None) -> datetime | None:
-        now = after or datetime.now(timezone.utc)
+        now = after or datetime.now(UTC)
         if self.schedule_type == "interval":
             return now + timedelta(seconds=float(self.schedule_spec))
         if self.schedule_type == "cron":
             raw = _cron_next_run(self.schedule_spec, now)
-            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+            return raw if raw.tzinfo else raw.replace(tzinfo=UTC)
         if self.schedule_type == "once":
             dt = datetime.fromisoformat(self.schedule_spec)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=UTC)
             return dt if dt > now else None
         return None
 
@@ -136,6 +137,7 @@ class CronScheduler:
         self._runner = runner
         self._jobs: dict[str, ScheduledJob] = {}
         self._task: asyncio.Task[None] | None = None
+        self._running_tasks: set[asyncio.Task[None]] = set()
         self._started = False
 
     # ------------------------------------------------------------------
@@ -160,6 +162,10 @@ class CronScheduler:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        for task in list(self._running_tasks):
+            task.cancel()
+        if self._running_tasks:
+            await asyncio.gather(*self._running_tasks, return_exceptions=True)
         self._started = False
 
     # ------------------------------------------------------------------
@@ -232,16 +238,18 @@ class CronScheduler:
         while True:
             try:
                 await asyncio.sleep(10)
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 due = [
                     j for j in list(self._jobs.values())
                     if j.enabled and j.next_run and j.next_run <= now
                 ]
                 for job in due:
-                    asyncio.create_task(
+                    task = asyncio.create_task(
                         self._run_job(job),
                         name=f"cron:{job.job_id}",
                     )
+                    self._running_tasks.add(task)
+                    task.add_done_callback(self._running_tasks.discard)
             except asyncio.CancelledError:
                 return
             except Exception:
@@ -249,7 +257,7 @@ class CronScheduler:
 
     async def _run_job(self, job: ScheduledJob) -> None:
         logger.info("Running job %s: %r", job.job_id, job.prompt[:80])
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         job.last_run = now
         job.run_count += 1
         next_run = job.compute_next_run(now)
@@ -281,7 +289,7 @@ class CronScheduler:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute("SELECT data FROM scheduled_jobs")
             rows = await cur.fetchall()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for (data,) in rows:
             d = json.loads(data)
             job = ScheduledJob(
@@ -315,7 +323,7 @@ def _validate_schedule(schedule_type: str, spec: str) -> None:
         if secs < 10:
             raise ValueError("Interval must be at least 10 seconds")
     elif schedule_type == "cron":
-        _cron_next_run(spec, datetime.now(timezone.utc))  # dry-run parse
+        _cron_next_run(spec, datetime.now(UTC))  # dry-run parse
     elif schedule_type == "once":
         datetime.fromisoformat(spec)
     else:

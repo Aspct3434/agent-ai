@@ -23,8 +23,7 @@ def _run(command: list[str], *, env: dict[str, str] | None = None) -> subprocess
         cwd=PROJECT_ROOT,
         env=merged,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=True,
     )
 
@@ -33,7 +32,7 @@ def _bash() -> str:
     bash = shutil.which("bash")
     if not bash:
         pytest.skip("bash is not available")
-    probe = subprocess.run([bash, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    probe = subprocess.run([bash, "--version"], capture_output=True)
     if probe.returncode != 0:
         pytest.skip("bash is present but not usable")
     return bash
@@ -135,7 +134,7 @@ def test_docker_compose_config_accepts_temp_env_file(tmp_path: Path) -> None:
     docker = shutil.which("docker")
     if not docker:
         pytest.skip("docker is not available")
-    probe = subprocess.run([docker, "compose", "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    probe = subprocess.run([docker, "compose", "version"], capture_output=True)
     if probe.returncode != 0:
         pytest.skip("docker compose is not available")
 

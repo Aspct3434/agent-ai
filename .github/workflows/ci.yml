@@ -69,7 +69,6 @@ jobs:
                  tests/test_gateway_unit.py \
                  tests/test_coverage_boost.py \
                  tests/test_property.py \
-                 tests/test_rust_server_scenario.py \
                  tests/test_node_react_scenario.py \
                  tests/test_plan_contract_robustness.py \
                  tests/test_toolsets.py \

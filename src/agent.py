@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -43,7 +43,12 @@ from contract import (
     _terminal_failure_since_diagnostic,
     _tool_names_for_contract_status,
 )
-from evaluator import ExecutionStep, ExecutionTrajectory, SkillDistiller, extract_and_update_user_profile
+from evaluator import (
+    ExecutionStep,
+    ExecutionTrajectory,
+    SkillDistiller,
+    extract_and_update_user_profile,
+)
 from llm_utils import (
     _acompletion_stream_with_retry,
     _is_async_iterable,
@@ -1060,7 +1065,7 @@ class AgentEngine:
                         ),
                     }
                 )
-                yield {"type": "status", "message": "Still working autonomouslyÃ¢â‚¬Â¦"}
+                yield {"type": "status", "message": "Still working autonomously..."}
                 continue
 
             # Auto-continue exhausted or no progress: surface the paused message.
