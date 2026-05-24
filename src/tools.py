@@ -293,7 +293,258 @@ _AGENT_BACKGROUND_LOG_PATH = (
 )
 
 
-class _DockerSandbox:
+class _ScriptSandbox:
+    """Shared behaviour for sandboxes that run Linux Python helpers.
+
+    Both the Docker and SSH backends execute the agent's commands on a Linux
+    host, so the file-write, evidence-collection, and HTTP-proxy helpers are
+    identical Python scripts fed a JSON payload on stdin. Only the *transport*
+    differs (``docker exec`` vs ``ssh``), so subclasses implement just
+    :meth:`_run_python`. Keeping the scripts here prevents the two backends
+    from drifting apart and guarantees every backend supports the full tool
+    surface (writing files, collecting evidence, proxying HTTP).
+    """
+
+    _WRITE_SCRIPT = r"""
+import json, os, sys
+
+req = json.load(sys.stdin)
+path = req["path"]
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(req.get("content", ""))
+st = os.stat(path)
+print(json.dumps({
+    "path": path,
+    "exists": os.path.isfile(path),
+    "size_bytes": st.st_size,
+}))
+"""
+
+    _EVIDENCE_SCRIPT = r"""
+import json, os, socket, sys, time
+
+req = json.load(sys.stdin)
+
+def preview(path, max_bytes=1200):
+    try:
+        with open(path, "rb") as f:
+            data = f.read(max_bytes)
+    except OSError as exc:
+        return "[preview error] " + str(exc)
+    if b"\0" in data:
+        return f"[binary file preview omitted; sampled {len(data)} bytes]"
+    printable = sum(1 for b in data if b in b"\n\r\t" or 32 <= b <= 126)
+    if data and printable / len(data) < 0.75:
+        return f"[binary file preview omitted; sampled {len(data)} bytes]"
+    return data.decode("utf-8", "replace")
+
+def inspect_path(raw, cwd):
+    path = raw if os.path.isabs(raw) else os.path.join(cwd, raw)
+    path = os.path.normpath(path)
+    info = {"input": raw, "path": path, "exists": os.path.exists(path)}
+    if not info["exists"]:
+        return info
+    try:
+        st = os.stat(path)
+        info.update({
+            "is_file": os.path.isfile(path),
+            "is_dir": os.path.isdir(path),
+            "size_bytes": st.st_size,
+            "modified_at_unix": st.st_mtime,
+            "modified_age_seconds": round(time.time() - st.st_mtime, 3),
+        })
+        if info["is_dir"]:
+            children = []
+            for name in sorted(os.listdir(path), key=str.lower)[:50]:
+                child = os.path.join(path, name)
+                children.append({
+                    "name": name,
+                    "is_file": os.path.isfile(child),
+                    "is_dir": os.path.isdir(child),
+                    "size_bytes": os.path.getsize(child) if os.path.exists(child) else None,
+                })
+            info["children"] = children
+        elif info["is_file"]:
+            info["preview"] = preview(path)
+    except OSError as exc:
+        info["error"] = str(exc)
+    return info
+
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+def inspect_pid(pid):
+    info = {"pid": pid, "running": os.path.exists(f"/proc/{pid}")}
+    if info["running"]:
+        line = cmdline(pid)
+        if line:
+            info["cmdline"] = line
+    return info
+
+def inspect_process_name(name):
+    needle = name.lower()
+    matches = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        line = cmdline(pid)
+        try:
+            with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip()
+        except OSError:
+            comm = ""
+        haystack = f"{comm} {line}".lower()
+        if needle in haystack:
+            matches.append({"pid": int(pid), "comm": comm, "cmdline": line})
+            if len(matches) >= 20:
+                break
+    return {"name": name, "matches": matches, "count": len(matches)}
+
+def inspect_port(port):
+    info = {"port": port, "host": "127.0.0.1", "connectable": False}
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(1.0)
+    try:
+        info["connectable"] = sock.connect_ex(("127.0.0.1", int(port))) == 0
+    except OSError as exc:
+        info["error"] = str(exc)
+    finally:
+        sock.close()
+    return info
+
+def tail_file(path, max_bytes=4000):
+    info = {"path": path, "exists": os.path.exists(path)}
+    if not info["exists"]:
+        return info
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            info["tail"] = f.read().decode("utf-8", "replace")
+            info["size_bytes"] = size
+    except OSError as exc:
+        info["error"] = str(exc)
+    return info
+
+cwd = req.get("cwd") or "/workspace"
+out = {
+    "scope": req.get("scope") or "docker_sandbox",
+    "current_working_directory": cwd,
+    "paths": [inspect_path(p, cwd) for p in req.get("paths") or []],
+    "pids": [inspect_pid(int(p)) for p in req.get("pids") or []],
+    "process_names": [inspect_process_name(p) for p in req.get("process_names") or []],
+    "ports": [inspect_port(int(p)) for p in req.get("ports") or []],
+}
+if req.get("include_background_log", True):
+    out["background_log"] = tail_file(req.get("background_log_path") or "/tmp/background_task.log")
+print(json.dumps(out))
+"""
+
+    _HTTP_SCRIPT = r"""
+import base64, json, sys, urllib.error, urllib.request
+
+req = json.load(sys.stdin)
+url = f"http://127.0.0.1:{int(req['port'])}/{req.get('path','').lstrip('/')}"
+if req.get("query"):
+    url += "?" + req["query"]
+body = base64.b64decode(req.get("body_b64") or "")
+data = body if body else None
+request = urllib.request.Request(
+    url,
+    data=data,
+    method=req.get("method") or "GET",
+    headers=req.get("headers") or {},
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = response.read()
+        print(json.dumps({
+            "status_code": response.status,
+            "headers": dict(response.headers.items()),
+            "body_b64": base64.b64encode(payload).decode("ascii"),
+        }))
+except urllib.error.HTTPError as exc:
+    payload = exc.read()
+    print(json.dumps({
+        "status_code": exc.code,
+        "headers": dict(exc.headers.items()),
+        "body_b64": base64.b64encode(payload).decode("ascii"),
+    }))
+"""
+
+    # Backend-specific transport. Runs *script* on the Linux host with *payload*
+    # serialised to JSON on stdin and returns the parsed JSON the script prints.
+    def _run_python(self, script: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        raise NotImplementedError
+
+    # Subclasses override to label evidence with their own sandbox mode.
+    _evidence_scope: str = "docker_sandbox"
+
+    def write_text_file(self, path: str, content: str) -> dict[str, Any]:
+        """Write a UTF-8 text file inside the sandbox workspace."""
+        return self._run_python(
+            self._WRITE_SCRIPT, {"path": path, "content": content}, timeout=30
+        )
+
+    def collect_evidence_json(
+        self,
+        *,
+        paths: list[str] | None = None,
+        pids: list[int] | None = None,
+        process_names: list[str] | None = None,
+        ports: list[int] | None = None,
+        include_background_log: bool = True,
+        cwd: str = _SANDBOX_WORKDIR,
+    ) -> dict[str, Any]:
+        """Inspect paths, processes, ports, and logs from inside the sandbox."""
+        return self._run_python(
+            self._EVIDENCE_SCRIPT,
+            {
+                "cwd": cwd,
+                "scope": self._evidence_scope,
+                "paths": paths or [],
+                "pids": pids or [],
+                "process_names": process_names or [],
+                "ports": ports or [],
+                "include_background_log": include_background_log,
+            },
+            timeout=10,
+        )
+
+    def fetch_http_json(
+        self,
+        *,
+        port: int,
+        path: str,
+        query: str,
+        method: str,
+        headers: dict[str, str],
+        body_b64: str,
+    ) -> dict[str, Any]:
+        """Fetch an HTTP URL from inside the sandbox for the backend proxy."""
+        return self._run_python(
+            self._HTTP_SCRIPT,
+            {
+                "port": int(port),
+                "path": path,
+                "query": query,
+                "method": method,
+                "headers": headers,
+                "body_b64": body_b64,
+            },
+            timeout=35,
+        )
+
+
+class _DockerSandbox(_ScriptSandbox):
     """A long-lived Docker container used as an isolated command execution sandbox.
 
     One instance is created per ``ToolManager`` when ``AGENT_SANDBOX=docker``.
@@ -463,253 +714,21 @@ class _DockerSandbox:
             logger.warning("sandbox exec_background failed: %s", exc)
             return None
 
-    def write_text_file(self, path: str, content: str) -> dict[str, Any]:
-        """Write a UTF-8 text file inside the container workspace."""
-        script = r"""
-import json, os, sys
+    _evidence_scope = "docker_sandbox"
 
-req = json.load(sys.stdin)
-path = req["path"]
-parent = os.path.dirname(path)
-if parent:
-    os.makedirs(parent, exist_ok=True)
-with open(path, "w", encoding="utf-8") as handle:
-    handle.write(req.get("content", ""))
-st = os.stat(path)
-print(json.dumps({
-    "path": path,
-    "exists": os.path.isfile(path),
-    "size_bytes": st.st_size,
-}))
-"""
-        result = subprocess.run(
-            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
-            input=json.dumps({"path": path, "content": content}),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "sandbox file write failed")
-        return json.loads(result.stdout)
-
-    def collect_evidence_json(
-        self,
-        *,
-        paths: list[str] | None = None,
-        pids: list[int] | None = None,
-        process_names: list[str] | None = None,
-        ports: list[int] | None = None,
-        include_background_log: bool = True,
-        cwd: str = _SANDBOX_WORKDIR,
+    def _run_python(
+        self, script: str, payload: dict[str, Any], timeout: float
     ) -> dict[str, Any]:
-        """Inspect paths, processes, ports, and logs from inside the sandbox."""
-        script = r"""
-import json, os, socket, sys, time
-
-req = json.load(sys.stdin)
-
-def preview(path, max_bytes=1200):
-    try:
-        with open(path, "rb") as f:
-            data = f.read(max_bytes)
-    except OSError as exc:
-        return "[preview error] " + str(exc)
-    if b"\0" in data:
-        return f"[binary file preview omitted; sampled {len(data)} bytes]"
-    printable = sum(1 for b in data if b in b"\n\r\t" or 32 <= b <= 126)
-    if data and printable / len(data) < 0.75:
-        return f"[binary file preview omitted; sampled {len(data)} bytes]"
-    return data.decode("utf-8", "replace")
-
-def inspect_path(raw, cwd):
-    path = raw if os.path.isabs(raw) else os.path.join(cwd, raw)
-    path = os.path.normpath(path)
-    info = {"input": raw, "path": path, "exists": os.path.exists(path)}
-    if not info["exists"]:
-        return info
-    try:
-        st = os.stat(path)
-        info.update({
-            "is_file": os.path.isfile(path),
-            "is_dir": os.path.isdir(path),
-            "size_bytes": st.st_size,
-            "modified_at_unix": st.st_mtime,
-            "modified_age_seconds": round(time.time() - st.st_mtime, 3),
-        })
-        if info["is_dir"]:
-            children = []
-            for name in sorted(os.listdir(path), key=str.lower)[:50]:
-                child = os.path.join(path, name)
-                children.append({
-                    "name": name,
-                    "is_file": os.path.isfile(child),
-                    "is_dir": os.path.isdir(child),
-                    "size_bytes": os.path.getsize(child) if os.path.exists(child) else None,
-                })
-            info["children"] = children
-        elif info["is_file"]:
-            info["preview"] = preview(path)
-    except OSError as exc:
-        info["error"] = str(exc)
-    return info
-
-def cmdline(pid):
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
-    except OSError:
-        return ""
-
-def inspect_pid(pid):
-    info = {"pid": pid, "running": os.path.exists(f"/proc/{pid}")}
-    if info["running"]:
-        line = cmdline(pid)
-        if line:
-            info["cmdline"] = line
-    return info
-
-def inspect_process_name(name):
-    needle = name.lower()
-    matches = []
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        line = cmdline(pid)
-        try:
-            with open(f"/proc/{pid}/comm", "r", encoding="utf-8", errors="replace") as f:
-                comm = f.read().strip()
-        except OSError:
-            comm = ""
-        haystack = f"{comm} {line}".lower()
-        if needle in haystack:
-            matches.append({"pid": int(pid), "comm": comm, "cmdline": line})
-            if len(matches) >= 20:
-                break
-    return {"name": name, "matches": matches, "count": len(matches)}
-
-def inspect_port(port):
-    info = {"port": port, "host": "127.0.0.1", "connectable": False}
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(1.0)
-    try:
-        info["connectable"] = sock.connect_ex(("127.0.0.1", int(port))) == 0
-    except OSError as exc:
-        info["error"] = str(exc)
-    finally:
-        sock.close()
-    return info
-
-def tail_file(path, max_bytes=4000):
-    info = {"path": path, "exists": os.path.exists(path)}
-    if not info["exists"]:
-        return info
-    try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - max_bytes))
-            info["tail"] = f.read().decode("utf-8", "replace")
-            info["size_bytes"] = size
-    except OSError as exc:
-        info["error"] = str(exc)
-    return info
-
-cwd = req.get("cwd") or "/workspace"
-out = {
-    "scope": "docker_sandbox",
-    "current_working_directory": cwd,
-    "paths": [inspect_path(p, cwd) for p in req.get("paths") or []],
-    "pids": [inspect_pid(int(p)) for p in req.get("pids") or []],
-    "process_names": [inspect_process_name(p) for p in req.get("process_names") or []],
-    "ports": [inspect_port(int(p)) for p in req.get("ports") or []],
-}
-if req.get("include_background_log", True):
-    out["background_log"] = tail_file("/tmp/background_task.log")
-print(json.dumps(out))
-"""
-        payload = json.dumps(
-            {
-                "cwd": cwd,
-                "paths": paths or [],
-                "pids": pids or [],
-                "process_names": process_names or [],
-                "ports": ports or [],
-                "include_background_log": include_background_log,
-            }
-        )
+        """Run *script* inside the container with *payload* JSON on stdin."""
         result = subprocess.run(
             ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
-            input=payload,
+            input=json.dumps(payload),
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=timeout,
         )
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "sandbox evidence failed")
-        return json.loads(result.stdout)
-
-    def fetch_http_json(
-        self,
-        *,
-        port: int,
-        path: str,
-        query: str,
-        method: str,
-        headers: dict[str, str],
-        body_b64: str,
-    ) -> dict[str, Any]:
-        """Fetch an HTTP URL from inside the sandbox for the backend proxy."""
-        script = r"""
-import base64, json, sys, urllib.error, urllib.request
-
-req = json.load(sys.stdin)
-url = f"http://127.0.0.1:{int(req['port'])}/{req.get('path','').lstrip('/')}"
-if req.get("query"):
-    url += "?" + req["query"]
-body = base64.b64decode(req.get("body_b64") or "")
-data = body if body else None
-request = urllib.request.Request(
-    url,
-    data=data,
-    method=req.get("method") or "GET",
-    headers=req.get("headers") or {},
-)
-try:
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = response.read()
-        print(json.dumps({
-            "status_code": response.status,
-            "headers": dict(response.headers.items()),
-            "body_b64": base64.b64encode(payload).decode("ascii"),
-        }))
-except urllib.error.HTTPError as exc:
-    payload = exc.read()
-    print(json.dumps({
-        "status_code": exc.code,
-        "headers": dict(exc.headers.items()),
-        "body_b64": base64.b64encode(payload).decode("ascii"),
-    }))
-"""
-        payload = json.dumps(
-            {
-                "port": int(port),
-                "path": path,
-                "query": query,
-                "method": method,
-                "headers": headers,
-                "body_b64": body_b64,
-            }
-        )
-        result = subprocess.run(
-            ["docker", "exec", "-i", self.container_id, "python3", "-c", script],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=35,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "sandbox HTTP fetch failed")
+            raise RuntimeError(result.stderr.strip() or "sandbox script failed")
         return json.loads(result.stdout)
 
     # ------------------------------------------------------------------
@@ -768,7 +787,7 @@ except urllib.error.HTTPError as exc:
 # ---------------------------------------------------------------------------
 
 
-class _SSHSandbox:
+class _SSHSandbox(_ScriptSandbox):
     """Route agent commands to a remote host over SSH.
 
     Authentication uses a key file (AGENT_SSH_KEY_PATH) or falls back to the
@@ -845,6 +864,27 @@ class _SSHSandbox:
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             logger.warning("SSH exec_background failed: %s", exc)
             return None
+
+    _evidence_scope = "ssh_sandbox"
+
+    def _run_python(
+        self, script: str, payload: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        """Run *script* on the remote host with *payload* JSON piped on stdin."""
+        remote_cmd = f"python3 -c {shlex.quote(script)}"
+        try:
+            result = subprocess.run(
+                [*self._ssh_argv(), remote_cmd],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError from exc
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "ssh sandbox script failed")
+        return json.loads(result.stdout)
 
     def collect_environment_json(self) -> str:
         script = (

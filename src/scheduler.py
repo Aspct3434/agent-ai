@@ -36,9 +36,12 @@ def _matches_field(value: int, spec: str) -> bool:
         if part == "*":
             return True
         if part.startswith("*/"):
+            # A step term in a comma list must not short-circuit the whole
+            # field: "*/30,45" has to keep checking "45" when value % 30 != 0.
             step = int(part[2:])
-            return value % step == 0
-        if "-" in part:
+            if step > 0 and value % step == 0:
+                return True
+        elif "-" in part:
             a, b = part.split("-", 1)
             if int(a) <= value <= int(b):
                 return True
@@ -55,12 +58,18 @@ def _cron_next_run(expr: str, after: datetime) -> datetime:
     min_f, hour_f, dom_f, mon_f, dow_f = parts
     dt = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
     for _ in range(366 * 24 * 60):
+        # Cron day-of-week is 0=Sunday..6=Saturday (with 7 also = Sunday),
+        # whereas Python's weekday() is 0=Monday..6=Sunday.
+        cron_dow = (dt.weekday() + 1) % 7
         if (
             _matches_field(dt.minute, min_f)
             and _matches_field(dt.hour, hour_f)
             and _matches_field(dt.day, dom_f)
             and _matches_field(dt.month, mon_f)
-            and _matches_field(dt.weekday(), dow_f)
+            and (
+                _matches_field(cron_dow, dow_f)
+                or (cron_dow == 0 and _matches_field(7, dow_f))
+            )
         ):
             return dt
         dt += timedelta(minutes=1)
