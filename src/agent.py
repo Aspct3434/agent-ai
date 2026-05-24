@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -68,6 +68,7 @@ from tools import ToolManager
 from toolsets import filter_tools_by_toolset
 
 if TYPE_CHECKING:
+    from evaluator import SkillRegistry
     from memory import HybridMemory, UserProfileStore
     from scheduler import CronScheduler
 
@@ -511,12 +512,15 @@ _PARALLEL_SAFE_TOOLS: frozenset[str] = frozenset(
     {
         "get_system_environment",
         "get_filesystem_process_evidence",
-        # Web tools are read-only network calls â€” safe to run concurrently
+        # Web tools are read-only network calls â€" safe to run concurrently
         "web_fetch",
         "web_search",
         "expand_tool_output",
         "set_task_contract",
         "update_plan",
+        # Scheduler / skill registry introspection (read-only)
+        "list_scheduled_tasks",
+        "list_skills",
         # MCP filesystem server (read-only ops)
         "list_tables",
         "describe_table",
@@ -722,6 +726,15 @@ SYSTEM_DIRECTIVE = (
     "browser UI on an internal container port, call expose_local_http_service after "
     "the service is listening and give the returned /proxy URL. Do not ask the user "
     "to manually open ports or edit Docker Compose for normal HTTP access. "
+    # ── Scheduled tasks vs background services ────────────────────────────
+    "For time-based recurring work (heartbeats, periodic reports, cleanup), use "
+    "schedule_task — it registers a persistent cron/interval/once job with the "
+    "agent scheduler, survives restarts, and is visible via list_scheduled_tasks. "
+    "execute_background_service is only for non-terminating daemons and servers "
+    "that must run continuously inside the current container session. Never use "
+    "execute_background_service for work that should repeat on a schedule. "
+    "After calling schedule_task, always call list_scheduled_tasks to confirm the "
+    "job was registered and show the user its job_id and next-run time. "
     # â”€â”€ Output format â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "Final answers must use clear GitHub-flavored Markdown. Use bold section labels "
     "and concise bullets when helpful. Include one to three relevant emoji characters "
@@ -803,6 +816,7 @@ class AgentEngine:
         require_task_contract: bool = True,
         profile_store: UserProfileStore | None = None,
         scheduler: CronScheduler | None = None,
+        skill_registry: SkillRegistry | None = None,
         persona_content: str = "",
     ) -> None:
         self._memory = memory
@@ -823,6 +837,7 @@ class AgentEngine:
         self._require_task_contract = require_task_contract
         self._profile_store = profile_store
         self._scheduler = scheduler
+        self._skill_registry = skill_registry
         self._histories: dict[str, list[dict[str, Any]]] = {}
 
     def update_models(
@@ -1403,6 +1418,7 @@ class AgentEngine:
                     messages=messages,
                     steps=steps,
                     tool_index=tool_index,
+                    session_id=session_id,
                 )
                 for result_event in tool_result_events:
                     yield result_event
@@ -1657,6 +1673,7 @@ class AgentEngine:
         messages: list[dict[str, Any]],
         steps: list[ExecutionStep],
         tool_index: dict[str, str],
+        session_id: str = "unknown",
     ) -> tuple[int, list[dict[str, Any]]]:
         """Execute one iteration's tool calls and record results.
 
@@ -1694,7 +1711,7 @@ class AgentEngine:
 
             gathered = await asyncio.gather(
                 *(
-                    self._execute_single_tool(name, args, messages, tool_index)
+                    self._execute_single_tool(name, args, messages, tool_index, session_id)
                     for (_, name, args) in parallel_to_run
                 )
             )
@@ -1766,7 +1783,7 @@ class AgentEngine:
                 # reads): identical call, no state change, no new information.
                 results[tc_id] = (_repeated_tool_call_message(name, args), True, "__builtin__")
             else:
-                results[tc_id] = await self._execute_single_tool(name, args, messages, tool_index)
+                results[tc_id] = await self._execute_single_tool(name, args, messages, tool_index, session_id)
                 if cmd:
                     last_host_cmd = cmd
                     local_repeat_counts[cmd] = local_repeat_counts.get(cmd, 0) + 1
@@ -1813,6 +1830,7 @@ class AgentEngine:
         arguments: dict[str, Any],
         messages: list[dict[str, Any]],
         tool_index: dict[str, str],
+        session_id: str = "unknown",
     ) -> tuple[str, bool, str | None]:
         """Execute one tool call and return ``(content, is_error, server)``.
 
@@ -1963,10 +1981,20 @@ class AgentEngine:
                 return f"[generate_image error] {exc}", True, "__builtin__"
         if tool_name == "schedule_task":
             try:
-                result = await self._schedule_task(arguments, messages)
+                result = await self._schedule_task(arguments, session_id)
                 return result, False, "__builtin__"
             except Exception as exc:
                 return f"[schedule_task error] {exc}", True, "__builtin__"
+        if tool_name == "list_scheduled_tasks":
+            try:
+                return self._list_scheduled_tasks(), False, "__builtin__"
+            except Exception as exc:
+                return f"[list_scheduled_tasks error] {exc}", True, "__builtin__"
+        if tool_name == "list_skills":
+            try:
+                return self._list_skills(), False, "__builtin__"
+            except Exception as exc:
+                return f"[list_skills error] {exc}", True, "__builtin__"
 
         server = tool_index.get(tool_name)
         if server is None:
@@ -1993,16 +2021,10 @@ class AgentEngine:
     async def _schedule_task(
         self,
         arguments: dict[str, Any],
-        messages: list[dict[str, Any]],
+        session_id: str,
     ) -> str:
         if self._scheduler is None:
             return json.dumps({"error": "Scheduler is not configured on this engine."})
-        # Derive session_id from the current conversation context
-        session_id = next(
-            (m.get("session_id") for m in messages if m.get("session_id")),
-            "scheduled",
-        )
-        # The session_id is stored in metadata on history list — retrieve from messages owner
         job = await self._scheduler.add_job(
             schedule_type=arguments["schedule_type"],
             schedule_spec=arguments["schedule_spec"],
@@ -2017,6 +2039,16 @@ class AgentEngine:
             "next_run": job.next_run.isoformat() if job.next_run else None,
             "label": job.label,
         }, indent=2)
+
+    def _list_scheduled_tasks(self) -> str:
+        if self._scheduler is None:
+            return json.dumps({"jobs": [], "note": "Scheduler not configured on this engine."})
+        return json.dumps({"jobs": self._scheduler.list_jobs()}, indent=2)
+
+    def _list_skills(self) -> str:
+        if self._skill_registry is None:
+            return json.dumps({"skills": [], "note": "Skill registry not configured on this engine."})
+        return json.dumps({"skills": self._skill_registry.list_skills()}, indent=2)
 
     def _directive_system_message(self) -> dict[str, Any]:
         """Build the durable system-directive message.

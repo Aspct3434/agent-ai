@@ -351,6 +351,7 @@ async def lifespan(app: FastAPI):
         distiller=distiller,
         checkpointer=checkpointer,
         profile_store=profile_store,
+        skill_registry=skill_registry,
         persona_content=persona_content,
     )
 

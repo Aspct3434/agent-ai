@@ -1349,13 +1349,50 @@ GENERATE_IMAGE_TOOL: dict[str, Any] = {
     },
 }
 
+LIST_SCHEDULED_TASKS_TOOL: dict[str, Any] = {
+    "server": "__builtin__",
+    "name": "list_scheduled_tasks",
+    "description": (
+        "List all jobs registered with the agent's internal cron scheduler. "
+        "Returns job IDs, schedule type and spec, labels, next-run times, "
+        "enabled status, and run counts. Use this to verify a schedule_task "
+        "call succeeded, inspect what recurring tasks are active, or find a "
+        "job_id before disabling one via the /api/cron/jobs API."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+LIST_SKILLS_TOOL: dict[str, Any] = {
+    "server": "__builtin__",
+    "name": "list_skills",
+    "description": (
+        "List all skills in the agent's skill registry with their description, "
+        "tags, usage count, success rate, and self-improvement history. "
+        "Use this to see which skills exist, how often they have been called, "
+        "and whether they qualify for LLM self-improvement."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
 SCHEDULE_TASK_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "schedule_task",
     "description": (
         "Schedule a task to run automatically on a recurring schedule or at a "
         "specific future time. The task is dispatched to the agent and runs "
-        "unattended. Returns the job ID.\n"
+        "unattended. Returns the job ID. Use list_scheduled_tasks to verify.\n"
+        "IMPORTANT: use this (not execute_background_service) for any work that "
+        "must repeat on a time-based schedule — heartbeats, periodic reports, "
+        "cleanup jobs. execute_background_service is for persistent daemons "
+        "(servers/watchers) that run continuously, not for scheduled work.\n"
         "schedule_type options:\n"
         "  'interval' — run every N seconds (spec: '300' = every 5 min)\n"
         "  'cron'     — 5-field cron expression (spec: '0 9 * * 1' = every Monday 9am)\n"
@@ -1573,8 +1610,10 @@ class ToolManager:
         if _VISION_MODEL:
             results.append(ANALYZE_IMAGE_TOOL)
         results.append(GENERATE_IMAGE_TOOL)
-        # Schedule tool always available (scheduler handles missing config gracefully).
+        # Schedule tool + introspection always available.
         results.append(SCHEDULE_TASK_TOOL)
+        results.append(LIST_SCHEDULED_TASKS_TOOL)
+        results.append(LIST_SKILLS_TOOL)
         self._tools_cache = results
         return results
 
@@ -3433,6 +3472,7 @@ SKILLS_DIR = Path(__file__).parent
 # Allow skills to import the _skill decorator via `from _skill import skill`
 sys.path.insert(0, str(SKILLS_DIR))
 
+logger = logging.getLogger(__name__)
 mcp = FastMCP("skills")
 
 
