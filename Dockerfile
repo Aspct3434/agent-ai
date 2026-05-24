@@ -38,7 +38,7 @@ RUN playwright install-deps chromium \
     && playwright install chromium \
     && chmod -R a+rx /usr/local/ms-playwright
 
-ENV NODE_VERSION=20.18.1
+ENV NODE_VERSION=22.17.1
 
 RUN ARCH="$(dpkg --print-architecture)" \
     && case "$ARCH" in \
