@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from checkpointer import StateCheckpointer
 from contract import (
     _HOST_EXECUTION_TOOLS,
+    _MAX_CONSECUTIVE_PORT_POLL_FAILURES,
     _MAX_IDENTICAL_COMMAND_RUNS,
     _TASK_CONTRACT_TOOL,
     _attempted_tool_names,
@@ -22,6 +23,7 @@ from contract import (
     _build_incomplete_contract_cap_message,
     _build_task_contract_instruction,
     _can_stream_text_before_final,
+    _consecutive_port_poll_failures,
     _contract_completion_status,
     _duplicate_command_message,
     _filter_tool_schemas,
@@ -29,6 +31,7 @@ from contract import (
     _last_host_command,
     _latest_task_contract,
     _normalize_command,
+    _port_poll_block_message,
     _repeated_command_message,
     _run_set_task_contract,
     _should_block_tool_for_action_task,
@@ -495,9 +498,13 @@ SYSTEM_DIRECTIVE = (
     "building, running tests -- MUST go through execute_terminal_command, which waits "
     "for the command to finish; do not background it. Backgrounding a finite command "
     "forces you to poll /tmp/background_task.log and can deadlock on resource locks "
-    "(e.g. apt/dpkg). After you start a real background service, read the log at most "
-    "once or twice to confirm it is up -- never poll it repeatedly in a loop -- and "
-    "never launch the same install or service command more than once. "
+    "(e.g. apt/dpkg). After you start a real background service, call wait_for_port "
+    "to wait for it to bind -- that tool blocks internally and returns only once the "
+    "port opens (or the timeout expires), so you never burn multiple API calls polling. "
+    "Read the background log at most once (cat /tmp/background_task.log) to confirm "
+    "startup or diagnose a failure; never call get_filesystem_process_evidence in a "
+    "loop checking the same port; and never launch the same service command again "
+    "while one is already running. "
     "NEVER append '&' to a command in execute_terminal_command to background it: that "
     "tool is synchronous and returns only when the command exits, so a trailing '&' "
     "keeps nothing running and will mislead you -- use execute_background_service for "
@@ -1489,13 +1496,34 @@ class AgentEngine:
         serial = [c for c in calls if c[1] not in _PARALLEL_SAFE_TOOLS]
 
         if parallel:
+            # Pre-screen parallel tools: block get_filesystem_process_evidence
+            # calls that are polling the same port(s) that keep returning
+            # connectable=false.  The agent should use wait_for_port instead,
+            # which handles the entire wait in a single LLM turn.
+            parallel_to_run: list[tuple[str, str, dict[str, Any]]] = []
+            for tc_id, name, args in parallel:
+                if name == "get_filesystem_process_evidence":
+                    ports = [int(p) for p in (args.get("ports") or [])]
+                    if (
+                        ports
+                        and _consecutive_port_poll_failures(steps, ports)
+                        >= _MAX_CONSECUTIVE_PORT_POLL_FAILURES
+                    ):
+                        results[tc_id] = (
+                            _port_poll_block_message(ports),
+                            True,
+                            "__builtin__",
+                        )
+                        continue
+                parallel_to_run.append((tc_id, name, args))
+
             gathered = await asyncio.gather(
                 *(
                     self._execute_single_tool(name, args, messages, tool_index)
-                    for (_, name, args) in parallel
+                    for (_, name, args) in parallel_to_run
                 )
             )
-            for (tc_id, _, _), res in zip(parallel, gathered, strict=False):
+            for (tc_id, _, _), res in zip(parallel_to_run, gathered, strict=False):
                 results[tc_id] = res
 
         # Track the most recent host command so an immediately-repeated,
@@ -1648,6 +1676,16 @@ class AgentEngine:
             except Exception as exc:
                 logger.warning("get_filesystem_process_evidence raised: %s", exc)
                 return f"[get_filesystem_process_evidence error] {exc}", True, "__builtin__"
+        if tool_name == "wait_for_port":
+            try:
+                return (
+                    await self._tools.wait_for_port(**arguments),
+                    False,
+                    "__builtin__",
+                )
+            except Exception as exc:
+                logger.warning("wait_for_port raised: %s", exc)
+                return f"[wait_for_port error] {exc}", True, "__builtin__"
         if tool_name == "write_text_file":
             try:
                 return (

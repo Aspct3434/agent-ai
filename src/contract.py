@@ -757,6 +757,84 @@ def _repeated_command_message(tool_name: str, command: Any) -> str:
     )
 
 
+# Maximum consecutive get_filesystem_process_evidence calls that probe the
+# same port(s) and receive connectable=false before the next one is blocked
+# and the agent is directed to use wait_for_port instead.
+_MAX_CONSECUTIVE_PORT_POLL_FAILURES = max(
+    1, int(os.getenv("AGENT_MAX_PORT_POLL_FAILURES", "2"))
+)
+
+
+def _consecutive_port_poll_failures(
+    steps: list[ExecutionStep],
+    ports: list[int],
+) -> int:
+    """Count consecutive get_filesystem_process_evidence calls that probed
+    *ports* and all returned connectable=false, since the last background
+    service launch or state change.
+
+    Used to block poll-loops where the agent calls get_filesystem_process_evidence
+    repeatedly while waiting for a slow service to bind (e.g. a JVM server).
+    The guard redirects to wait_for_port which handles the wait in one API call.
+    """
+    if not ports:
+        return 0
+    target = frozenset(int(p) for p in ports)
+
+    count = 0
+    # Walk backward through steps; stop counting when we see a successful
+    # background service launch (= state changed) or a connectable port result.
+    for step in reversed(steps):
+        if step.kind != "tool_result":
+            continue
+        name = step.metadata.get("tool_name")
+
+        # A new background service launch resets the window.
+        if name == "execute_background_service" and not step.metadata.get("is_error"):
+            break
+
+        # Any state-changing write also resets the window.
+        if name in _STATE_CHANGING_TOOLS and not step.metadata.get("is_error"):
+            break
+
+        if name != "get_filesystem_process_evidence":
+            continue
+
+        # Only count calls that probed the same (or a superset of) ports.
+        args = step.metadata.get("arguments") or {}
+        checked = frozenset(int(p) for p in (args.get("ports") or []))
+        if not checked.issuperset(target):
+            # Different port set — stop the backward scan.
+            break
+
+        # Check if any target port was connectable in this result.
+        try:
+            data = json.loads(step.content)
+            for port_info in data.get("ports", []):
+                if int(port_info.get("port", -1)) in target and port_info.get("connectable"):
+                    return count  # port was open at some point; reset
+        except (TypeError, json.JSONDecodeError, ValueError):
+            pass
+
+        count += 1
+
+    return count
+
+
+def _port_poll_block_message(ports: list[int]) -> str:
+    port_str = ", ".join(str(p) for p in ports)
+    return (
+        f"[skipped: poll loop detected] You have checked port(s) {port_str} "
+        f"{_MAX_CONSECUTIVE_PORT_POLL_FAILURES} times in a row and they are still "
+        "not open. Continuing to poll burns API calls without progress. "
+        "Instead: call wait_for_port to wait efficiently — it blocks internally "
+        "until the port opens (or the timeout expires) without requiring more LLM "
+        "turns. If the service failed to start, read the background log first: "
+        "execute_terminal_command('cat /tmp/background_task.log') to diagnose the "
+        "error before retrying."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Action-task tool blocking
 # ---------------------------------------------------------------------------

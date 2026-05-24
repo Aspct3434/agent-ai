@@ -674,7 +674,11 @@ GET_FILESYSTEM_PROCESS_EVIDENCE_TOOL: dict[str, Any] = {
         "Return structured evidence about host filesystem paths, process IDs, "
         "process names, localhost ports, and the background-service log. Use this "
         "after creating files, folders, servers, or background processes to prove "
-        "the requested artifacts or service exist before giving a final answer."
+        "the requested artifacts or service exist before giving a final answer. "
+        "IMPORTANT: do NOT call this in a loop to wait for a slow service to start. "
+        "If a port is not yet open, use wait_for_port instead — it blocks internally "
+        "and returns only when the port opens (or the timeout expires), so you do "
+        "not burn API calls polling."
     ),
     "inputSchema": {
         "type": "object",
@@ -702,6 +706,40 @@ GET_FILESYSTEM_PROCESS_EVIDENCE_TOOL: dict[str, Any] = {
             "include_background_log": {
                 "type": "boolean",
                 "description": f"Include the tail of {_BACKGROUND_LOG_PATH}. Default true.",
+            },
+        },
+        "additionalProperties": False,
+    },
+}
+
+WAIT_FOR_PORT_TOOL: dict[str, Any] = {
+    "server": "__builtin__",
+    "name": "wait_for_port",
+    "description": (
+        "Block until a local TCP port is reachable or the timeout expires, then return "
+        "the result. Use this INSTEAD of calling get_filesystem_process_evidence in a "
+        "loop after starting a slow service (e.g. a JVM server, a Rust binary, or any "
+        "service that takes tens of seconds to bind). A single wait_for_port call "
+        "handles the entire wait internally without burning API calls — it polls the "
+        "port every few seconds until it opens or the timeout is reached. "
+        "Returns {open, port, elapsed_seconds} on success or "
+        "{open: false, port, timeout: true, elapsed_seconds, hint} on timeout."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "required": ["port"],
+        "properties": {
+            "port": {
+                "type": "integer",
+                "description": "Local TCP port to wait for on 127.0.0.1.",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Maximum seconds to wait. Default 120. Capped at 300.",
+            },
+            "interval": {
+                "type": "integer",
+                "description": "Polling interval in seconds. Default 5. Min 1, max 30.",
             },
         },
         "additionalProperties": False,
@@ -1187,6 +1225,7 @@ class ToolManager:
 
         results.append(GET_SYSTEM_ENVIRONMENT_TOOL)
         results.append(GET_FILESYSTEM_PROCESS_EVIDENCE_TOOL)
+        results.append(WAIT_FOR_PORT_TOOL)
         results.append(WEB_FETCH_TOOL)
         results.append(WEB_SEARCH_TOOL)
         # Browser tools only appear when Playwright is installed.
@@ -1610,6 +1649,50 @@ class ToolManager:
             headers=headers,
             body_b64=base64.b64encode(body).decode("ascii"),
         )
+
+    async def wait_for_port(
+        self,
+        port: int,
+        timeout: int = 120,
+        interval: int = 5,
+    ) -> str:
+        """Block asynchronously until *port* is reachable or *timeout* expires.
+
+        Polls every *interval* seconds using a non-blocking async sleep so the
+        event loop stays responsive.  Returns a JSON string with:
+          ``{open, port, elapsed_seconds}``          on success, or
+          ``{open: false, port, timeout, elapsed_seconds, hint}``  on timeout.
+        """
+        timeout = min(max(int(timeout), 1), 300)
+        interval = min(max(int(interval), 1), 30)
+        start = asyncio.get_event_loop().time()
+        deadline = start + timeout
+
+        while True:
+            try:
+                with socket.create_connection(("127.0.0.1", int(port)), timeout=1.0):
+                    elapsed = round(asyncio.get_event_loop().time() - start, 1)
+                    return json.dumps({"open": True, "port": port, "elapsed_seconds": elapsed})
+            except OSError:
+                pass
+
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(interval, remaining))
+
+        elapsed = round(asyncio.get_event_loop().time() - start, 1)
+        return json.dumps({
+            "open": False,
+            "port": port,
+            "timeout": True,
+            "elapsed_seconds": elapsed,
+            "hint": (
+                f"Port {port} did not open within {timeout}s. "
+                "Read the background log (cat /tmp/background_task.log) "
+                "to diagnose the failure before retrying."
+            ),
+        })
 
     async def execute_terminal_command(self, command: str) -> dict[str, Any]:
         """Run *command* inside ``self.current_cwd`` and return a structured result dict.
