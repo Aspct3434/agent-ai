@@ -19,6 +19,19 @@ function run(args, input = "") {
   });
 }
 
+function runWithEnv(args, env, input = "") {
+  return spawnSync(process.execPath, [bin, ...args], {
+    cwd: root,
+    input,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ...env,
+      NO_COLOR: "1"
+    }
+  });
+}
+
 function tempInstallDir(name) {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agent-ai-cli-")), name);
 }
@@ -78,6 +91,27 @@ function assertIncludes(text, expected) {
   assertIncludes(result.stdout, 'AGENT_SANDBOX_HOST_FALLBACK="true"');
   assertIncludes(result.stdout, "TELEGRAM_BOT_TOKEN=");
   assertIncludes(result.stdout, "DISCORD_BOT_TOKEN=");
+}
+
+{
+  const installDir = tempInstallDir("no-env-secret-import");
+  const result = runWithEnv([
+    "install",
+    "--dry-run",
+    "--yes",
+    "--no-start",
+    "--install-dir",
+    installDir,
+    "--provider",
+    "openai",
+    "--sandbox",
+    "on",
+    "--messaging",
+    "none"
+  ], { OPENAI_API_KEY: "sk-should-not-be-imported" });
+  assert.strictEqual(result.status, 0, result.stderr);
+  assertIncludes(result.stdout, "OPENAI_API_KEY=");
+  assert(!result.stdout.includes("sk-should-not-be-imported"));
 }
 
 {
