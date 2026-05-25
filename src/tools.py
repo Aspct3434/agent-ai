@@ -20,6 +20,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, PaginatedRequestParams
@@ -242,6 +243,7 @@ _WINDOWS_WHERE_RE = re.compile(r"(?:^|[;&|]\s*)where(?:\.exe)?\s+\S+", re.IGNORE
 _SANDBOX_MODE = os.getenv("AGENT_SANDBOX", "").lower()
 _SANDBOX_ENABLED = _SANDBOX_MODE == "docker"
 _SSH_SANDBOX_ENABLED = _SANDBOX_MODE == "ssh"
+_HTTP_SANDBOX_ENABLED = _SANDBOX_MODE == "http"
 
 # SSH sandbox configuration
 _SSH_HOST = os.getenv("AGENT_SSH_HOST", "")
@@ -249,6 +251,13 @@ _SSH_USER = os.getenv("AGENT_SSH_USER", "")
 _SSH_KEY_PATH = os.getenv("AGENT_SSH_KEY_PATH", "")
 _SSH_WORKDIR = os.getenv("AGENT_SSH_WORKDIR", "/tmp/agent-workspace")
 _SSH_PORT = int(os.getenv("AGENT_SSH_PORT", "22"))
+
+# HTTP-exec sandbox configuration (pluggable serverless backend).
+# Point AGENT_SANDBOX_EXEC_URL at a small shim in front of any serverless
+# sandbox (Daytona, E2B, Modal, Vercel Sandbox, …); see _HttpExecSandbox.
+_HTTP_EXEC_URL = os.getenv("AGENT_SANDBOX_EXEC_URL", "").rstrip("/")
+_HTTP_EXEC_TOKEN = os.getenv("AGENT_SANDBOX_EXEC_TOKEN", "")
+_HTTP_EXEC_WORKDIR = os.getenv("AGENT_SANDBOX_EXEC_WORKDIR", "/workspace")
 
 # Vision and image generation model config
 _VISION_MODEL = os.getenv("AGENT_VISION_MODEL", "")
@@ -976,6 +985,142 @@ class _SSHSandbox(_ScriptSandbox):
         }, indent=2)
 
 
+class _HttpExecSandbox(_ScriptSandbox):
+    """Pluggable serverless backend: run commands via a remote HTTP exec shim.
+
+    Set ``AGENT_SANDBOX=http`` and ``AGENT_SANDBOX_EXEC_URL`` to a service that
+    fronts any serverless sandbox (Daytona, E2B, Modal, Vercel Sandbox, …). The
+    contract is one endpoint::
+
+        POST {url}/exec
+          {"command": str, "cwd": str, "timeout": float,
+           "stdin": str?, "background": bool?, "log_path": str?}
+        → {"exit_code": int, "stdout": str, "stderr": str, "pid": int?}
+
+    Keeping the backend protocol this small means a provider integration is a
+    ~20-line shim, and the agent gets serverless hibernate-on-idle execution
+    without any provider SDK baked into this repo.
+    """
+
+    def __init__(self, url: str, token: str = "", workdir: str = "/workspace") -> None:
+        if not url:
+            raise RuntimeError("AGENT_SANDBOX_EXEC_URL is required for the http sandbox")
+        self._url = url
+        self._token = token
+        self._workdir = workdir
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"} if self._token else {}
+
+    def _post(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        resp = httpx.post(
+            f"{self._url}/exec", json=payload, headers=self._headers(), timeout=timeout
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return data
+
+    def start(self) -> None:
+        # Verify reachability and ensure the workspace exists.
+        self._post(
+            {"command": f"mkdir -p {shlex.quote(self._workdir)}", "cwd": "/", "timeout": 15},
+            timeout=20,
+        )
+        logger.info("HTTP-exec sandbox ready at %s", self._url)
+
+    def stop(self) -> None:
+        pass  # the remote service owns lifecycle/hibernation
+
+    async def exec_async(
+        self, command: str, cwd: str, timeout: float
+    ) -> tuple[int, str, str]:
+        def _run() -> tuple[int, str, str]:
+            try:
+                data = self._post(
+                    {"command": command, "cwd": cwd, "timeout": timeout}, timeout + 5
+                )
+            except httpx.TimeoutException:
+                raise
+            except Exception as exc:
+                return 1, "", f"http sandbox error: {exc}"
+            return (
+                int(data.get("exit_code", 0)),
+                str(data.get("stdout", "")),
+                str(data.get("stderr", "")),
+            )
+
+        try:
+            return await asyncio.to_thread(_run)
+        except httpx.TimeoutException as exc:
+            raise TimeoutError from exc
+
+    def exec_background(self, command: str, cwd: str, log_path: str) -> int | None:
+        try:
+            data = self._post(
+                {
+                    "command": command,
+                    "cwd": cwd,
+                    "timeout": 15,
+                    "background": True,
+                    "log_path": log_path,
+                },
+                timeout=20,
+            )
+            pid = data.get("pid")
+            return int(pid) if pid is not None else None
+        except Exception as exc:
+            logger.warning("http sandbox exec_background failed: %s", exc)
+            return None
+
+    _evidence_scope = "http_sandbox"
+
+    def _run_python(
+        self, script: str, payload: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        try:
+            data = self._post(
+                {
+                    "command": f"python3 -c {shlex.quote(script)}",
+                    "cwd": self._workdir,
+                    "timeout": timeout,
+                    "stdin": json.dumps(payload),
+                },
+                timeout + 5,
+            )
+        except httpx.TimeoutException as exc:
+            raise TimeoutError from exc
+        if int(data.get("exit_code", 0)) != 0:
+            raise RuntimeError(data.get("stderr") or "http sandbox script failed")
+        return json.loads(data.get("stdout") or "{}")
+
+    def collect_environment_json(self) -> str:
+        probe = (
+            "import json,shutil; "
+            "rts=['python3','node','npm','git','curl','apt-get']; "
+            "print(json.dumps({'os':'Linux','shell':{'shell':'bash','posix':True},"
+            "'sandbox':{'mode':'http'},"
+            "'runtimes':{r:shutil.which(r) is not None for r in rts}}))"
+        )
+        try:
+            data = self._post(
+                {"command": f"python3 -c {shlex.quote(probe)}", "cwd": self._workdir, "timeout": 15},
+                timeout=20,
+            )
+            out = str(data.get("stdout", "")).strip()
+            if int(data.get("exit_code", 0)) == 0 and out:
+                return out
+        except Exception as exc:
+            logger.warning("http sandbox environment probe failed: %s", exc)
+        return json.dumps(
+            {
+                "os": "Linux",
+                "sandbox": {"mode": "http", "url": self._url},
+                "shell": {"shell": "bash", "posix": True},
+            },
+            indent=2,
+        )
+
+
 GET_SYSTEM_ENVIRONMENT_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "get_system_environment",
@@ -1605,6 +1750,24 @@ class ToolManager:
                 self.current_cwd = host_workdir
                 self._env_snapshot = _collect_system_environment()
                 logger.error("SSH sandbox failed to start — falling back to host: %s", exc)
+        elif _HTTP_SANDBOX_ENABLED:
+            try:
+                http_sandbox = _HttpExecSandbox(
+                    url=_HTTP_EXEC_URL,
+                    token=_HTTP_EXEC_TOKEN,
+                    workdir=_HTTP_EXEC_WORKDIR,
+                )
+                http_sandbox.start()
+                self._sandbox = http_sandbox
+                self.current_cwd = _HTTP_EXEC_WORKDIR
+                self._env_snapshot = http_sandbox.collect_environment_json()
+                logger.info("Sandbox mode: http (%s)", _HTTP_EXEC_URL)
+            except Exception as exc:
+                self._sandbox = None
+                self._sandbox_startup_failed = True
+                self.current_cwd = host_workdir
+                self._env_snapshot = _collect_system_environment()
+                logger.error("HTTP sandbox failed to start — falling back to host: %s", exc)
         else:
             self.current_cwd = host_workdir
             self._env_snapshot = _collect_system_environment()

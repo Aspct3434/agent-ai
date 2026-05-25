@@ -511,6 +511,46 @@ class SkillRegistry:
         return str(dest)
 
     # ------------------------------------------------------------------
+    # agentskills.io (SKILL.md) interop
+    # ------------------------------------------------------------------
+
+    def export_skill_md(self, skill_name: str) -> str | None:
+        """Render a skill as an agentskills.io-compatible SKILL.md document."""
+        data = self.export_skill(skill_name)
+        if data is None:
+            return None
+        from skill_standard import to_skill_md
+
+        return to_skill_md(
+            name=data["name"],
+            description=data["description"],
+            code=data["code"],
+            tags=data.get("tags") or [],
+        )
+
+    def import_skill_md(self, text: str) -> str:
+        """Import a skill from an agentskills.io SKILL.md document.
+
+        The standard supports instruction-only skills, but agent-ai skills are
+        executable Python, so a fenced ``python`` block is required.
+        """
+        from skill_standard import parse_skill_md
+
+        parsed = parse_skill_md(text)
+        if not parsed["code"]:
+            raise ValueError(
+                "SKILL.md has no ```python``` block; agent-ai skills must be executable."
+            )
+        return self.import_skill(
+            {
+                "name": parsed["name"] or "imported_skill",
+                "description": parsed["description"],
+                "code": parsed["code"],
+                "tags": parsed["metadata"].get("tags", []),
+            }
+        )
+
+    # ------------------------------------------------------------------
     # Private
     # ------------------------------------------------------------------
 

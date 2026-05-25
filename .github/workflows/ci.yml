@@ -79,6 +79,9 @@ jobs:
                  tests/test_progress_format.py \
                  tests/test_cron_delivery.py \
                  tests/test_sandbox_selfheal.py \
+                 tests/test_http_sandbox.py \
+                 tests/test_skill_standard.py \
+                 tests/test_tui.py \
                  -v --tb=short
         env:
           PYTHONPATH: src

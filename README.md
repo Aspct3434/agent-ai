@@ -208,6 +208,37 @@ Each Telegram chat, Discord channel, and Slack channel gets its own isolated ses
 
 **Voice notes (Telegram)** — set `AGENT_TRANSCRIBE_MODEL` (e.g. `whisper-1`, or `groq/whisper-large-v3`) and the bot transcribes voice/audio messages, echoes what it heard, and acts on it. Leave blank to disable.
 
+## Rich terminal UI
+
+A streaming terminal client that shows the agent's work live (a line per tool call) and renders the final answer as Markdown — start a gateway, then:
+
+```bash
+python src/tui.py                    # connects to ws://127.0.0.1:8000
+python src/tui.py --url ws://host:9000/ws/stream
+```
+
+In-session commands: `/new` (or `/reset`), `/help`, `/quit`.
+
+## Serverless sandbox backend
+
+Besides `docker`, `ssh`, and host execution, set `AGENT_SANDBOX=http` to run commands on any serverless sandbox (Daytona, E2B, Modal, Vercel Sandbox) via a tiny exec shim. Point `AGENT_SANDBOX_EXEC_URL` at a service exposing one endpoint:
+
+```
+POST {url}/exec  {command, cwd, timeout, stdin?, background?, log_path?}
+              →  {exit_code, stdout, stderr, pid?}
+```
+
+That ~20-line shim is the entire provider integration — no SDK is baked into the repo.
+
+## Shareable skills (agentskills.io)
+
+Distilled skills export to / import from the open [agentskills.io](https://agentskills.io) `SKILL.md` format (YAML frontmatter + a fenced `python` block):
+
+```bash
+curl localhost:8000/api/skills/<name>/export.md      # download a SKILL.md
+curl -X POST localhost:8000/api/skills/import-md -d '{"text":"<SKILL.md>"}'
+```
+
 ## Running tests
 
 ```bash

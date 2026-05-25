@@ -906,6 +906,33 @@ async def import_skill(payload: SkillImportRequest) -> dict[str, str]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/skills/{skill_name}/export.md")
+async def export_skill_md(skill_name: str) -> Response:
+    """Export a skill as an agentskills.io-compatible SKILL.md document."""
+    md = app.state.skill_registry.export_skill_md(skill_name)
+    if md is None:
+        raise HTTPException(status_code=404, detail=f"Skill {skill_name!r} not found")
+    return Response(content=md, media_type="text/markdown")
+
+
+class SkillImportMdRequest(BaseModel):
+    text: str  # raw SKILL.md document
+
+
+@app.post("/api/skills/import-md")
+async def import_skill_md(payload: SkillImportMdRequest) -> dict[str, str]:
+    """Import a skill from a raw agentskills.io SKILL.md document."""
+    try:
+        path = app.state.skill_registry.import_skill_md(payload.text)
+        try:
+            await app.state.tools.connect_skills_server()
+        except Exception:
+            pass
+        return {"status": "imported", "path": path}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # Cron scheduler API
 # ---------------------------------------------------------------------------
