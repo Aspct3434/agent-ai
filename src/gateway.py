@@ -426,6 +426,7 @@ async def lifespan(app: FastAPI):
 
     from adapters.telegram import TelegramAdapter
     from adapters.discord_bot import DiscordAdapter
+    from adapters.slack import SlackAdapter
 
     async def _adapter_stream(session_id: str, text: str):
         """Stream the agent's live progress (tool calls + final answer) so
@@ -445,6 +446,7 @@ async def lifespan(app: FastAPI):
 
     telegram_adapter: TelegramAdapter | None = None
     discord_adapter: DiscordAdapter | None = None
+    slack_adapter: SlackAdapter | None = None
 
     if tg_token := os.getenv("TELEGRAM_BOT_TOKEN"):
         telegram_adapter = TelegramAdapter(
@@ -460,6 +462,35 @@ async def lifespan(app: FastAPI):
         await discord_adapter.start()
         app.state.discord_adapter = discord_adapter
 
+    slack_bot = os.getenv("SLACK_BOT_TOKEN")
+    slack_app = os.getenv("SLACK_APP_TOKEN")
+    if slack_bot and slack_app:
+        slack_adapter = SlackAdapter(
+            bot_token=slack_bot,
+            app_token=slack_app,
+            stream_fn=_adapter_stream,
+            reset_fn=_adapter_reset,
+        )
+        await slack_adapter.start()
+        app.state.slack_adapter = slack_adapter
+
+    # -- Scheduled-task delivery to messaging --------------------------------
+    # Lets cron jobs push their result to a chat (deliver_to="tg:123" etc.),
+    # so the agent can proactively message you — the always-on use case.
+    async def _deliver(target: str, text: str) -> None:
+        if not text:
+            return
+        if target.startswith("tg:") and telegram_adapter is not None:
+            await telegram_adapter.deliver(int(target[3:]), text)
+        elif target.startswith("discord:") and discord_adapter is not None:
+            await discord_adapter.deliver(target[len("discord:") :], text)
+        elif target.startswith("slack:") and slack_adapter is not None:
+            await slack_adapter.deliver(target[len("slack:") :], text)
+        else:
+            logger.warning("Cron delivery target %r has no active adapter", target)
+
+    scheduler.set_delivery(_deliver)
+
     try:
         yield
     finally:
@@ -468,6 +499,8 @@ async def lifespan(app: FastAPI):
             await telegram_adapter.shutdown()
         if discord_adapter is not None:
             await discord_adapter.shutdown()
+        if slack_adapter is not None:
+            await slack_adapter.shutdown()
         for task in list(app.state.active_stream_tasks.values()):
             task.cancel()
         await asyncio.gather(
@@ -884,6 +917,7 @@ class CronJobRequest(BaseModel):
     schedule_spec: str
     label: str = ""
     session_id: str = "cron"
+    deliver_to: str = ""  # e.g. "tg:12345" / "discord:67890" / "slack:C123"
 
 
 @app.get("/api/cron/jobs")
@@ -903,6 +937,7 @@ async def create_cron_job(payload: CronJobRequest) -> dict[str, Any]:
         prompt=payload.prompt,
         session_id=payload.session_id,
         label=payload.label,
+        deliver_to=payload.deliver_to,
     )
     return job.to_dict()
 

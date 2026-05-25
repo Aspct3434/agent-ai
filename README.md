@@ -163,9 +163,14 @@ Model strings follow the `ollama/<name>` convention (`ollama/llama3.2`, `ollama/
 
 See `ollama.env.example` for the full provider reference (Anthropic, OpenAI, Gemini, Azure).
 
-## Messaging adapters (Telegram / Discord)
+## Messaging adapters (Telegram / Discord / Slack)
 
-The agent can receive and reply to messages on Telegram and Discord alongside the browser control panel. Adapters are **disabled by default** and start only when a bot token is present.
+The agent can receive and reply to messages on Telegram, Discord, and Slack alongside the browser control panel. Adapters are **disabled by default** and start only when their bot token(s) are present. On every channel the bot:
+
+- shows a **live typing indicator** and streams **what it's executing** (a line per tool call) before the final answer;
+- supports in-chat commands: **`/new`** or **`/reset`** (fresh conversation), **`/stop`** (interrupt the current task), **`/help`**;
+- can **proactively message you**: ask it to "every morning at 8am summarise X" and the scheduled job delivers its result straight back to that chat;
+- (Telegram) **transcribes voice notes** when `AGENT_TRANSCRIBE_MODEL` is set.
 
 **Telegram**
 
@@ -188,7 +193,20 @@ The agent can receive and reply to messages on Telegram and Discord alongside th
    DISCORD_ALLOWED_USER_IDS=<comma-separated user_ids>   # omit to allow everyone
    ```
 
-Each Telegram chat and Discord channel gets its own isolated session, so conversation history is scoped correctly per chat.
+**Slack**
+
+1. [api.slack.com/apps](https://api.slack.com/apps) → Create New App → enable **Socket Mode**.
+2. Add a **Bot Token** (`xoxb-`, scope `chat:write`) and an **App-Level Token** (`xapp-`, scope `connections:write`); subscribe to `message.channels` / `message.im` events.
+3. Add to `an-api.env`:
+   ```
+   SLACK_BOT_TOKEN=xoxb-<token>
+   SLACK_APP_TOKEN=xapp-<token>
+   SLACK_ALLOWED_USERS=<comma-separated user_ids>   # omit to allow everyone
+   ```
+
+Each Telegram chat, Discord channel, and Slack channel gets its own isolated session, so conversation history is scoped correctly per chat.
+
+**Voice notes (Telegram)** — set `AGENT_TRANSCRIBE_MODEL` (e.g. `whisper-1`, or `groq/whisper-large-v3`) and the bot transcribes voice/audio messages, echoes what it heard, and acts on it. Leave blank to disable.
 
 ## Running tests
 

@@ -2030,12 +2030,18 @@ class AgentEngine:
     ) -> str:
         if self._scheduler is None:
             return json.dumps({"error": "Scheduler is not configured on this engine."})
+        # When scheduled from a messaging chat, deliver the result back to that
+        # chat by default so recurring tasks proactively message the user.
+        deliver_to = arguments.get("deliver_to", "")
+        if not deliver_to and session_id.split(":", 1)[0] in ("tg", "discord", "slack"):
+            deliver_to = session_id
         job = await self._scheduler.add_job(
             schedule_type=arguments["schedule_type"],
             schedule_spec=arguments["schedule_spec"],
             prompt=arguments["prompt"],
             session_id=session_id,
             label=arguments.get("label", ""),
+            deliver_to=deliver_to,
         )
         return json.dumps({
             "job_id": job.job_id,
@@ -2043,6 +2049,7 @@ class AgentEngine:
             "schedule_spec": job.schedule_spec,
             "next_run": job.next_run.isoformat() if job.next_run else None,
             "label": job.label,
+            "deliver_to": job.deliver_to,
         }, indent=2)
 
     def _list_scheduled_tasks(self) -> str:

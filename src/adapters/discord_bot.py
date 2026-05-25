@@ -407,6 +407,14 @@ class DiscordAdapter:
             await asyncio.sleep(_TYPING_REFRESH_S)
             await self._trigger_typing(channel_id)
 
+    async def deliver(self, channel_id: str, text: str) -> None:
+        """Post a (possibly long) message to a channel — used for scheduled delivery."""
+        text = str(text).strip()
+        if not text:
+            return
+        for chunk in _chunk_text(text):
+            await self._post_message(channel_id, chunk)
+
     async def _trigger_typing(self, channel_id: str) -> None:
         assert self._http is not None
         try:

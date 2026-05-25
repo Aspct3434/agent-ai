@@ -89,6 +89,9 @@ class ScheduledJob:
     prompt: str
     session_id: str
     label: str = ""
+    # Optional messaging target for the result, e.g. "tg:12345",
+    # "discord:67890", "slack:C123". Empty = no delivery.
+    deliver_to: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     next_run: datetime | None = None
     last_run: datetime | None = None
@@ -104,6 +107,7 @@ class ScheduledJob:
             "prompt": self.prompt,
             "session_id": self.session_id,
             "label": self.label,
+            "deliver_to": self.deliver_to,
             "created_at": self.created_at.isoformat(),
             "next_run": self.next_run.isoformat() if self.next_run else None,
             "last_run": self.last_run.isoformat() if self.last_run else None,
@@ -129,6 +133,8 @@ class ScheduledJob:
 
 # Callable the scheduler uses to run an agent task: (session_id, prompt) -> result
 AgentRunner = Callable[[str, str], Coroutine[Any, Any, str]]
+# Callable that delivers a job's result to a messaging target: (target, text) -> None
+DeliveryFn = Callable[[str, str], Coroutine[Any, Any, None]]
 
 
 class CronScheduler:
@@ -144,10 +150,15 @@ class CronScheduler:
     def __init__(self, db_path: str, runner: AgentRunner) -> None:
         self._db_path = db_path
         self._runner = runner
+        self._deliver: DeliveryFn | None = None
         self._jobs: dict[str, ScheduledJob] = {}
         self._task: asyncio.Task[None] | None = None
         self._running_tasks: set[asyncio.Task[None]] = set()
         self._started = False
+
+    def set_delivery(self, deliver: DeliveryFn) -> None:
+        """Register the callback used to deliver job results to messaging targets."""
+        self._deliver = deliver
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -189,6 +200,7 @@ class CronScheduler:
         prompt: str,
         session_id: str,
         label: str = "",
+        deliver_to: str = "",
         job_id: str | None = None,
     ) -> ScheduledJob:
         """Create, persist, and return a new scheduled job."""
@@ -200,6 +212,7 @@ class CronScheduler:
             prompt=prompt,
             session_id=session_id,
             label=label or prompt[:60],
+            deliver_to=deliver_to,
         )
         job.next_run = job.compute_next_run()
         self._jobs[job.job_id] = job
@@ -280,6 +293,12 @@ class CronScheduler:
         try:
             result = await self._runner(job.session_id, job.prompt)
             job.last_result = (result or "")[:500]
+            # Deliver the full result to the configured messaging target.
+            if job.deliver_to and self._deliver and result:
+                try:
+                    await self._deliver(job.deliver_to, result)
+                except Exception:
+                    logger.exception("Cron delivery to %s failed", job.deliver_to)
         except Exception as exc:
             job.last_result = f"ERROR: {exc}"
             logger.exception("Scheduled job %s failed", job.job_id)
@@ -308,6 +327,7 @@ class CronScheduler:
                 prompt=d["prompt"],
                 session_id=d["session_id"],
                 label=d.get("label", ""),
+                deliver_to=d.get("deliver_to", ""),
                 created_at=datetime.fromisoformat(d["created_at"]),
                 next_run=datetime.fromisoformat(d["next_run"]) if d.get("next_run") else None,
                 last_run=datetime.fromisoformat(d["last_run"]) if d.get("last_run") else None,

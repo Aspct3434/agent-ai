@@ -124,6 +124,9 @@ class TelegramAdapter:
         self._allowed: frozenset[int] | None = _parse_int_set(
             os.getenv("TELEGRAM_ALLOWED_IDS", "")
         )
+        # Voice transcription model (e.g. "whisper-1", "groq/whisper-large-v3").
+        # Empty = voice notes are not transcribed.
+        self._transcribe_model: str = os.getenv("AGENT_TRANSCRIBE_MODEL", "").strip()
         self._offset: int = 0
         self._running: bool = False
         self._task: asyncio.Task[None] | None = None
@@ -258,18 +261,24 @@ class TelegramAdapter:
         from_user: dict[str, Any] = message.get("from") or {}
         user_id: int = int(from_user.get("id") or 0)
 
-        if not text:
-            return
-
         # /start is a friendly greeting available to anyone who can reach the bot.
         if text == "/start":
             await self._send_message(chat_id, _WELCOME)
             return
 
-        # Allowlist gate for everything that follows.
+        # Allowlist gate for everything that follows (incl. costly transcription).
         if self._allowed is not None and user_id not in self._allowed:
-            await self._send_message(chat_id, "Access denied.")
+            if text:
+                await self._send_message(chat_id, "Access denied.")
             return
+
+        # Voice / audio note → transcribe it into text and continue as usual.
+        if not text:
+            voice = message.get("voice") or message.get("audio") or {}
+            if voice.get("file_id"):
+                text = await self._handle_voice(chat_id, str(voice["file_id"]))
+            if not text:
+                return
 
         # Slash commands are handled out-of-band (so /stop can interrupt a turn).
         if text.startswith("/"):
@@ -369,6 +378,62 @@ class TelegramAdapter:
             )
         except Exception as exc:
             logger.debug("Telegram sendChatAction failed (chat=%s): %s", chat_id, exc)
+
+    # ------------------------------------------------------------------
+    # Voice transcription
+    # ------------------------------------------------------------------
+
+    async def _handle_voice(self, chat_id: int, file_id: str) -> str:
+        """Transcribe a voice/audio note to text. Returns "" on failure."""
+        if not self._transcribe_model:
+            await self._send_message(
+                chat_id,
+                "🎙️ Voice messages aren't enabled (set AGENT_TRANSCRIBE_MODEL).",
+            )
+            return ""
+        try:
+            transcript = await self._transcribe(file_id)
+        except Exception as exc:
+            logger.warning("Telegram voice transcription failed: %s", exc)
+            transcript = ""
+        if not transcript:
+            await self._send_message(chat_id, "⚠️ Couldn't transcribe that voice message.")
+            return ""
+        # Echo what was heard so the user can confirm.
+        await self._send_message(chat_id, f'🎙️ "{transcript}"')
+        return transcript
+
+    async def _transcribe(self, file_id: str) -> str:
+        """Download the Telegram file and transcribe it via LiteLLM."""
+        assert self._http is not None
+        meta = await self._http.post(
+            f"{self._base}/getFile", json={"file_id": file_id}, timeout=30.0
+        )
+        data = meta.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"getFile failed: {data}")
+        file_path = data["result"]["file_path"]
+        download = await self._http.get(
+            f"https://api.telegram.org/file/bot{self._token}/{file_path}",
+            timeout=60.0,
+        )
+        audio = download.content
+
+        import litellm
+
+        result = await litellm.atranscription(
+            model=self._transcribe_model,
+            file=("voice.ogg", audio, "audio/ogg"),
+        )
+        return str(getattr(result, "text", "") or "").strip()
+
+    async def deliver(self, chat_id: int, text: str) -> None:
+        """Send a (possibly long) message to a chat — used for scheduled delivery."""
+        text = str(text).strip()
+        if not text:
+            return
+        for chunk in _chunk_text(text):
+            await self._send_message(chat_id, chunk)
 
     async def _send_message(self, chat_id: int, text: str) -> None:
         """POST a message to a Telegram chat; logs warnings on failure."""

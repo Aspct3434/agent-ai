@@ -382,3 +382,53 @@ class TestTelegramCommands:
 
         assert any("Stopped" in t for t in _sent_texts(mock_http))
         assert not any("never reached" in t for t in _sent_texts(mock_http))
+
+
+# ---------------------------------------------------------------------------
+# Voice transcription
+# ---------------------------------------------------------------------------
+
+
+def _make_voice_update(update_id: int, chat_id: int, user_id: int, file_id: str = "vf") -> dict:
+    return {
+        "update_id": update_id,
+        "message": {
+            "chat": {"id": chat_id},
+            "from": {"id": user_id},
+            "voice": {"file_id": file_id, "duration": 3},
+        },
+    }
+
+
+class TestTelegramVoice:
+    @pytest.mark.asyncio
+    async def test_voice_disabled_without_model(self, adapter, mock_http) -> None:
+        adapter._transcribe_model = ""
+        await adapter._handle_update(_make_voice_update(30, 42, 1))
+        assert any("aren't enabled" in t for t in _sent_texts(mock_http))
+        assert _chat_actions(mock_http) == []  # no turn started
+
+    @pytest.mark.asyncio
+    async def test_voice_transcribed_and_processed(self, adapter, mock_http) -> None:
+        adapter._transcribe_model = "whisper-1"
+        adapter._transcribe = AsyncMock(return_value="hello world")
+        await adapter._handle_update(_make_voice_update(31, 42, 1))
+        texts = _sent_texts(mock_http)
+        assert any('"hello world"' in t for t in texts)  # echoed transcript
+        assert any("reply to: hello world" in t for t in texts)  # turn ran on it
+
+    @pytest.mark.asyncio
+    async def test_voice_empty_transcript_reported(self, adapter, mock_http) -> None:
+        adapter._transcribe_model = "whisper-1"
+        adapter._transcribe = AsyncMock(return_value="")
+        await adapter._handle_update(_make_voice_update(32, 42, 1))
+        assert any("Couldn't transcribe" in t for t in _sent_texts(mock_http))
+        assert _chat_actions(mock_http) == []
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_voice_silently_ignored(self, adapter, mock_http) -> None:
+        adapter._allowed = frozenset({111})
+        adapter._transcribe_model = "whisper-1"
+        await adapter._handle_update(_make_voice_update(33, 42, 999))
+        # No transcription attempted, no reply (don't nag on stranger voice spam).
+        mock_http.post.assert_not_called()
