@@ -439,16 +439,24 @@ async def lifespan(app: FastAPI):
         ):
             yield event
 
+    def _adapter_reset(session_id: str) -> bool:
+        """Clear a chat's conversation history (the /new and /reset commands)."""
+        return engine.reset_session(session_id)
+
     telegram_adapter: TelegramAdapter | None = None
     discord_adapter: DiscordAdapter | None = None
 
     if tg_token := os.getenv("TELEGRAM_BOT_TOKEN"):
-        telegram_adapter = TelegramAdapter(token=tg_token, stream_fn=_adapter_stream)
+        telegram_adapter = TelegramAdapter(
+            token=tg_token, stream_fn=_adapter_stream, reset_fn=_adapter_reset
+        )
         await telegram_adapter.start()
         app.state.telegram_adapter = telegram_adapter
 
     if dc_token := os.getenv("DISCORD_BOT_TOKEN"):
-        discord_adapter = DiscordAdapter(token=dc_token, stream_fn=_adapter_stream)
+        discord_adapter = DiscordAdapter(
+            token=dc_token, stream_fn=_adapter_stream, reset_fn=_adapter_reset
+        )
         await discord_adapter.start()
         app.state.discord_adapter = discord_adapter
 

@@ -6,6 +6,7 @@ action, a line per tool call, and the final answer.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -113,8 +114,13 @@ def mock_http():
 
 
 @pytest.fixture
-def adapter(echo_stream_fn, mock_http):
-    a = TelegramAdapter(token="test-token", stream_fn=echo_stream_fn)
+def reset_fn():
+    return MagicMock(return_value=True)
+
+
+@pytest.fixture
+def adapter(echo_stream_fn, mock_http, reset_fn):
+    a = TelegramAdapter(token="test-token", stream_fn=echo_stream_fn, reset_fn=reset_fn)
     a._http = mock_http
     a._allowed = None  # open by default
     return a
@@ -159,9 +165,11 @@ class TestTelegramGating:
         assert any("Hello" in t for t in _sent_texts(mock_http))
 
     @pytest.mark.asyncio
-    async def test_other_slash_commands_ignored(self, adapter, mock_http) -> None:
+    async def test_slash_command_does_not_start_a_turn(self, adapter, mock_http) -> None:
+        # A command replies but must not kick off a streamed agent turn
+        # (no typing indicator).
         await adapter._handle_update(_make_update(2, 42, 99, "/unknown"))
-        mock_http.post.assert_not_called()
+        assert _chat_actions(mock_http) == []
 
     @pytest.mark.asyncio
     async def test_whitespace_only_message_ignored(self, adapter, mock_http) -> None:
@@ -215,7 +223,7 @@ class TestTelegramStreaming:
             },
             {"type": "text", "content": "all done"},
         )
-        a = TelegramAdapter(token="t", stream_fn=stream)
+        a = TelegramAdapter(token="t", stream_fn=stream, reset_fn=lambda _s: True)
         a._http = mock_http
         a._allowed = None
         await a._handle_update(_make_update(8, 42, 1, "install java"))
@@ -227,7 +235,7 @@ class TestTelegramStreaming:
     @pytest.mark.asyncio
     async def test_long_final_answer_chunked(self, mock_http) -> None:
         stream = _stream_of({"type": "text", "content": "x" * 9000})
-        a = TelegramAdapter(token="t", stream_fn=stream)
+        a = TelegramAdapter(token="t", stream_fn=stream, reset_fn=lambda _s: True)
         a._http = mock_http
         a._allowed = None
         await a._handle_update(_make_update(9, 1, 1, "go"))
@@ -241,7 +249,7 @@ class TestTelegramStreaming:
             raise RuntimeError("LLM unavailable")
             yield {}  # unreachable; marks this as an async generator
 
-        a = TelegramAdapter(token="t", stream_fn=_failing)
+        a = TelegramAdapter(token="t", stream_fn=_failing, reset_fn=lambda _s: True)
         a._http = mock_http
         a._allowed = None
         await a._handle_update(_make_update(10, 42, 1, "crash"))
@@ -307,10 +315,70 @@ class TestTelegramLifecycle:
         http_mock.aclose = AsyncMock()
 
         with patch("httpx.AsyncClient", return_value=http_mock):
-            a = TelegramAdapter(token="t", stream_fn=echo_stream_fn)
+            a = TelegramAdapter(token="t", stream_fn=echo_stream_fn, reset_fn=lambda _s: True)
             await a.start()
             assert a._task is not None and not a._task.done()
             await a.shutdown()
 
         assert not a._running
         http_mock.aclose.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# In-chat slash commands
+# ---------------------------------------------------------------------------
+
+
+class TestTelegramCommands:
+    @pytest.mark.asyncio
+    async def test_new_command_resets_session(self, adapter, mock_http, reset_fn) -> None:
+        await adapter._handle_update(_make_update(20, 42, 1, "/new"))
+        reset_fn.assert_called_once_with("tg:42")
+        assert any("new conversation" in t.lower() for t in _sent_texts(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_reset_command_alias(self, adapter, mock_http, reset_fn) -> None:
+        await adapter._handle_update(_make_update(21, 42, 1, "/reset"))
+        reset_fn.assert_called_once_with("tg:42")
+
+    @pytest.mark.asyncio
+    async def test_help_command_lists_commands(self, adapter, mock_http) -> None:
+        await adapter._handle_update(_make_update(22, 42, 1, "/help"))
+        assert any("/stop" in t for t in _sent_texts(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_unknown_command_reported(self, adapter, mock_http) -> None:
+        await adapter._handle_update(_make_update(23, 42, 1, "/frobnicate"))
+        assert any("Unknown command" in t for t in _sent_texts(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_stop_with_nothing_running(self, adapter, mock_http) -> None:
+        await adapter._handle_update(_make_update(24, 42, 1, "/stop"))
+        assert any("Nothing is running" in t for t in _sent_texts(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_running_turn(self, mock_http) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()  # never set — the turn blocks here
+
+        async def _blocking(_sid: str, _text: str) -> AsyncIterator[dict[str, Any]]:
+            yield {
+                "type": "tool_call",
+                "tool": "execute_terminal_command",
+                "params": {"command": "sleep 999"},
+            }
+            started.set()
+            await release.wait()
+            yield {"type": "text", "content": "never reached"}
+
+        a = TelegramAdapter(token="t", stream_fn=_blocking, reset_fn=lambda _s: True)
+        a._http = mock_http
+        a._allowed = None
+
+        turn = asyncio.create_task(a._handle_update(_make_update(25, 42, 1, "long task")))
+        await asyncio.wait_for(started.wait(), timeout=2)  # turn is mid-stream
+        await a._handle_command(42, "/stop")  # cancel out-of-band
+        await asyncio.wait_for(turn, timeout=2)
+
+        assert any("Stopped" in t for t in _sent_texts(mock_http))
+        assert not any("never reached" in t for t in _sent_texts(mock_http))

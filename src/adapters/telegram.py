@@ -47,6 +47,17 @@ _TYPING_REFRESH_S: float = 4.0
 # A streaming task runner: given (session_id, text) it yields the agent's
 # event stream — {"type": "tool_call"|"status"|"text"|"final_answer", ...}.
 StreamFn = Callable[[str, str], AsyncIterator[dict[str, Any]]]
+# Clears a session's history; returns True if a session existed.
+ResetFn = Callable[[str], bool]
+
+_WELCOME = "Hello! Send me a task and I'll get it done. Type /help for commands."
+_HELP = (
+    "Commands:\n"
+    "/new (or /reset) — start a fresh conversation\n"
+    "/stop — interrupt the current task\n"
+    "/help — show this message\n\n"
+    "Otherwise just send a message and I'll work on it."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -105,10 +116,11 @@ class TelegramAdapter:
         await adapter.shutdown()
     """
 
-    def __init__(self, token: str, stream_fn: StreamFn) -> None:
+    def __init__(self, token: str, stream_fn: StreamFn, reset_fn: ResetFn) -> None:
         self._token = token
         self._base = f"https://api.telegram.org/bot{token}"
         self._stream_fn = stream_fn
+        self._reset_fn = reset_fn
         self._allowed: frozenset[int] | None = _parse_int_set(
             os.getenv("TELEGRAM_ALLOWED_IDS", "")
         )
@@ -119,6 +131,8 @@ class TelegramAdapter:
         # Per-chat lock: serialise turns so one chat's history isn't mutated
         # by two concurrent agent runs.
         self._locks: dict[int, asyncio.Lock] = {}
+        # In-flight turn per chat, so /stop can interrupt it out-of-band.
+        self._turn_tasks: dict[int, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -244,24 +258,53 @@ class TelegramAdapter:
         from_user: dict[str, Any] = message.get("from") or {}
         user_id: int = int(from_user.get("id") or 0)
 
-        # /start command — send a welcome message and stop processing.
+        if not text:
+            return
+
+        # /start is a friendly greeting available to anyone who can reach the bot.
         if text == "/start":
-            await self._send_message(chat_id, "Hello! Send me a task and I'll get it done.")
+            await self._send_message(chat_id, _WELCOME)
             return
 
-        # Ignore other bot commands and empty/whitespace messages.
-        if text.startswith("/") or not text:
-            return
-
-        # Allowlist check.
+        # Allowlist gate for everything that follows.
         if self._allowed is not None and user_id not in self._allowed:
             await self._send_message(chat_id, "Access denied.")
             return
 
-        # Serialise turns within a chat so the agent's per-session history is
-        # not mutated by two concurrent runs.
+        # Slash commands are handled out-of-band (so /stop can interrupt a turn).
+        if text.startswith("/"):
+            await self._handle_command(chat_id, text)
+            return
+
+        # Normal message → run a streamed turn that /stop can cancel.
         async with self._chat_lock(chat_id):
-            await self._run_turn(chat_id, text)
+            task = asyncio.create_task(
+                self._run_turn(chat_id, text), name=f"tg:turn:{chat_id}"
+            )
+            self._turn_tasks[chat_id] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                await self._send_message(chat_id, "🛑 Stopped.")
+            finally:
+                self._turn_tasks.pop(chat_id, None)
+
+    async def _handle_command(self, chat_id: int, text: str) -> None:
+        """Handle an in-chat slash command (/new, /reset, /stop, /help)."""
+        cmd = text.split(maxsplit=1)[0].lower()
+        if cmd in ("/new", "/reset"):
+            self._reset_fn(f"tg:{chat_id}")
+            await self._send_message(chat_id, "🧹 Started a new conversation.")
+        elif cmd == "/stop":
+            task = self._turn_tasks.get(chat_id)
+            if task is not None and not task.done():
+                task.cancel()
+            else:
+                await self._send_message(chat_id, "Nothing is running.")
+        elif cmd == "/help":
+            await self._send_message(chat_id, _HELP)
+        else:
+            await self._send_message(chat_id, f"Unknown command {cmd}. Type /help.")
 
     async def _run_turn(self, chat_id: int, text: str) -> None:
         """Stream the agent's work to the chat: a live 'typing…' status, a

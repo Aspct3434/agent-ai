@@ -6,6 +6,7 @@ a line per tool call, then the final answer) back to the channel.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -103,8 +104,13 @@ def mock_http():
 
 
 @pytest.fixture
-def adapter(echo_stream_fn, mock_http):
-    a = DiscordAdapter(token="Bot-test-token", stream_fn=echo_stream_fn)
+def reset_fn():
+    return MagicMock(return_value=True)
+
+
+@pytest.fixture
+def adapter(echo_stream_fn, mock_http, reset_fn):
+    a = DiscordAdapter(token="Bot-test-token", stream_fn=echo_stream_fn, reset_fn=reset_fn)
     a._http = mock_http
     a._allowed = None
     return a
@@ -199,7 +205,7 @@ class TestDiscordStreaming:
             {"type": "tool_call", "tool": "web_search", "params": {"query": "minecraft jar"}},
             {"type": "text", "content": "done"},
         )
-        a = DiscordAdapter(token="t", stream_fn=stream)
+        a = DiscordAdapter(token="t", stream_fn=stream, reset_fn=lambda _s: True)
         a._http = mock_http
         a._allowed = None
         await a._handle_message(_make_msg("find it"))
@@ -211,7 +217,7 @@ class TestDiscordStreaming:
     @pytest.mark.asyncio
     async def test_long_final_answer_chunked(self, mock_http) -> None:
         stream = _stream_of({"type": "text", "content": "A" * 5000})
-        a = DiscordAdapter(token="t", stream_fn=stream)
+        a = DiscordAdapter(token="t", stream_fn=stream, reset_fn=lambda _s: True)
         a._http = mock_http
         a._allowed = None
         await a._handle_message(_make_msg("go"))
@@ -225,8 +231,65 @@ class TestDiscordStreaming:
             raise RuntimeError("Model offline")
             yield {}  # unreachable; marks this as an async generator
 
-        a = DiscordAdapter(token="t", stream_fn=_failing)
+        a = DiscordAdapter(token="t", stream_fn=_failing, reset_fn=lambda _s: True)
         a._http = mock_http
         a._allowed = None
         await a._handle_message(_make_msg("crash me"))
         assert any("Error" in m for m in _message_contents(mock_http))
+
+
+# ---------------------------------------------------------------------------
+# In-chat slash commands
+# ---------------------------------------------------------------------------
+
+
+class TestDiscordCommands:
+    @pytest.mark.asyncio
+    async def test_new_command_resets_session(self, adapter, mock_http, reset_fn) -> None:
+        await adapter._handle_message(_make_msg("/new", channel_id="c9"))
+        reset_fn.assert_called_once_with("discord:c9")
+        assert any("new conversation" in m.lower() for m in _message_contents(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_reset_command_alias(self, adapter, mock_http, reset_fn) -> None:
+        await adapter._handle_message(_make_msg("/reset", channel_id="c9"))
+        reset_fn.assert_called_once_with("discord:c9")
+
+    @pytest.mark.asyncio
+    async def test_help_command_lists_commands(self, adapter, mock_http) -> None:
+        await adapter._handle_message(_make_msg("/help"))
+        assert any("/stop" in m for m in _message_contents(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_unknown_command_reported(self, adapter, mock_http) -> None:
+        await adapter._handle_message(_make_msg("/frobnicate"))
+        assert any("Unknown command" in m for m in _message_contents(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_stop_with_nothing_running(self, adapter, mock_http) -> None:
+        await adapter._handle_message(_make_msg("/stop"))
+        assert any("Nothing is running" in m for m in _message_contents(mock_http))
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_running_turn(self, mock_http) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()  # never set — the turn blocks here
+
+        async def _blocking(_sid: str, _text: str) -> AsyncIterator[dict[str, Any]]:
+            yield {"type": "tool_call", "tool": "web_search", "params": {"query": "x"}}
+            started.set()
+            await release.wait()
+            yield {"type": "text", "content": "never reached"}
+
+        a = DiscordAdapter(token="t", stream_fn=_blocking, reset_fn=lambda _s: True)
+        a._http = mock_http
+        a._allowed = None
+
+        turn = asyncio.create_task(a._handle_message(_make_msg("long task", channel_id="c1")))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await a._handle_command("c1", "/stop")
+        await asyncio.wait_for(turn, timeout=2)
+
+        contents = _message_contents(mock_http)
+        assert any("Stopped" in m for m in contents)
+        assert not any("never reached" in m for m in contents)

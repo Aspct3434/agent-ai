@@ -74,6 +74,16 @@ _TYPING_REFRESH_S: float = 8.0
 # A streaming task runner: given (session_id, text) it yields the agent's
 # event stream — {"type": "tool_call"|"status"|"text"|"final_answer", ...}.
 StreamFn = Callable[[str, str], AsyncIterator[dict[str, Any]]]
+# Clears a session's history; returns True if a session existed.
+ResetFn = Callable[[str], bool]
+
+_HELP = (
+    "Commands:\n"
+    "`/new` (or `/reset`) — start a fresh conversation\n"
+    "`/stop` — interrupt the current task\n"
+    "`/help` — show this message\n\n"
+    "Otherwise just send a message and I'll work on it."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +140,10 @@ class DiscordAdapter:
         await adapter.shutdown()
     """
 
-    def __init__(self, token: str, stream_fn: StreamFn) -> None:
+    def __init__(self, token: str, stream_fn: StreamFn, reset_fn: ResetFn) -> None:
         self._token = token
         self._stream_fn = stream_fn
+        self._reset_fn = reset_fn
         self._auth_headers = {"Authorization": f"Bot {token}"}
         self._allowed: frozenset[str] | None = _parse_str_set(
             os.getenv("DISCORD_ALLOWED_USER_IDS", "")
@@ -147,6 +158,8 @@ class DiscordAdapter:
         # Per-channel lock: serialise turns so one channel's history isn't
         # mutated by two concurrent agent runs.
         self._locks: dict[str, asyncio.Lock] = {}
+        # In-flight turn per channel, so /stop can interrupt it out-of-band.
+        self._turn_tasks: dict[str, asyncio.Task[None]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -308,10 +321,40 @@ class DiscordAdapter:
 
         channel_id: str = str(data.get("channel_id") or "")
 
-        # Serialise turns within a channel so its history is not mutated by two
-        # concurrent agent runs.
+        # Slash commands are handled out-of-band (so /stop can interrupt a turn).
+        if content.startswith("/"):
+            await self._handle_command(channel_id, content)
+            return
+
+        # Normal message → run a streamed turn that /stop can cancel.
         async with self._channel_lock(channel_id):
-            await self._run_turn(channel_id, content)
+            task = asyncio.create_task(
+                self._run_turn(channel_id, content), name="discord:turn"
+            )
+            self._turn_tasks[channel_id] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                await self._post_message(channel_id, "🛑 Stopped.")
+            finally:
+                self._turn_tasks.pop(channel_id, None)
+
+    async def _handle_command(self, channel_id: str, content: str) -> None:
+        """Handle an in-chat slash command (/new, /reset, /stop, /help)."""
+        cmd = content.split(maxsplit=1)[0].lower()
+        if cmd in ("/new", "/reset"):
+            self._reset_fn(f"discord:{channel_id}")
+            await self._post_message(channel_id, "🧹 Started a new conversation.")
+        elif cmd == "/stop":
+            task = self._turn_tasks.get(channel_id)
+            if task is not None and not task.done():
+                task.cancel()
+            else:
+                await self._post_message(channel_id, "Nothing is running.")
+        elif cmd == "/help":
+            await self._post_message(channel_id, _HELP)
+        else:
+            await self._post_message(channel_id, f"Unknown command {cmd}. Type /help.")
 
     async def _run_turn(self, channel_id: str, content: str) -> None:
         """Stream the agent's work to the channel: a live typing indicator, a

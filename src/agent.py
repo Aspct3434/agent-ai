@@ -2269,6 +2269,14 @@ class AgentEngine:
         )
         return await sub_agent.process_task(sub_message)
 
+    def reset_session(self, session_id: str) -> bool:
+        """Drop a session's conversation history so the next turn starts fresh.
+
+        Returns ``True`` if a session existed and was cleared. Used by the
+        messaging adapters' ``/new`` / ``/reset`` commands.
+        """
+        return self._histories.pop(session_id, None) is not None
+
     def _touch_history(self, session_id: str) -> list[dict[str, Any]] | None:
         """Return the session's history, marking it most-recently-used (LRU)."""
         messages = self._histories.pop(session_id, None)

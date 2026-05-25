@@ -80,3 +80,8 @@ skills/
 
 # ── Accidental mkdir artifacts ────────────────────────────────────────────
 -p/
+
+# Vendored reference frameworks (not part of this project)
+hermes-agent-main/
+openclaw-main/
+*.zip
