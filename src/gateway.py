@@ -540,6 +540,34 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/status")
+async def status() -> dict[str, Any]:
+    """At-a-glance state for the dashboard Overview page."""
+    engine: AgentEngine = app.state.engine
+    skills = app.state.skill_registry.list_skills()
+    jobs = app.state.scheduler.list_jobs()
+    return {
+        "model": engine._model,
+        "fast_model": engine._fast_model,
+        "strong_model": engine._strong_model,
+        "sandbox": os.getenv("AGENT_SANDBOX", "") or "host",
+        "channels": {
+            "telegram": hasattr(app.state, "telegram_adapter"),
+            "discord": hasattr(app.state, "discord_adapter"),
+            "slack": hasattr(app.state, "slack_adapter"),
+        },
+        "skills": {
+            "count": len(skills),
+            "improved": sum(1 for s in skills if s.get("version", 1) > 1),
+        },
+        "cron": {
+            "count": len(jobs),
+            "enabled": sum(1 for j in jobs if j.get("enabled")),
+        },
+        "active_sessions": len(app.state.gateway.active_sessions),
+    }
+
+
 @app.post("/api/sessions/{session_id}/cancel")
 async def cancel_session(session_id: str) -> dict[str, Any]:
     task = app.state.active_stream_tasks.get(session_id)

@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
-import { Brain, CalendarClock, MessageSquare, Settings } from "lucide-react";
+import { Activity, Brain, CalendarClock, MessageSquare, Settings } from "lucide-react";
 import { api, type Health } from "../lib/api";
+import { OverviewPanel } from "./OverviewPanel";
 import { ChatInterface } from "./ChatInterface";
 import { SkillsPanel } from "./SkillsPanel";
 import { SchedulePanel } from "./SchedulePanel";
 import { SettingsPanel } from "./SettingsPanel";
 
-type Section = "chat" | "skills" | "schedule" | "settings";
+type Section = "overview" | "chat" | "skills" | "schedule" | "settings";
 
 const NAV: { id: Section; label: string; icon: typeof MessageSquare }[] = [
+  { id: "overview", label: "Overview", icon: Activity },
   { id: "chat", label: "Chat", icon: MessageSquare },
   { id: "skills", label: "Skills", icon: Brain },
   { id: "schedule", label: "Schedule", icon: CalendarClock },
@@ -38,7 +40,7 @@ function useHealth(): boolean | null {
 }
 
 export function Dashboard() {
-  const [section, setSection] = useState<Section>("chat");
+  const [section, setSection] = useState<Section>("overview");
   const health = useHealth();
 
   return (
@@ -94,6 +96,7 @@ export function Dashboard() {
           <ChatInterface />
         ) : (
           <div className="h-full overflow-y-auto bg-zinc-950 px-4 py-6 sm:px-8">
+            {section === "overview" && <OverviewPanel />}
             {section === "skills" && <SkillsPanel />}
             {section === "schedule" && <SchedulePanel />}
             {section === "settings" && <SettingsPanel />}

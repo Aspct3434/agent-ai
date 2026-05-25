@@ -67,3 +67,14 @@ export interface ModelConfig {
 }
 
 export type Health = { status: string };
+
+export interface Status {
+  model: string;
+  fast_model: string;
+  strong_model: string;
+  sandbox: string;
+  channels: { telegram: boolean; discord: boolean; slack: boolean };
+  skills: { count: number; improved: number };
+  cron: { count: number; enabled: number };
+  active_sessions: number;
+}
