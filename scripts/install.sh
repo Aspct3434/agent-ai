@@ -37,6 +37,122 @@ while [[ $# -gt 0 ]]; do
 done
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+step() { printf '==> %s\n' "$1" >&2; }
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+sudo_if_needed() {
+  if [[ "$(id -u)" -eq 0 ]]; then "$@"; elif have_cmd sudo; then sudo "$@"; else return 1; fi
+}
+
+python_satisfies() {
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
+}
+
+python_has_venv() {
+  "$1" -m venv --help >/dev/null 2>&1
+}
+
+find_python() {
+  local candidate
+  if [[ -n "${AGENT_PYTHON:-}" ]] && python_satisfies "$AGENT_PYTHON"; then
+    printf '%s' "$AGENT_PYTHON"
+    return 0
+  fi
+  for candidate in python3.13 python3.12 python3.11 python3 python; do
+    if have_cmd "$candidate" && python_satisfies "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_python_with_apt() {
+  local packages python_bin
+  sudo_if_needed apt-get update || return 1
+  for packages in \
+    "python3 python3-venv python3-pip" \
+    "python3.13 python3.13-venv python3-pip" \
+    "python3.12 python3.12-venv python3-pip" \
+    "python3.11 python3.11-venv python3-pip"; do
+    if sudo_if_needed apt-get install -y $packages; then
+      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+    fi
+  done
+  return 1
+}
+
+install_python_with_dnf() {
+  local packages python_bin
+  for packages in \
+    "python3 python3-pip" \
+    "python3.13 python3.13-pip" \
+    "python3.12 python3.12-pip" \
+    "python3.11 python3.11-pip"; do
+    if sudo_if_needed dnf install -y $packages; then
+      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+    fi
+  done
+  return 1
+}
+
+install_python_with_yum() {
+  local packages python_bin
+  for packages in \
+    "python3 python3-pip" \
+    "python3.12 python3.12-pip" \
+    "python3.11 python3.11-pip"; do
+    if sudo_if_needed yum install -y $packages; then
+      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+    fi
+  done
+  return 1
+}
+
+install_python_packages() {
+  if have_cmd apt-get; then install_python_with_apt && return 0; fi
+  if have_cmd dnf; then install_python_with_dnf && return 0; fi
+  if have_cmd yum; then install_python_with_yum && return 0; fi
+  if have_cmd pacman; then
+    local python_bin
+    if sudo_if_needed pacman -Sy --noconfirm python python-pip; then
+      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+    fi
+  fi
+  if have_cmd apk; then
+    local python_bin
+    if sudo_if_needed apk add --no-cache python3 py3-pip py3-virtualenv; then
+      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+    fi
+  fi
+  return 1
+}
+
+ensure_python() {
+  local python_bin=""
+  if python_bin="$(find_python)" && python_has_venv "$python_bin"; then
+    printf '%s' "$python_bin"
+    return 0
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf 'python3'
+    return 0
+  fi
+  step "Python 3.11+ with venv is missing; attempting OS package install"
+  if ! install_python_packages; then
+    echo "Python 3.11+ with venv is required. Install python3.11-venv or python3.12-venv, then rerun this installer." >&2
+    exit 1
+  fi
+  if ! python_bin="$(find_python)"; then
+    echo "Python 3.11+ is required, but the installed python is older or unavailable." >&2
+    exit 1
+  fi
+  if ! python_has_venv "$python_bin"; then
+    echo "Python venv support is required. Install the matching python venv package, then rerun this installer." >&2
+    exit 1
+  fi
+  printf '%s' "$python_bin"
+}
 
 prompt_value() {
   local label="$1" default="${2:-}" answer=""
@@ -221,8 +337,9 @@ if [[ "$NO_START" -eq 0 ]]; then
   if [[ "$sandbox" == "on" ]]; then
     (cd "$ROOT_DIR" && docker compose up -d --build)
   else
+    python_bin="$(ensure_python)"
     mkdir -p "$ROOT_DIR/logs"
-    (cd "$ROOT_DIR" && python -m venv .run-venv && . .run-venv/bin/activate && python -m pip install --upgrade pip && python -m pip install -r requirements.txt)
+    (cd "$ROOT_DIR" && "$python_bin" -m venv .run-venv && .run-venv/bin/python -m pip install --upgrade pip && .run-venv/bin/python -m pip install -r requirements.txt)
     (cd "$ROOT_DIR" && . .run-venv/bin/activate && set -a && . "$ENV_FILE" && set +a && nohup python -m uvicorn gateway:app --app-dir src --host 127.0.0.1 --port 8000 > logs/backend-local.stdout.log 2> logs/backend-local.stderr.log &)
     (cd "$ROOT_DIR/control-panel" && npm ci && nohup npm run dev -- --host 127.0.0.1 --port 5173 > ../logs/control-panel-dev.stdout.log 2> ../logs/control-panel-dev.stderr.log &)
   fi

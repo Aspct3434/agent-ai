@@ -58,6 +58,13 @@ def test_bash_scripts_parse() -> None:
     _run([bash, "-n", str(BASH_BOOTSTRAP)])
 
 
+def test_pywin32_requirement_is_windows_only() -> None:
+    text = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+    assert 'pywin32==311; sys_platform == "win32"' in text
+    assert "\npywin32==311\n" not in text
+
+
 def test_powershell_scripts_parse() -> None:
     shell = _powershell()
     for path in (POWERSHELL_INSTALLER, POWERSHELL_BOOTSTRAP):

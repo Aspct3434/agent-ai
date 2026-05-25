@@ -168,7 +168,7 @@ python-multipart==0.0.29
 
 pytz==2026.2
 
-pywin32==311
+pywin32==311; sys_platform == "win32"
 
 PyYAML==6.0.3
 
