@@ -95,6 +95,8 @@ MarkupSafe==3.0.3
 
 mcp==1.27.1
 
+mcp-server-sqlite==2025.4.25
+
 mdurl==0.1.2
 
 mmh3==5.2.1

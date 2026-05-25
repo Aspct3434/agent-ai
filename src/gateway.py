@@ -329,16 +329,29 @@ async def lifespan(app: FastAPI):
         logger.info("Docker sandbox mode disabled — running commands on host")
 
     tools = ToolManager()
-    await tools.connect_server(
-        name="sqlite",
-        command=_find_sqlite_server(),
-        args=["--db-path", str(db_path)],
-    )
+    # A missing/broken optional MCP server must never take down the whole
+    # gateway — otherwise the UI just shows "disconnected". Each connect is
+    # isolated so the API still comes up (in a degraded mode) on failure.
+    try:
+        await tools.connect_server(
+            name="sqlite",
+            command=_find_sqlite_server(),
+            args=["--db-path", str(db_path)],
+        )
+    except Exception as exc:
+        logger.warning(
+            "SQLite MCP server unavailable (%s); continuing without it. "
+            "Install it with: pip install mcp-server-sqlite",
+            exc,
+        )
     try:
         await tools.connect_filesystem_server(data_dir)
     except RuntimeError:
         pass
-    await tools.connect_skills_server(skills_dir)
+    try:
+        await tools.connect_skills_server(skills_dir)
+    except Exception as exc:
+        logger.warning("Skills MCP server unavailable (%s); continuing without it.", exc)
 
     # -- Persona ----------------------------------------------------------
     persona = PersonaLoader(persona_dir if persona_dir.exists() else None)
