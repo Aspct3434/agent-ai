@@ -427,22 +427,28 @@ async def lifespan(app: FastAPI):
     from adapters.telegram import TelegramAdapter
     from adapters.discord_bot import DiscordAdapter
 
-    async def _adapter_send(session_id: str, text: str) -> str:
-        result = await gw.send(session_id, {"text": text})
-        if result.error:
-            raise RuntimeError(result.error)
-        return str(result.output)
+    async def _adapter_stream(session_id: str, text: str):
+        """Stream the agent's live progress (tool calls + final answer) so
+        messaging adapters can surface what the agent is doing, OpenClaw-style.
+
+        Same-session ordering is enforced inside each adapter (per-chat lock),
+        mirroring how the WebSocket UI drives ``stream_task`` directly.
+        """
+        async for event in engine.stream_task(
+            NormalizedMessage(session_id=session_id, role="user", content=text)
+        ):
+            yield event
 
     telegram_adapter: TelegramAdapter | None = None
     discord_adapter: DiscordAdapter | None = None
 
     if tg_token := os.getenv("TELEGRAM_BOT_TOKEN"):
-        telegram_adapter = TelegramAdapter(token=tg_token, send_fn=_adapter_send)
+        telegram_adapter = TelegramAdapter(token=tg_token, stream_fn=_adapter_stream)
         await telegram_adapter.start()
         app.state.telegram_adapter = telegram_adapter
 
     if dc_token := os.getenv("DISCORD_BOT_TOKEN"):
-        discord_adapter = DiscordAdapter(token=dc_token, send_fn=_adapter_send)
+        discord_adapter = DiscordAdapter(token=dc_token, stream_fn=_adapter_stream)
         await discord_adapter.start()
         app.state.discord_adapter = discord_adapter
 

@@ -1,7 +1,9 @@
 """Discord Gateway adapter — raw WebSocket, zero extra dependencies.
 
 Connects to the Discord Gateway WebSocket, receives ``MESSAGE_CREATE``
-events, and routes them to the Agent Gateway via the injected *send_fn*.
+events, and streams each agent turn back to the channel via the injected
+*stream_fn*: a live typing indicator, a concise line per tool the agent
+runs, then the final answer.
 
 Session scoping
 ---------------
@@ -29,11 +31,14 @@ import json
 import logging
 import os
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 from typing import Any
 
 import httpx
 from websockets.asyncio.client import connect as ws_connect
+
+from adapters._progress import format_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +68,12 @@ _INTENTS: int = (
 
 # Discord's hard limit on outgoing message length (characters).
 _MSG_LIMIT: int = 2000
+# Discord clears a typing indicator after ~10 s, so refresh it sooner.
+_TYPING_REFRESH_S: float = 8.0
 
-SendFn = Callable[[str, str], Awaitable[str]]
+# A streaming task runner: given (session_id, text) it yields the agent's
+# event stream — {"type": "tool_call"|"status"|"text"|"final_answer", ...}.
+StreamFn = Callable[[str, str], AsyncIterator[dict[str, Any]]]
 
 
 # ---------------------------------------------------------------------------
@@ -115,15 +124,15 @@ class DiscordAdapter:
     Typical usage::
 
         adapter = DiscordAdapter(token=os.environ["DISCORD_BOT_TOKEN"],
-                                 send_fn=my_send_fn)
+                                 stream_fn=my_stream_fn)
         await adapter.start()
         # ... server runs ...
         await adapter.shutdown()
     """
 
-    def __init__(self, token: str, send_fn: SendFn) -> None:
+    def __init__(self, token: str, stream_fn: StreamFn) -> None:
         self._token = token
-        self._send_fn = send_fn
+        self._stream_fn = stream_fn
         self._auth_headers = {"Authorization": f"Bot {token}"}
         self._allowed: frozenset[str] | None = _parse_str_set(
             os.getenv("DISCORD_ALLOWED_USER_IDS", "")
@@ -135,6 +144,9 @@ class DiscordAdapter:
         self._running: bool = False
         self._task: asyncio.Task[None] | None = None
         self._http: httpx.AsyncClient | None = None
+        # Per-channel lock: serialise turns so one channel's history isn't
+        # mutated by two concurrent agent runs.
+        self._locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -296,19 +308,61 @@ class DiscordAdapter:
 
         channel_id: str = str(data.get("channel_id") or "")
 
-        # Typing indicator — best-effort; failure does not abort the reply.
-        await self._trigger_typing(channel_id)
+        # Serialise turns within a channel so its history is not mutated by two
+        # concurrent agent runs.
+        async with self._channel_lock(channel_id):
+            await self._run_turn(channel_id, content)
 
+    async def _run_turn(self, channel_id: str, content: str) -> None:
+        """Stream the agent's work to the channel: a live typing indicator, a
+        concise line per tool the agent runs, then the final answer.
+        """
         session_id = f"discord:{channel_id}"
+        # Show the typing indicator immediately, then keep it alive.
+        await self._trigger_typing(channel_id)
+        typing = asyncio.create_task(
+            self._typing_loop(channel_id), name="discord:typing"
+        )
+        final = ""
         try:
-            reply: str = await self._send_fn(session_id, content)
+            async for event in self._stream_fn(session_id, content):
+                etype = event.get("type")
+                if etype == "tool_call":
+                    line = format_tool_call(
+                        str(event.get("tool") or ""), event.get("params") or {}
+                    )
+                    if line:
+                        await self._post_message(channel_id, line)
+                elif etype in ("text", "final_answer"):
+                    final = str(event.get("content") or final)
         except Exception as exc:
-            reply = f"⚠️ Error: {exc}"
+            final = f"⚠️ Error: {exc}"
+        finally:
+            typing.cancel()
+            with suppress(asyncio.CancelledError):
+                await typing
 
-        reply_text = str(reply).strip()
-        if reply_text:
-            for chunk in _chunk_text(reply_text):
+        final = final.strip()
+        if final:
+            for chunk in _chunk_text(final):
                 await self._post_message(channel_id, chunk)
+
+    def _channel_lock(self, channel_id: str) -> asyncio.Lock:
+        lock = self._locks.get(channel_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[channel_id] = lock
+        return lock
+
+    async def _typing_loop(self, channel_id: str) -> None:
+        """Refresh the channel typing indicator until cancelled.
+
+        The first indicator is sent by the caller; this loop only re-sends it
+        before Discord's ~10 s timeout clears it.
+        """
+        while True:
+            await asyncio.sleep(_TYPING_REFRESH_S)
+            await self._trigger_typing(channel_id)
 
     async def _trigger_typing(self, channel_id: str) -> None:
         assert self._http is not None

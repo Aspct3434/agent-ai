@@ -1,8 +1,9 @@
 """Telegram Bot API adapter — long-polling, zero extra dependencies.
 
 One ``TelegramAdapter`` instance runs per process.  It long-polls
-``getUpdates`` on the Telegram Bot API and routes each incoming message
-to the Agent Gateway via the injected *send_fn*.
+``getUpdates`` on the Telegram Bot API and streams each agent turn back to
+the chat via the injected *stream_fn*: a live "typing…" status, a concise
+line per tool the agent runs, then the final answer.
 
 Session scoping
 ---------------
@@ -24,10 +25,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 from typing import Any
 
 import httpx
+
+from adapters._progress import format_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +41,12 @@ _POLL_TIMEOUT_S: int = 30
 _HTTP_TIMEOUT_S: float = float(_POLL_TIMEOUT_S + 5)
 # Telegram's hard limit on outgoing message length (characters).
 _MSG_LIMIT: int = 4096
+# Telegram clears a chat action after ~5 s, so refresh "typing…" faster than that.
+_TYPING_REFRESH_S: float = 4.0
 
-SendFn = Callable[[str, str], Awaitable[str]]
+# A streaming task runner: given (session_id, text) it yields the agent's
+# event stream — {"type": "tool_call"|"status"|"text"|"final_answer", ...}.
+StreamFn = Callable[[str, str], AsyncIterator[dict[str, Any]]]
 
 
 # ---------------------------------------------------------------------------
@@ -91,16 +99,16 @@ class TelegramAdapter:
     Typical usage::
 
         adapter = TelegramAdapter(token=os.environ["TELEGRAM_BOT_TOKEN"],
-                                  send_fn=my_send_fn)
+                                  stream_fn=my_stream_fn)
         await adapter.start()
         # ... server runs ...
         await adapter.shutdown()
     """
 
-    def __init__(self, token: str, send_fn: SendFn) -> None:
+    def __init__(self, token: str, stream_fn: StreamFn) -> None:
         self._token = token
         self._base = f"https://api.telegram.org/bot{token}"
-        self._send_fn = send_fn
+        self._stream_fn = stream_fn
         self._allowed: frozenset[int] | None = _parse_int_set(
             os.getenv("TELEGRAM_ALLOWED_IDS", "")
         )
@@ -108,6 +116,9 @@ class TelegramAdapter:
         self._running: bool = False
         self._task: asyncio.Task[None] | None = None
         self._http: httpx.AsyncClient | None = None
+        # Per-chat lock: serialise turns so one chat's history isn't mutated
+        # by two concurrent agent runs.
+        self._locks: dict[int, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -247,18 +258,74 @@ class TelegramAdapter:
             await self._send_message(chat_id, "Access denied.")
             return
 
-        await self._send_message(chat_id, "⏳ Working on it…")
+        # Serialise turns within a chat so the agent's per-session history is
+        # not mutated by two concurrent runs.
+        async with self._chat_lock(chat_id):
+            await self._run_turn(chat_id, text)
 
+    async def _run_turn(self, chat_id: int, text: str) -> None:
+        """Stream the agent's work to the chat: a live 'typing…' status, a
+        concise line per tool the agent runs, then the final answer.
+        """
         session_id = f"tg:{chat_id}"
+        # Show "typing…" in the chat immediately (instead of an "On it"
+        # message), then keep it alive for the whole turn.
+        await self._send_chat_action(chat_id, "typing")
+        typing = asyncio.create_task(
+            self._typing_loop(chat_id), name=f"tg:typing:{chat_id}"
+        )
+        final = ""
         try:
-            reply: str = await self._send_fn(session_id, text)
+            async for event in self._stream_fn(session_id, text):
+                etype = event.get("type")
+                if etype == "tool_call":
+                    line = format_tool_call(
+                        str(event.get("tool") or ""), event.get("params") or {}
+                    )
+                    if line:
+                        await self._send_message(chat_id, line)
+                elif etype in ("text", "final_answer"):
+                    final = str(event.get("content") or final)
         except Exception as exc:
-            reply = f"⚠️ Error: {exc}"
+            final = f"⚠️ Error: {exc}"
+        finally:
+            typing.cancel()
+            with suppress(asyncio.CancelledError):
+                await typing
 
-        reply_text = str(reply).strip()
-        if reply_text:
-            for chunk in _chunk_text(reply_text):
+        final = final.strip()
+        if final:
+            for chunk in _chunk_text(final):
                 await self._send_message(chat_id, chunk)
+
+    def _chat_lock(self, chat_id: int) -> asyncio.Lock:
+        lock = self._locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[chat_id] = lock
+        return lock
+
+    async def _typing_loop(self, chat_id: int) -> None:
+        """Refresh the 'typing…' chat action until cancelled.
+
+        The first action is sent by the caller; this loop only re-sends it
+        before Telegram's ~5 s timeout clears it.
+        """
+        while True:
+            await asyncio.sleep(_TYPING_REFRESH_S)
+            await self._send_chat_action(chat_id, "typing")
+
+    async def _send_chat_action(self, chat_id: int, action: str) -> None:
+        """Show a transient chat action (e.g. 'typing…') in the chat header."""
+        assert self._http is not None
+        try:
+            await self._http.post(
+                f"{self._base}/sendChatAction",
+                json={"chat_id": chat_id, "action": action},
+                timeout=15.0,
+            )
+        except Exception as exc:
+            logger.debug("Telegram sendChatAction failed (chat=%s): %s", chat_id, exc)
 
     async def _send_message(self, chat_id: int, text: str) -> None:
         """POST a message to a Telegram chat; logs warnings on failure."""

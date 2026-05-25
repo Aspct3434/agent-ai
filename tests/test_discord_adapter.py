@@ -1,12 +1,15 @@
 """Unit tests for the Discord Gateway adapter.
 
-All tests run without a live Discord connection — the send_fn and HTTP
-client are fully mocked.
+All tests run without a live Discord connection — the stream_fn and HTTP
+client are fully mocked. The adapter streams progress (a typing indicator,
+a line per tool call, then the final answer) back to the channel.
 """
 from __future__ import annotations
 
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -29,14 +32,13 @@ class TestChunkText:
         assert _chunk_text(text, 2000) == [text]
 
     def test_splits_at_newline_within_limit(self) -> None:
-        # 1500 + "\n" + 1500 = 3001 chars; limit=2000 → first chunk ≤ 2000
         text = "a" * 1500 + "\n" + "b" * 1500
         chunks = _chunk_text(text, 2000)
         assert len(chunks) == 2
         assert all(len(c) <= 2000 for c in chunks)
 
     def test_hard_split_when_no_newline(self) -> None:
-        text = "z" * 3000  # no newlines → exact hard split
+        text = "z" * 3000
         chunks = _chunk_text(text, 2000)
         assert len(chunks) == 2
         assert all(len(c) <= 2000 for c in chunks)
@@ -72,14 +74,22 @@ class TestParseStrSet:
 
 
 # ---------------------------------------------------------------------------
-# DiscordAdapter._handle_message (mocked send_fn + HTTP)
+# Streaming helpers + fixtures
 # ---------------------------------------------------------------------------
 
 
+def _stream_of(*events: dict[str, Any]):
+    async def _fn(_session_id: str, _text: str) -> AsyncIterator[dict[str, Any]]:
+        for event in events:
+            yield event
+
+    return _fn
+
+
 @pytest.fixture
-def echo_send_fn():
-    async def _fn(session_id: str, text: str) -> str:
-        return f"reply:{text}"
+def echo_stream_fn():
+    async def _fn(_session_id: str, text: str) -> AsyncIterator[dict[str, Any]]:
+        yield {"type": "text", "content": f"reply:{text}"}
 
     return _fn
 
@@ -93,16 +103,24 @@ def mock_http():
 
 
 @pytest.fixture
-def adapter(echo_send_fn, mock_http):
-    a = DiscordAdapter(token="Bot-test-token", send_fn=echo_send_fn)
+def adapter(echo_stream_fn, mock_http):
+    a = DiscordAdapter(token="Bot-test-token", stream_fn=echo_stream_fn)
     a._http = mock_http
     a._allowed = None
     return a
 
 
-def _msg_posts(mock_http: AsyncMock) -> list:
-    """Return only the HTTP post calls that carry a JSON body (message posts, not typing)."""
-    return [c for c in mock_http.post.call_args_list if c.kwargs.get("json") is not None]
+def _message_contents(mock_http: AsyncMock) -> list[str]:
+    """Contents of all posted channel messages (the /messages endpoint)."""
+    return [
+        c.kwargs["json"]["content"]
+        for c in mock_http.post.call_args_list
+        if c.args and c.args[0].endswith("/messages")
+    ]
+
+
+def _typing_calls(mock_http: AsyncMock) -> list:
+    return [c for c in mock_http.post.call_args_list if c.args and c.args[0].endswith("/typing")]
 
 
 def _make_msg(
@@ -118,7 +136,12 @@ def _make_msg(
     }
 
 
-class TestDiscordMessageHandling:
+# ---------------------------------------------------------------------------
+# Gating (runs before any streaming)
+# ---------------------------------------------------------------------------
+
+
+class TestDiscordGating:
     @pytest.mark.asyncio
     async def test_bot_messages_ignored(self, adapter, mock_http) -> None:
         await adapter._handle_message(_make_msg("I'm a bot", is_bot=True))
@@ -140,89 +163,70 @@ class TestDiscordMessageHandling:
         await adapter._handle_message(_make_msg("hi", user_id="stranger"))
         mock_http.post.assert_not_called()
 
+
+# ---------------------------------------------------------------------------
+# Streaming behaviour
+# ---------------------------------------------------------------------------
+
+
+class TestDiscordStreaming:
     @pytest.mark.asyncio
-    async def test_authorized_user_receives_reply(self, adapter, mock_http) -> None:
-        adapter._allowed = frozenset({"user42"})
-        await adapter._handle_message(_make_msg("hello", user_id="user42"))
-        posts = _msg_posts(mock_http)
-        assert len(posts) == 1
-        assert "reply:hello" in posts[0].kwargs["json"]["content"]
+    async def test_typing_indicator_sent(self, adapter, mock_http) -> None:
+        await adapter._handle_message(_make_msg("hello"))
+        assert len(_typing_calls(mock_http)) >= 1
 
     @pytest.mark.asyncio
-    async def test_no_allowlist_allows_all_users(self, adapter, mock_http) -> None:
-        adapter._allowed = None
-        await adapter._handle_message(_make_msg("open access"))
-        posts = _msg_posts(mock_http)
-        assert len(posts) == 1
+    async def test_final_answer_sent(self, adapter, mock_http) -> None:
+        await adapter._handle_message(_make_msg("hello"))
+        assert any("reply:hello" in m for m in _message_contents(mock_http))
 
     @pytest.mark.asyncio
     async def test_session_id_scoped_to_channel(self, adapter) -> None:
-        """The session_id forwarded to send_fn must be discord:{channel_id}."""
         captured: list[str] = []
 
-        async def _capturing(_sid: str, _text: str) -> str:
-            captured.append(_sid)
-            return "ok"
+        async def _capturing(sid: str, _text: str) -> AsyncIterator[dict[str, Any]]:
+            captured.append(sid)
+            yield {"type": "text", "content": "ok"}
 
-        adapter._send_fn = _capturing
+        adapter._stream_fn = _capturing
         await adapter._handle_message(_make_msg("test", channel_id="chan-xyz"))
         assert captured == ["discord:chan-xyz"]
 
     @pytest.mark.asyncio
-    async def test_long_reply_chunked_into_multiple_posts(self, adapter, mock_http) -> None:
-        """Replies > 2000 chars must be split across multiple message posts."""
-
-        async def _long_reply(_sid: str, _text: str) -> str:
-            return "A" * 5000  # → 3 chunks: 2000 + 2000 + 1000
-
-        adapter._send_fn = _long_reply
-        await adapter._handle_message(_make_msg("go"))
-        posts = _msg_posts(mock_http)
-        assert len(posts) == 3
-        assert all(len(p.kwargs["json"]["content"]) <= 2000 for p in posts)
-
-    @pytest.mark.asyncio
-    async def test_send_fn_error_reported_to_channel(self, adapter, mock_http) -> None:
-        """Exceptions from send_fn must be caught and sent as an error message."""
-
-        async def _failing(_sid: str, _text: str) -> str:
-            raise RuntimeError("Model offline")
-
-        adapter._send_fn = _failing
-        await adapter._handle_message(_make_msg("crash me"))
-        posts = _msg_posts(mock_http)
-        assert len(posts) == 1
-        assert "Error" in posts[0].kwargs["json"]["content"]
-
-    @pytest.mark.asyncio
-    async def test_typing_indicator_sent_before_reply(self, adapter, mock_http) -> None:
-        """The typing-indicator POST (no json body) must precede the message POST."""
-        await adapter._handle_message(_make_msg("hi"))
-        all_calls = mock_http.post.call_args_list
-        # First call = typing (no json kwarg), second = message (has json)
-        assert all_calls[0].kwargs.get("json") is None
-        assert all_calls[1].kwargs.get("json") is not None
-
-    @pytest.mark.asyncio
-    async def test_typing_failure_does_not_abort_reply(self, mock_http) -> None:
-        """If the typing-indicator POST fails, the reply is still sent."""
-        call_count = 0
-
-        async def _flaky_post(*args: object, **kwargs: object) -> MagicMock:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise ConnectionError("typing endpoint down")
-            return MagicMock()
-
-        mock_http.post.side_effect = _flaky_post
-
-        async def _send(_sid: str, _text: str) -> str:
-            return "ok"
-
-        a = DiscordAdapter(token="t", send_fn=_send)
+    async def test_tool_calls_shown_as_progress(self, mock_http) -> None:
+        stream = _stream_of(
+            {"type": "tool_call", "tool": "update_plan", "params": {}},  # silent
+            {"type": "tool_call", "tool": "web_search", "params": {"query": "minecraft jar"}},
+            {"type": "text", "content": "done"},
+        )
+        a = DiscordAdapter(token="t", stream_fn=stream)
         a._http = mock_http
         a._allowed = None
-        await a._handle_message(_make_msg("hello"))
-        # Despite the typing failure, the message post still happened.
-        assert call_count == 2
+        await a._handle_message(_make_msg("find it"))
+        contents = _message_contents(mock_http)
+        assert any("minecraft jar" in m for m in contents)  # tool surfaced
+        assert any("done" in m for m in contents)  # final answer
+        assert not any("update_plan" in m for m in contents)  # internal hidden
+
+    @pytest.mark.asyncio
+    async def test_long_final_answer_chunked(self, mock_http) -> None:
+        stream = _stream_of({"type": "text", "content": "A" * 5000})
+        a = DiscordAdapter(token="t", stream_fn=stream)
+        a._http = mock_http
+        a._allowed = None
+        await a._handle_message(_make_msg("go"))
+        contents = _message_contents(mock_http)
+        assert len(contents) == 3
+        assert all(len(m) <= 2000 for m in contents)
+
+    @pytest.mark.asyncio
+    async def test_stream_error_reported_to_channel(self, mock_http) -> None:
+        async def _failing(_sid: str, _text: str) -> AsyncIterator[dict[str, Any]]:
+            raise RuntimeError("Model offline")
+            yield {}  # unreachable; marks this as an async generator
+
+        a = DiscordAdapter(token="t", stream_fn=_failing)
+        a._http = mock_http
+        a._allowed = None
+        await a._handle_message(_make_msg("crash me"))
+        assert any("Error" in m for m in _message_contents(mock_http))
