@@ -85,6 +85,7 @@ jobs:
                  tests/test_tui.py \
                  tests/test_oauth.py \
                  tests/test_session_store.py \
+                 tests/test_approvals.py \
                  -v --tb=short
         env:
           PYTHONPATH: src

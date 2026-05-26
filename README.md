@@ -240,6 +240,10 @@ POST {url}/exec  {command, cwd, timeout, stdin?, background?, log_path?}
 
 That ~20-line shim is the entire provider integration — no SDK is baked into the repo.
 
+## Command approval (human-in-the-loop)
+
+Set `AGENT_REQUIRE_APPROVAL=risky` (or `all`) and the agent **pauses before running shell commands** until you approve them. A banner appears in the dashboard (Approve / Deny); unanswered requests auto-deny after `AGENT_APPROVAL_TIMEOUT` seconds. `risky` matches dangerous patterns (`sudo`, `rm -rf`, `curl … | sh`, `git push --force`, `docker rm`, fork bombs, …); `off` (default) keeps current behavior. Endpoints: `GET /api/approvals`, `POST /api/approvals/{id}`.
+
 ## Cross-session memory (recall)
 
 Every user/assistant turn is indexed in a full-text store (SQLite FTS5, with a LIKE fallback). The agent can search its **own past conversations across all prior sessions** with the `recall_memory` tool ("what did we decide about X last week?"), and you can search them from the dashboard (Memory → *Recall past conversations*) or `GET /api/sessions/search?q=…`.
