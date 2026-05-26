@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSoc
 from pydantic import BaseModel, Field
 
 from agent import AgentEngine, NormalizedMessage
+from auth.oauth import CodexOAuth, wait_for_callback
 from checkpointer import StateCheckpointer, initialize_checkpoints_db
 from evaluator import SkillDistiller, SkillRegistry
 from memory import UserProfileStore
@@ -451,6 +452,11 @@ async def lifespan(app: FastAPI):
             )
         )
 
+    # -- Codex OAuth (sign-in alternative to a pasted API key) ------------
+    oauth = CodexOAuth()
+    oauth.ensure_fresh()  # refresh + re-inject OPENAI_API_KEY if a token exists
+    app.state.oauth = oauth
+
     gw = Gateway(handler)
     app.state.tools = tools
     app.state.distiller = distiller
@@ -636,6 +642,46 @@ async def get_logs(level: str = "ALL", limit: int = 200) -> list[dict[str, Any]]
 async def clear_logs() -> dict[str, str]:
     _log_buffer.clear()
     return {"status": "cleared"}
+
+
+# ---------------------------------------------------------------------------
+# Codex OAuth API
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/auth/status")
+async def auth_status() -> dict[str, Any]:
+    return app.state.oauth.status()
+
+
+@app.post("/api/auth/login")
+async def auth_login() -> dict[str, Any]:
+    """Start the OAuth flow: return the authorize URL and await the callback.
+
+    The browser is opened client-side to the returned URL; the provider then
+    redirects to the local callback (port 1455) which a background task awaits.
+    """
+    oauth: CodexOAuth = app.state.oauth
+    url = oauth.authorize_url()
+
+    async def _await_callback() -> None:
+        try:
+            result = await asyncio.to_thread(wait_for_callback, 300.0)
+            if result.get("error"):
+                logger.warning("OAuth callback error: %s", result["error"])
+                return
+            await asyncio.to_thread(oauth.complete, result["code"], result["state"])
+        except Exception as exc:
+            logger.warning("OAuth login flow failed: %s", exc)
+
+    asyncio.create_task(_await_callback())  # noqa: RUF006
+    return {"authorize_url": url}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout() -> dict[str, str]:
+    app.state.oauth.logout()
+    return {"status": "signed_out"}
 
 
 @app.post("/api/sessions/{session_id}/cancel")

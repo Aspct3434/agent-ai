@@ -83,6 +83,7 @@ jobs:
                  tests/test_skill_standard.py \
                  tests/test_skill_evolution.py \
                  tests/test_tui.py \
+                 tests/test_oauth.py \
                  -v --tb=short
         env:
           PYTHONPATH: src

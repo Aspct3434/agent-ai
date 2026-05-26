@@ -143,6 +143,16 @@ Open `http://localhost:8000` for the API. Docker Compose serves the chat UI at `
 | `AGENT_USE_HYBRID_MEMORY` | `true` | Enable ChromaDB + Neo4j memory |
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j (optional; falls back to Chroma-only) |
 
+## Sign in with OpenAI (Codex OAuth)
+
+Instead of pasting an `OPENAI_API_KEY`, you can sign in with your ChatGPT/OpenAI account. An OAuth 2.0 + PKCE flow against `auth.openai.com` (public Codex client) mints an API key from your account, stores it at `AGENT_AUTH_FILE` (`~/.agent-ai/codex_auth.json`), refreshes it, and injects it into `OPENAI_API_KEY` so LiteLLM uses it.
+
+- **Dashboard:** Settings → Authentication → **Sign in with OpenAI**.
+- **CLI:** `PYTHONPATH=src python -m auth login` (also `status` / `logout`).
+- **Gateway:** `POST /api/auth/login` → open the returned URL; `GET /api/auth/status`; `POST /api/auth/logout`.
+
+The browser redirects to `http://localhost:1455/auth/callback`, so this works for host/local runs. (Heads-up: OpenAI's hosted login couldn't be exercised end-to-end here — if the token-exchange shape has changed, only the request payloads in `src/auth/oauth.py` need adjusting; the surrounding PKCE flow is standard.)
+
 ## Local models (Ollama / vLLM / OpenRouter)
 
 The agent uses [LiteLLM](https://docs.litellm.ai/docs/providers) internally, so any provider it supports works — just change `AGENT_MODEL` and supply the matching API key.

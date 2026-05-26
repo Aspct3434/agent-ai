@@ -66,6 +66,15 @@ export interface ModelConfig {
   strong_model: string;
 }
 
+export interface AuthStatus {
+  method: string; // "oauth" | "api_key" | "none"
+  signed_in: boolean;
+  email: string;
+  account_id: string;
+  expires_at: number | null;
+  client_id: string;
+}
+
 export type Health = { status: string };
 
 export interface Tool {
