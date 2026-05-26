@@ -49,7 +49,12 @@ python_satisfies() {
 }
 
 python_has_venv() {
-  "$1" -m venv --help >/dev/null 2>&1
+  local probe_dir status
+  probe_dir="$(mktemp -d 2>/dev/null || mktemp -d -t agent-ai-venv-probe)"
+  "$1" -m venv "$probe_dir/venv" >/dev/null 2>&1
+  status=$?
+  rm -rf "$probe_dir"
+  return "$status"
 }
 
 find_python() {
@@ -67,6 +72,21 @@ find_python() {
   return 1
 }
 
+find_python_with_venv() {
+  local candidate
+  if [[ -n "${AGENT_PYTHON:-}" ]] && python_satisfies "$AGENT_PYTHON" && python_has_venv "$AGENT_PYTHON"; then
+    printf '%s' "$AGENT_PYTHON"
+    return 0
+  fi
+  for candidate in python3.13 python3.12 python3.11 python3 python; do
+    if have_cmd "$candidate" && python_satisfies "$candidate" && python_has_venv "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 install_python_with_apt() {
   local packages python_bin
   sudo_if_needed apt-get update || return 1
@@ -76,7 +96,7 @@ install_python_with_apt() {
     "python3.12 python3.12-venv python3-pip" \
     "python3.11 python3.11-venv python3-pip"; do
     if sudo_if_needed apt-get install -y $packages; then
-      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+      if python_bin="$(find_python_with_venv)"; then return 0; fi
     fi
   done
   return 1
@@ -90,7 +110,7 @@ install_python_with_dnf() {
     "python3.12 python3.12-pip" \
     "python3.11 python3.11-pip"; do
     if sudo_if_needed dnf install -y $packages; then
-      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+      if python_bin="$(find_python_with_venv)"; then return 0; fi
     fi
   done
   return 1
@@ -103,7 +123,7 @@ install_python_with_yum() {
     "python3.12 python3.12-pip" \
     "python3.11 python3.11-pip"; do
     if sudo_if_needed yum install -y $packages; then
-      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+      if python_bin="$(find_python_with_venv)"; then return 0; fi
     fi
   done
   return 1
@@ -116,13 +136,13 @@ install_python_packages() {
   if have_cmd pacman; then
     local python_bin
     if sudo_if_needed pacman -Sy --noconfirm python python-pip; then
-      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+      if python_bin="$(find_python_with_venv)"; then return 0; fi
     fi
   fi
   if have_cmd apk; then
     local python_bin
     if sudo_if_needed apk add --no-cache python3 py3-pip py3-virtualenv; then
-      if python_bin="$(find_python)" && python_has_venv "$python_bin"; then return 0; fi
+      if python_bin="$(find_python_with_venv)"; then return 0; fi
     fi
   fi
   return 1
@@ -130,7 +150,7 @@ install_python_packages() {
 
 ensure_python() {
   local python_bin=""
-  if python_bin="$(find_python)" && python_has_venv "$python_bin"; then
+  if python_bin="$(find_python_with_venv)"; then
     printf '%s' "$python_bin"
     return 0
   fi
@@ -138,8 +158,8 @@ ensure_python() {
     printf 'python3'
     return 0
   fi
-  step "Python 3.11+ with venv is missing; attempting OS package install"
-  if ! install_python_packages; then
+  step "Python 3.11+ with venv is missing; attempting OS package install" >&2
+  if ! install_python_packages >&2; then
     echo "Python 3.11+ with venv is required. Install python3.11-venv or python3.12-venv, then rerun this installer." >&2
     exit 1
   fi
@@ -147,11 +167,34 @@ ensure_python() {
     echo "Python 3.11+ is required, but the installed python is older or unavailable." >&2
     exit 1
   fi
-  if ! python_has_venv "$python_bin"; then
+  if ! python_bin="$(find_python_with_venv)"; then
     echo "Python venv support is required. Install the matching python venv package, then rerun this installer." >&2
     exit 1
   fi
   printf '%s' "$python_bin"
+}
+
+project_venv_python() {
+  printf '%s' "$ROOT_DIR/.run-venv/bin/python"
+}
+
+project_venv_usable() {
+  local venv_python
+  venv_python="$(project_venv_python)"
+  [[ -x "$venv_python" ]] && "$venv_python" -m pip --version >/dev/null 2>&1
+}
+
+ensure_project_venv() {
+  local python_bin="$1"
+  if project_venv_usable; then
+    step "Using existing virtual environment at $ROOT_DIR/.run-venv"
+    return 0
+  fi
+  if [[ -d "$ROOT_DIR/.run-venv" ]]; then
+    step "Removing incomplete virtual environment at $ROOT_DIR/.run-venv"
+    rm -rf "$ROOT_DIR/.run-venv"
+  fi
+  (cd "$ROOT_DIR" && "$python_bin" -m venv .run-venv)
 }
 
 prompt_value() {
@@ -339,7 +382,8 @@ if [[ "$NO_START" -eq 0 ]]; then
   else
     python_bin="$(ensure_python)"
     mkdir -p "$ROOT_DIR/logs"
-    (cd "$ROOT_DIR" && "$python_bin" -m venv .run-venv && .run-venv/bin/python -m pip install --upgrade pip && .run-venv/bin/python -m pip install -r requirements.txt)
+    ensure_project_venv "$python_bin"
+    (cd "$ROOT_DIR" && .run-venv/bin/python -m pip install --upgrade pip && .run-venv/bin/python -m pip install -r requirements.txt)
     (cd "$ROOT_DIR" && . .run-venv/bin/activate && set -a && . "$ENV_FILE" && set +a && nohup python -m uvicorn gateway:app --app-dir src --host 127.0.0.1 --port 8000 > logs/backend-local.stdout.log 2> logs/backend-local.stderr.log &)
     (cd "$ROOT_DIR/control-panel" && npm ci && nohup npm run dev -- --host 127.0.0.1 --port 5173 > ../logs/control-panel-dev.stdout.log 2> ../logs/control-panel-dev.stderr.log &)
   fi

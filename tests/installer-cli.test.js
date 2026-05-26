@@ -132,6 +132,35 @@ function assertIncludes(text, expected) {
   assertIncludes(result.stdout, "npx @aspct3434/agent-ai doctor");
 }
 
+{
+  const { __testing } = require(path.join(root, "lib", "agent-ai-cli.js"));
+  const fakeDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-ai-fake-python-"));
+  const workingPython = path.join(fakeDir, "working-python.js");
+  const brokenPython = path.join(fakeDir, "broken-python.js");
+  fs.writeFileSync(
+    workingPython,
+    [
+      "const fs = require('fs');",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === '-m' && args[1] === 'venv') { fs.mkdirSync(args[2], { recursive: true }); process.exit(0); }",
+      "process.exit(0);"
+    ].join("\n"),
+    "utf8"
+  );
+  fs.writeFileSync(
+    brokenPython,
+    [
+      "const args = process.argv.slice(2);",
+      "if (args[0] === '-m' && args[1] === 'venv') process.exit(1);",
+      "process.exit(0);"
+    ].join("\n"),
+    "utf8"
+  );
+
+  assert.strictEqual(__testing.pythonHasVenv(process.execPath, [workingPython]), true);
+  assert.strictEqual(__testing.pythonHasVenv(process.execPath, [brokenPython]), false);
+}
+
 // Secret prompts echo one "*" per character on an interactive terminal so the
 // user gets visible feedback without revealing the token (OpenClaw-style).
 {
