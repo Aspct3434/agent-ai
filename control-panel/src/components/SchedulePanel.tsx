@@ -96,14 +96,14 @@ export function SchedulePanel() {
           <button
             type="button"
             onClick={() => void load()}
-            className="flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-violet-500 hover:text-white"
+            className="flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-violet-600 hover:text-white"
           >
             <RefreshCw size={13} /> Refresh
           </button>
           <button
             type="button"
             onClick={() => setShowForm((v) => !v)}
-            className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs text-white hover:bg-violet-500"
+            className="flex items-center gap-1.5 rounded-lg bg-violet-700 px-3 py-1.5 text-xs text-white hover:bg-violet-600"
           >
             <Plus size={13} /> New task
           </button>
@@ -126,7 +126,7 @@ export function SchedulePanel() {
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="Task for the agent to run on schedule…"
-            className="resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-500"
+            className="resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-600"
           />
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="flex flex-col gap-1 text-xs text-zinc-400">
@@ -134,7 +134,7 @@ export function SchedulePanel() {
               <select
                 value={scheduleType}
                 onChange={(e) => setScheduleType(e.target.value as typeof scheduleType)}
-                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-500"
+                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-600"
               >
                 {SCHEDULE_TYPES.map((t) => (
                   <option key={t} value={t}>
@@ -155,7 +155,7 @@ export function SchedulePanel() {
                       ? "0 9 * * 1  (Mon 9am)"
                       : "2026-06-01T12:00:00Z"
                 }
-                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-100 outline-none focus:border-violet-500"
+                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-100 outline-none focus:border-violet-600"
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-zinc-400">
@@ -163,7 +163,7 @@ export function SchedulePanel() {
               <input
                 value={label}
                 onChange={(e) => setLabel(e.target.value)}
-                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-500"
+                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-600"
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-zinc-400">
@@ -172,7 +172,7 @@ export function SchedulePanel() {
                 value={deliverTo}
                 onChange={(e) => setDeliverTo(e.target.value)}
                 placeholder="tg:12345 / discord:67890 / slack:C123"
-                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-100 outline-none focus:border-violet-500"
+                className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 font-mono text-sm text-zinc-100 outline-none focus:border-violet-600"
               />
             </label>
           </div>
@@ -186,7 +186,7 @@ export function SchedulePanel() {
             </button>
             <button
               type="submit"
-              className="rounded-lg bg-violet-600 px-4 py-1.5 text-xs text-white hover:bg-violet-500"
+              className="rounded-lg bg-violet-700 px-4 py-1.5 text-xs text-white hover:bg-violet-600"
             >
               Schedule
             </button>

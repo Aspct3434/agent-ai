@@ -49,7 +49,7 @@ export function SkillsPanel() {
         <button
           type="button"
           onClick={() => void load()}
-          className="ml-auto flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-violet-500 hover:text-white"
+          className="ml-auto flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-violet-600 hover:text-white"
         >
           <RefreshCw size={13} /> Refresh
         </button>

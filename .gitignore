@@ -86,3 +86,6 @@ skills/
 hermes-agent-main/
 openclaw-main/
 *.zip
+
+# Design reference bundle (not committed)
+_design_ref/

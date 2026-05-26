@@ -111,7 +111,7 @@ function StatusDot({ status }: { status: string }) {
 function UserBubble({ text }: { text: string }) {
   return (
     <div className="flex justify-end">
-      <p className="max-w-[78%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-violet-600 px-4 py-2.5 text-sm text-white">
+      <p className="max-w-[78%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-violet-700 px-4 py-2.5 text-sm text-white">
         {text}
       </p>
     </div>
@@ -401,7 +401,7 @@ export function ChatInterface() {
             disabled={!canNavigateHistory}
             aria-label="New chat"
             title="New chat"
-            className="ml-auto flex size-11 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-200 transition-colors hover:border-violet-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+            className="ml-auto flex size-11 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-200 transition-colors hover:border-violet-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
           >
             <Plus size={17} />
           </button>
@@ -467,7 +467,7 @@ export function ChatInterface() {
             onChange={(event) => handleSelectConversation(event.target.value)}
             disabled={!canNavigateHistory}
             aria-label="Chat history"
-            className="ml-auto max-w-[45vw] rounded-lg border border-zinc-700 bg-zinc-800 px-2 py-2 text-xs text-zinc-100 outline-none focus:border-violet-500 disabled:opacity-50 md:hidden"
+            className="ml-auto max-w-[45vw] rounded-lg border border-zinc-700 bg-zinc-800 px-2 py-2 text-xs text-zinc-100 outline-none focus:border-violet-600 disabled:opacity-50 md:hidden"
           >
             {conversations.map((conversation) => (
               <option key={conversation.id} value={conversation.id}>
@@ -481,7 +481,7 @@ export function ChatInterface() {
             disabled={!canNavigateHistory}
             aria-label="New chat"
             title="New chat"
-            className="flex size-11 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-800 text-zinc-200 transition-colors hover:border-violet-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40 md:hidden"
+            className="flex size-11 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-800 text-zinc-200 transition-colors hover:border-violet-600 hover:text-white disabled:cursor-not-allowed disabled:opacity-40 md:hidden"
           >
             <Plus size={17} />
           </button>
@@ -535,7 +535,7 @@ export function ChatInterface() {
                     : "Waiting for connection..."
               }
               disabled={status !== "connected" || isAgentBusy}
-              className="min-h-11 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
+              className="min-h-11 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-800 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 outline-none transition-colors focus:border-violet-600 disabled:cursor-not-allowed disabled:opacity-50"
             />
             <button
               type="button"
@@ -551,7 +551,7 @@ export function ChatInterface() {
               type="submit"
               disabled={!canSend}
               aria-label="Send message"
-              className="flex size-11 shrink-0 items-center justify-center rounded-lg bg-violet-600 text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
+              className="flex size-11 shrink-0 items-center justify-center rounded-lg bg-violet-700 text-white transition-colors hover:bg-violet-600 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <Send size={17} />
             </button>
