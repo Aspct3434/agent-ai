@@ -74,6 +74,21 @@ export interface Tool {
   description: string;
 }
 
+export interface LogEntry {
+  time: number;
+  level: string;
+  name: string;
+  message: string;
+}
+
+export interface PersonaInfo {
+  persona_dir: string | null;
+  active_persona: string | null;
+  available_personas: string[];
+  content_length: number;
+  loaded: boolean;
+}
+
 export interface Status {
   model: string;
   fast_model: string;

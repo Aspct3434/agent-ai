@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -32,6 +32,50 @@ from scheduler import CronScheduler, _validate_schedule
 from tools import ToolManager
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-memory log ring buffer (powers the dashboard Logs panel)
+# ---------------------------------------------------------------------------
+
+_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+
+
+class _LogRingBuffer(logging.Handler):
+    """Keep the most recent log records in memory for the /api/logs endpoint."""
+
+    def __init__(self, capacity: int = 500) -> None:
+        super().__init__()
+        self._records: deque[dict[str, Any]] = deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._records.append({
+                "time": record.created,
+                "level": record.levelname,
+                "name": record.name,
+                "message": record.getMessage(),
+            })
+        except Exception:
+            pass
+
+    def snapshot(self, level: str = "ALL", limit: int = 200) -> list[dict[str, Any]]:
+        items = list(self._records)
+        if level and level != "ALL":
+            floor = _LOG_LEVELS.get(level.upper(), 0)
+            items = [r for r in items if _LOG_LEVELS.get(r["level"], 0) >= floor]
+        return items[-limit:]
+
+    def clear(self) -> None:
+        self._records.clear()
+
+
+# Attach once at import so the buffer captures startup logs too.
+_log_buffer = _LogRingBuffer()
+_log_buffer.setLevel(logging.INFO)
+_root_logger = logging.getLogger()
+if _root_logger.level == 0 or _root_logger.level > logging.INFO:
+    _root_logger.setLevel(logging.INFO)
+_root_logger.addHandler(_log_buffer)
 
 # ---------------------------------------------------------------------------
 # Rate limiting
@@ -580,6 +624,18 @@ async def list_tools() -> list[dict[str, Any]]:
         }
         for t in tools
     ]
+
+
+@app.get("/api/logs")
+async def get_logs(level: str = "ALL", limit: int = 200) -> list[dict[str, Any]]:
+    """Recent gateway/agent log records (in-memory ring buffer)."""
+    return _log_buffer.snapshot(level=level, limit=max(1, min(limit, 500)))
+
+
+@app.delete("/api/logs")
+async def clear_logs() -> dict[str, str]:
+    _log_buffer.clear()
+    return {"status": "cleared"}
 
 
 @app.post("/api/sessions/{session_id}/cancel")

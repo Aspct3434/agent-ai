@@ -18,6 +18,7 @@ import { SettingsPanel } from "./SettingsPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { PersonaPanel } from "./PersonaPanel";
 import { ToolsPanel } from "./ToolsPanel";
+import { LogsPanel } from "./LogsPanel";
 
 type Section =
   | "overview"
@@ -112,28 +113,6 @@ function NavGroup({ label }: { label: string }) {
   );
 }
 
-function PlaceholderPanel({
-  icon: Icon,
-  title,
-  blurb,
-}: {
-  icon: typeof MessageSquare;
-  title: string;
-  blurb: string;
-}) {
-  return (
-    <div className="mx-auto flex max-w-3xl flex-col gap-4">
-      <div className="flex items-center gap-3">
-        <Icon className="text-violet-400" size={20} />
-        <h2 className="text-lg font-semibold text-zinc-100">{title}</h2>
-      </div>
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-6 py-10 text-center text-sm leading-relaxed text-zinc-500">
-        {blurb}
-      </div>
-    </div>
-  );
-}
-
 export function Dashboard() {
   const [section, setSection] = useState<Section>("overview");
   const health = useHealth();
@@ -203,13 +182,7 @@ export function Dashboard() {
             {section === "persona" && <PersonaPanel />}
             {section === "settings" && <SettingsPanel />}
             {section === "tools" && <ToolsPanel />}
-            {section === "logs" && (
-              <PlaceholderPanel
-                icon={Activity}
-                title="Logs"
-                blurb="Live gateway logs, per-session tool traces, and error replays. (Streaming log viewer coming soon.)"
-              />
-            )}
+            {section === "logs" && <LogsPanel />}
           </div>
         )}
       </div>
