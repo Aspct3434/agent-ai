@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSoc
 from pydantic import BaseModel, Field
 
 from agent import AgentEngine, NormalizedMessage
+from approvals import ApprovalGate
 from auth.oauth import CodexOAuth, wait_for_callback
 from checkpointer import StateCheckpointer, initialize_checkpoints_db
 from evaluator import SkillDistiller, SkillRegistry
@@ -425,6 +426,9 @@ async def lifespan(app: FastAPI):
         os.getenv("AGENT_SESSION_DB", str(data_dir / "sessions.db"))
     )
 
+    # -- Command-approval gate (human-in-the-loop for risky commands) -----
+    approval_gate = ApprovalGate()
+
     # -- Engine -----------------------------------------------------------
     engine = AgentEngine(
         memory=memory,
@@ -438,6 +442,7 @@ async def lifespan(app: FastAPI):
         skill_registry=skill_registry,
         persona_content=persona_content,
         session_store=session_store,
+        approval_gate=approval_gate,
     )
 
     # -- Cron scheduler ---------------------------------------------------
@@ -475,6 +480,7 @@ async def lifespan(app: FastAPI):
     app.state.skill_registry = skill_registry
     app.state.scheduler = scheduler
     app.state.session_store = session_store
+    app.state.approval_gate = approval_gate
     app.state.gateway = gw
     app.state.active_stream_tasks = {}
 
@@ -665,6 +671,29 @@ async def get_logs(level: str = "ALL", limit: int = 200) -> list[dict[str, Any]]
 async def clear_logs() -> dict[str, str]:
     _log_buffer.clear()
     return {"status": "cleared"}
+
+
+# ---------------------------------------------------------------------------
+# Command-approval API (human-in-the-loop)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/approvals")
+async def list_approvals() -> dict[str, Any]:
+    gate = app.state.approval_gate
+    return {"mode": gate.mode, "pending": gate.pending()}
+
+
+class ApprovalDecision(BaseModel):
+    approved: bool
+
+
+@app.post("/api/approvals/{request_id}")
+async def resolve_approval(request_id: str, payload: ApprovalDecision) -> dict[str, Any]:
+    resolved = app.state.approval_gate.resolve(request_id, payload.approved)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Approval request not found or already resolved")
+    return {"request_id": request_id, "approved": payload.approved}
 
 
 # ---------------------------------------------------------------------------

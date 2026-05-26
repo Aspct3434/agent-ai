@@ -824,6 +824,7 @@ class AgentEngine:
         skill_registry: SkillRegistry | None = None,
         persona_content: str = "",
         session_store: Any = None,
+        approval_gate: Any = None,
     ) -> None:
         self._memory = memory
         self._tools = tools
@@ -845,6 +846,7 @@ class AgentEngine:
         self._scheduler = scheduler
         self._skill_registry = skill_registry
         self._session_store = session_store
+        self._approval_gate = approval_gate
         self._histories: dict[str, list[dict[str, Any]]] = {}
 
     def update_models(
@@ -1857,6 +1859,9 @@ class AgentEngine:
                 logger.warning("delegate_task raised: %s", exc)
                 return f"[delegate_task error] {exc}", True, "__builtin__"
         if tool_name == "execute_terminal_command":
+            denial = await self._check_approval(arguments.get("command", ""), session_id)
+            if denial is not None:
+                return json.dumps({"status": "denied", "reason": denial}), True, "__builtin__"
             try:
                 result = await self._tools.execute_terminal_command(arguments["command"])
                 return json.dumps(result), int(result.get("exit_code", -1)) != 0, "__builtin__"
@@ -1872,6 +1877,9 @@ class AgentEngine:
                     "__builtin__",
                 )
         if tool_name == "execute_background_service":
+            denial = await self._check_approval(arguments.get("command", ""), session_id)
+            if denial is not None:
+                return json.dumps({"status": "denied", "reason": denial}), True, "__builtin__"
             try:
                 result = self._tools.execute_background_service(arguments["command"])
                 return json.dumps(result), result.get("status") == "error", "__builtin__"
@@ -2086,6 +2094,17 @@ class AgentEngine:
         if self._skill_registry is None:
             return json.dumps({"skills": [], "note": "Skill registry not configured on this engine."})
         return json.dumps({"skills": self._skill_registry.list_skills()}, indent=2)
+
+    async def _check_approval(self, command: str, session_id: str) -> str | None:
+        """Return a denial reason if a command needs and fails human approval.
+
+        Returns ``None`` when approval is off, not required, or granted.
+        """
+        gate = self._approval_gate
+        if gate is None or not gate.requires_approval(command):
+            return None
+        approved, reason = await gate.request(command, session_id)
+        return None if approved else reason
 
     def _record_turn(self, session_id: str, role: str, content: str) -> None:
         """Append a turn to the cross-session memory store (fire-and-forget)."""

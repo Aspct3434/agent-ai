@@ -83,6 +83,18 @@ export interface Tool {
   description: string;
 }
 
+export interface ApprovalRequest {
+  id: string;
+  command: string;
+  session_id: string;
+  created_at: number;
+}
+
+export interface ApprovalsState {
+  mode: string;
+  pending: ApprovalRequest[];
+}
+
 export interface SessionMatch {
   session_id: string;
   role: string;
