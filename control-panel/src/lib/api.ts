@@ -68,6 +68,12 @@ export interface ModelConfig {
 
 export type Health = { status: string };
 
+export interface Tool {
+  name: string;
+  server: string;
+  description: string;
+}
+
 export interface Status {
   model: string;
   fast_model: string;

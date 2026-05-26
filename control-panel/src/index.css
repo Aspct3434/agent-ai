@@ -23,6 +23,38 @@
   50% { opacity: 0.35; }
 }
 
+/* Section fade + slide-up when switching nav items. */
+@keyframes agentai-section-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.section-enter { animation: agentai-section-enter 280ms cubic-bezier(0.4, 0, 0.2, 1); }
+
+/* Streaming chat event slide-in. */
+@keyframes agentai-event-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.event-enter { animation: agentai-event-enter 240ms cubic-bezier(0.4, 0, 0.2, 1); }
+
+/* Card hover lift (stat / skill / job cards). */
+.lift {
+  transition: transform 200ms cubic-bezier(0.4, 0, 0.2, 1), border-color 200ms, background 200ms;
+}
+.lift:hover { transform: translateY(-1px); border-color: #3f3f46 !important; }
+
+/* Success-rate / progress bar grow on load. */
+@keyframes agentai-bar-grow {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+.bar-grow { transform-origin: left; animation: agentai-bar-grow 640ms cubic-bezier(0.4, 0, 0.2, 1); }
+
+@media (prefers-reduced-motion: reduce) {
+  .section-enter, .event-enter, .bar-grow { animation: none; }
+  .lift { transition: none; }
+}
+
 /* ── Scrollbar — WebKit (Chrome, Edge, Safari) ─────────────────────────── */
 
 ::-webkit-scrollbar {

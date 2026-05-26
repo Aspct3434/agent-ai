@@ -77,7 +77,7 @@ export function SkillsPanel() {
         {skills.map((skill) => (
           <div
             key={skill.name}
-            className="flex flex-col gap-2 rounded-lg border border-zinc-800 bg-zinc-900 p-4"
+            className="lift flex flex-col gap-2 rounded-lg border border-zinc-800 bg-zinc-900 p-4"
           >
             <div className="flex items-center gap-2">
               <Sparkles size={15} className="text-violet-400" />
@@ -135,6 +135,19 @@ export function SkillsPanel() {
                 {ratePct(skill.success_rate)} success
               </span>
               <span className="ml-auto">used {fmtDate(skill.last_used)}</span>
+            </div>
+
+            <div className="h-1 overflow-hidden rounded-full bg-zinc-800" title="Success rate">
+              <div
+                className={`bar-grow h-full rounded-full ${
+                  skill.success_rate >= 0.8
+                    ? "bg-emerald-500"
+                    : skill.success_rate >= 0.5
+                      ? "bg-amber-500"
+                      : "bg-red-500"
+                }`}
+                style={{ width: `${Math.round(skill.success_rate * 100)}%` }}
+              />
             </div>
           </div>
         ))}

@@ -568,6 +568,20 @@ async def status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/tools")
+async def list_tools() -> list[dict[str, Any]]:
+    """The agent's live tool inventory (builtins + connected MCP servers)."""
+    tools = await app.state.tools.list_all_tools()
+    return [
+        {
+            "name": t.get("name", ""),
+            "server": t.get("server", ""),
+            "description": (t.get("description") or "")[:200],
+        }
+        for t in tools
+    ]
+
+
 @app.post("/api/sessions/{session_id}/cancel")
 async def cancel_session(session_id: str) -> dict[str, Any]:
     task = app.state.active_stream_tasks.get(session_id)

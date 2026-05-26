@@ -10,12 +10,19 @@ import {
   Send,
 } from "lucide-react";
 import { api, type Status } from "../lib/api";
+import { useCountUp } from "../lib/useCountUp";
 
 const CHANNEL_META: { key: keyof Status["channels"]; label: string; icon: typeof Send }[] = [
   { key: "telegram", label: "Telegram", icon: Send },
   { key: "discord", label: "Discord", icon: MessageCircle },
   { key: "slack", label: "Slack", icon: Radio },
 ];
+
+function StatValue({ value }: { value: string | number }) {
+  const isNum = typeof value === "number";
+  const counted = useCountUp(isNum ? value : 0);
+  return <>{isNum ? counted : value}</>;
+}
 
 function StatCard({
   icon: Icon,
@@ -29,12 +36,14 @@ function StatCard({
   sub?: string;
 }) {
   return (
-    <div className="flex flex-col gap-1 rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+    <div className="lift flex flex-col gap-1 rounded-xl border border-zinc-800 bg-zinc-900 p-4">
       <div className="flex items-center gap-2 text-zinc-400">
         <Icon size={16} className="text-violet-400" />
         <span className="text-xs font-medium uppercase tracking-wide">{label}</span>
       </div>
-      <div className="text-2xl font-semibold text-zinc-100">{value}</div>
+      <div className="text-2xl font-semibold text-zinc-100">
+        <StatValue value={value} />
+      </div>
       {sub && <div className="text-xs text-zinc-500">{sub}</div>}
     </div>
   );

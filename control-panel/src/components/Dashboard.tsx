@@ -17,6 +17,7 @@ import { SchedulePanel } from "./SchedulePanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { PersonaPanel } from "./PersonaPanel";
+import { ToolsPanel } from "./ToolsPanel";
 
 type Section =
   | "overview"
@@ -191,20 +192,17 @@ export function Dashboard() {
         {section === "chat" ? (
           <ChatInterface />
         ) : (
-          <div className="h-full overflow-y-auto bg-zinc-950 px-4 py-6 sm:px-8">
+          <div
+            key={section}
+            className="section-enter h-full overflow-y-auto bg-zinc-950 px-4 py-6 sm:px-8"
+          >
             {section === "overview" && <OverviewPanel />}
             {section === "skills" && <SkillsPanel />}
             {section === "schedule" && <SchedulePanel />}
             {section === "memory" && <MemoryPanel />}
             {section === "persona" && <PersonaPanel />}
             {section === "settings" && <SettingsPanel />}
-            {section === "tools" && (
-              <PlaceholderPanel
-                icon={Wrench}
-                title="Tools"
-                blurb="MCP servers, terminal, file, process, and port tools. Inspect, enable, and configure each adapter. (Live tool inventory coming soon.)"
-              />
-            )}
+            {section === "tools" && <ToolsPanel />}
             {section === "logs" && (
               <PlaceholderPanel
                 icon={Activity}

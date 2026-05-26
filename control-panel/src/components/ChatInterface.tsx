@@ -503,7 +503,9 @@ export function ChatInterface() {
               <div className="flex flex-col gap-3">
                 <UserBubble text={activeUserText} />
                 {events.map((event, index) => (
-                  <EventRow key={`live-${index}`} event={event} />
+                  <div key={`live-${index}`} className="event-enter">
+                    <EventRow event={event} />
+                  </div>
                 ))}
                 {streamingText ? (
                   <StreamingTextBubble text={streamingText} />
