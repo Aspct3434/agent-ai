@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 
 from adapters._progress import format_tool_call
+from adapters._telegram_format import html_to_plain, render_telegram_html_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -345,10 +346,7 @@ class TelegramAdapter:
             with suppress(asyncio.CancelledError):
                 await typing
 
-        final = final.strip()
-        if final:
-            for chunk in _chunk_text(final):
-                await self._send_message(chat_id, chunk)
+        await self._send_rich(chat_id, final)
 
     def _chat_lock(self, chat_id: int) -> asyncio.Lock:
         lock = self._locks.get(chat_id)
@@ -429,20 +427,59 @@ class TelegramAdapter:
 
     async def deliver(self, chat_id: int, text: str) -> None:
         """Send a (possibly long) message to a chat — used for scheduled delivery."""
-        text = str(text).strip()
-        if not text:
-            return
-        for chunk in _chunk_text(text):
-            await self._send_message(chat_id, chunk)
+        await self._send_rich(chat_id, text)
 
-    async def _send_message(self, chat_id: int, text: str) -> None:
-        """POST a message to a Telegram chat; logs warnings on failure."""
+    async def _send_rich(self, chat_id: int, markdown: str) -> None:
+        """Render the agent's Markdown as Telegram HTML and send it in chunks.
+
+        Each chunk is sent with ``parse_mode=HTML`` so bold, code blocks,
+        links and bullets render natively; if Telegram rejects the markup
+        (``ok: false``), :meth:`_send_message` retries that chunk as plain
+        text so the content always arrives.
+        """
+        markdown = str(markdown).strip()
+        if not markdown:
+            return
+        for chunk in render_telegram_html_chunks(markdown):
+            await self._send_message(chat_id, chunk, parse_mode="HTML")
+
+    async def _send_message(
+        self, chat_id: int, text: str, *, parse_mode: str | None = None
+    ) -> None:
+        """POST a message to a Telegram chat; logs warnings on failure.
+
+        With *parse_mode* set, a Telegram parse rejection (``ok: false``,
+        usually "can't parse entities") triggers one retry as plain text so a
+        formatting glitch never swallows the message.
+        """
         assert self._http is not None
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         try:
-            await self._http.post(
-                f"{self._base}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=15.0,
+            resp = await self._http.post(
+                f"{self._base}/sendMessage", json=payload, timeout=15.0
             )
         except Exception as exc:
             logger.warning("Telegram sendMessage failed (chat=%s): %s", chat_id, exc)
+            return
+
+        if not parse_mode:
+            return
+        try:
+            data = resp.json()
+        except Exception:
+            return
+        if isinstance(data, dict) and data.get("ok") is False:
+            logger.warning(
+                "Telegram rejected %s message (chat=%s): %s — retrying as plain text",
+                parse_mode,
+                chat_id,
+                data.get("description"),
+            )
+            with suppress(Exception):
+                await self._http.post(
+                    f"{self._base}/sendMessage",
+                    json={"chat_id": chat_id, "text": html_to_plain(text)},
+                    timeout=15.0,
+                )

@@ -146,6 +146,15 @@ def _sent_texts(mock_http: AsyncMock) -> list[str]:
     ]
 
 
+def _sent_messages(mock_http: AsyncMock) -> list[dict]:
+    """All sendMessage JSON payloads (text + parse_mode)."""
+    return [
+        c.kwargs["json"]
+        for c in mock_http.post.call_args_list
+        if c.args and "sendMessage" in c.args[0]
+    ]
+
+
 def _chat_actions(mock_http: AsyncMock) -> list:
     """All sendChatAction calls (typing indicators)."""
     return [
@@ -254,6 +263,63 @@ class TestTelegramStreaming:
         a._allowed = None
         await a._handle_update(_make_update(10, 42, 1, "crash"))
         assert any("Error" in t for t in _sent_texts(mock_http))
+
+
+class TestTelegramRichFormatting:
+    @pytest.mark.asyncio
+    async def test_final_answer_sent_as_html_with_bold(self, mock_http) -> None:
+        stream = _stream_of({"type": "text", "content": "## Done\n\n**all good**"})
+        a = TelegramAdapter(token="t", stream_fn=stream, reset_fn=lambda _s: True)
+        a._http = mock_http
+        a._allowed = None
+        await a._handle_update(_make_update(40, 42, 1, "go"))
+
+        msgs = [m for m in _sent_messages(mock_http) if m["text"]]
+        answer = msgs[-1]
+        assert answer["parse_mode"] == "HTML"
+        assert "<b>Done</b>" in answer["text"]
+        assert "<b>all good</b>" in answer["text"]
+        assert "**" not in answer["text"]
+        assert "##" not in answer["text"]
+
+    @pytest.mark.asyncio
+    async def test_tool_progress_lines_stay_plain(self, mock_http) -> None:
+        stream = _stream_of(
+            {
+                "type": "tool_call",
+                "tool": "execute_terminal_command",
+                "params": {"command": "ls -la"},
+            },
+            {"type": "text", "content": "done"},
+        )
+        a = TelegramAdapter(token="t", stream_fn=stream, reset_fn=lambda _s: True)
+        a._http = mock_http
+        a._allowed = None
+        await a._handle_update(_make_update(41, 42, 1, "go"))
+
+        tool_msg = next(m for m in _sent_messages(mock_http) if "ls -la" in m["text"])
+        assert "parse_mode" not in tool_msg  # progress lines are sent as plain text
+
+    @pytest.mark.asyncio
+    async def test_html_rejection_falls_back_to_plain(self) -> None:
+        # First sendMessage (HTML) is rejected; adapter must retry as plain text.
+        responses = [
+            MagicMock(json=MagicMock(return_value={"ok": False, "description": "can't parse entities"})),
+            MagicMock(json=MagicMock(return_value={"ok": True})),
+        ]
+        http = AsyncMock()
+        http.post = AsyncMock(side_effect=responses)
+        a = TelegramAdapter(token="t", stream_fn=_stream_of(), reset_fn=lambda _s: True)
+        a._http = http
+        a._allowed = None
+
+        await a._send_rich(42, "**bold**")
+
+        sent = [c.kwargs["json"] for c in http.post.call_args_list]
+        assert sent[0]["parse_mode"] == "HTML"
+        assert sent[0]["text"] == "<b>bold</b>"
+        assert "parse_mode" not in sent[1]  # plain-text retry
+        assert sent[1]["text"] == "bold"  # tags stripped
 
 
 # ---------------------------------------------------------------------------

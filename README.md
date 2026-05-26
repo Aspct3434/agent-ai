@@ -173,9 +173,9 @@ Model strings follow the `ollama/<name>` convention (`ollama/llama3.2`, `ollama/
 
 See `ollama.env.example` for the full provider reference (Anthropic, OpenAI, Gemini, Azure).
 
-## Messaging adapters (Telegram / Discord / Slack)
+## Messaging adapters (Telegram / Discord / Slack / Email)
 
-The agent can receive and reply to messages on Telegram, Discord, and Slack alongside the browser control panel. Adapters are **disabled by default** and start only when their bot token(s) are present. On every channel the bot:
+The agent can receive and reply to messages on Telegram, Discord, Slack, and Email alongside the browser control panel. Adapters are **disabled by default** and start only when their bot token(s) are present. On every channel the bot:
 
 - shows a **live typing indicator** and streams **what it's executing** (a line per tool call) before the final answer;
 - supports in-chat commands: **`/new`** or **`/reset`** (fresh conversation), **`/stop`** (interrupt the current task), **`/help`**;
@@ -214,7 +214,21 @@ The agent can receive and reply to messages on Telegram, Discord, and Slack alon
    SLACK_ALLOWED_USERS=<comma-separated user_ids>   # omit to allow everyone
    ```
 
-Each Telegram chat, Discord channel, and Slack channel gets its own isolated session, so conversation history is scoped correctly per chat.
+**Email**
+
+Works with any IMAP/SMTP provider — the agent polls the inbox for unread mail, runs the task, and replies to the sender with its answer plus a compact list of what it did. For Gmail, create an [App Password](https://support.google.com/accounts/answer/185833) (regular passwords won't work with IMAP).
+
+1. Add to `an-api.env`:
+   ```
+   EMAIL_ADDRESS=you@gmail.com
+   EMAIL_PASSWORD=<app password>
+   EMAIL_IMAP_HOST=imap.gmail.com
+   EMAIL_SMTP_HOST=smtp.gmail.com
+   EMAIL_ALLOWED_SENDERS=<comma-separated From addresses>   # omit to allow everyone
+   ```
+2. Restart the server — the adapter polls every `EMAIL_POLL_INTERVAL` seconds (default 20). Unlike the live chat channels, replies arrive as a single email once the task completes.
+
+Each Telegram chat, Discord channel, Slack channel, and email sender gets its own isolated session, so conversation history is scoped correctly per conversation.
 
 **Voice notes (Telegram)** — set `AGENT_TRANSCRIBE_MODEL` (e.g. `whisper-1`, or `groq/whisper-large-v3`) and the bot transcribes voice/audio messages, echoes what it heard, and acts on it. Leave blank to disable.
 

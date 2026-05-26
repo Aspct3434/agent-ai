@@ -507,6 +507,7 @@ async def lifespan(app: FastAPI):
     from adapters.telegram import TelegramAdapter
     from adapters.discord_bot import DiscordAdapter
     from adapters.slack import SlackAdapter
+    from adapters.email_adapter import EmailAdapter
 
     async def _adapter_stream(session_id: str, text: str):
         """Stream the agent's live progress (tool calls + final answer) so
@@ -527,6 +528,7 @@ async def lifespan(app: FastAPI):
     telegram_adapter: TelegramAdapter | None = None
     discord_adapter: DiscordAdapter | None = None
     slack_adapter: SlackAdapter | None = None
+    email_adapter: EmailAdapter | None = None
 
     if tg_token := os.getenv("TELEGRAM_BOT_TOKEN"):
         telegram_adapter = TelegramAdapter(
@@ -554,6 +556,24 @@ async def lifespan(app: FastAPI):
         await slack_adapter.start()
         app.state.slack_adapter = slack_adapter
 
+    email_addr = os.getenv("EMAIL_ADDRESS")
+    email_pass = os.getenv("EMAIL_PASSWORD")
+    email_imap = os.getenv("EMAIL_IMAP_HOST")
+    email_smtp = os.getenv("EMAIL_SMTP_HOST")
+    if email_addr and email_pass and email_imap and email_smtp:
+        email_adapter = EmailAdapter(
+            imap_host=email_imap,
+            smtp_host=email_smtp,
+            address=email_addr,
+            password=email_pass,
+            stream_fn=_adapter_stream,
+            reset_fn=_adapter_reset,
+            imap_port=int(os.getenv("EMAIL_IMAP_PORT", "993")),
+            smtp_port=int(os.getenv("EMAIL_SMTP_PORT", "465")),
+            poll_interval=float(os.getenv("EMAIL_POLL_INTERVAL", "20")),
+        )
+        await email_adapter.start()
+        app.state.email_adapter = email_adapter
 
     # -- Scheduled-task delivery to messaging --------------------------------
     # Lets cron jobs push their result to a chat (deliver_to="tg:123" etc.),
@@ -567,6 +587,8 @@ async def lifespan(app: FastAPI):
             await discord_adapter.deliver(target[len("discord:") :], text)
         elif target.startswith("slack:") and slack_adapter is not None:
             await slack_adapter.deliver(target[len("slack:") :], text)
+        elif target.startswith("email:") and email_adapter is not None:
+            await email_adapter.deliver(target[len("email:") :], text)
         else:
             logger.warning("Cron delivery target %r has no active adapter", target)
 
@@ -582,6 +604,8 @@ async def lifespan(app: FastAPI):
             await discord_adapter.shutdown()
         if slack_adapter is not None:
             await slack_adapter.shutdown()
+        if email_adapter is not None:
+            await email_adapter.shutdown()
         for task in list(app.state.active_stream_tasks.values()):
             task.cancel()
         await asyncio.gather(
@@ -637,6 +661,7 @@ async def status() -> dict[str, Any]:
             "telegram": hasattr(app.state, "telegram_adapter"),
             "discord": hasattr(app.state, "discord_adapter"),
             "slack": hasattr(app.state, "slack_adapter"),
+            "email": hasattr(app.state, "email_adapter"),
         },
         "skills": {
             "count": len(skills),

@@ -76,6 +76,7 @@ jobs:
                  tests/test_telegram_adapter.py \
                  tests/test_discord_adapter.py \
                  tests/test_slack_adapter.py \
+                 tests/test_email_adapter.py \
                  tests/test_progress_format.py \
                  tests/test_cron_delivery.py \
                  tests/test_sandbox_selfheal.py \
