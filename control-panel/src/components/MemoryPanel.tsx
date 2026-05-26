@@ -1,11 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
-import { HardDrive, RefreshCw, Trash2 } from "lucide-react";
-import { api } from "../lib/api";
+import { HardDrive, RefreshCw, Search, Trash2 } from "lucide-react";
+import { api, type SessionMatch } from "../lib/api";
 import { KeyValues } from "./KeyValues";
+
+function fmtTime(ts: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(ts * 1000));
+}
 
 export function MemoryPanel() {
   const [profile, setProfile] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [matches, setMatches] = useState<SessionMatch[] | null>(null);
+  const [searching, setSearching] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -16,6 +28,27 @@ export function MemoryPanel() {
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
+
+  async function search(e: React.FormEvent) {
+    e.preventDefault();
+    const q = query.trim();
+    if (!q) {
+      setMatches(null);
+      return;
+    }
+    setSearching(true);
+    try {
+      const res = await api.get<SessionMatch[]>(
+        `/api/sessions/search?q=${encodeURIComponent(q)}&limit=25`,
+      );
+      setMatches(res);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSearching(false);
+    }
+  }
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- intentional fetch-on-mount
@@ -61,6 +94,53 @@ export function MemoryPanel() {
         </div>
       )}
       <KeyValues data={profile} />
+
+      <section className="flex flex-col gap-3 pt-2">
+        <h3 className="text-sm font-semibold text-zinc-300">Recall past conversations</h3>
+        <form onSubmit={search} className="flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search
+              size={14}
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500"
+            />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search everything the agent has discussed…"
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-800 py-2 pl-9 pr-3 text-sm text-zinc-100 outline-none focus:border-violet-600"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={searching}
+            className="rounded-lg bg-violet-700 px-4 py-2 text-xs text-white hover:bg-violet-600 disabled:opacity-50"
+          >
+            {searching ? "…" : "Search"}
+          </button>
+        </form>
+
+        {matches !== null && matches.length === 0 && (
+          <p className="text-sm text-zinc-500">No matches.</p>
+        )}
+        <div className="flex flex-col gap-2">
+          {matches?.map((m, i) => (
+            <div key={i} className="lift rounded-lg border border-zinc-800 bg-zinc-900 p-3">
+              <div className="mb-1 flex items-center gap-2 text-[11px] text-zinc-500">
+                <span
+                  className={`rounded px-1.5 py-0.5 ${
+                    m.role === "user" ? "bg-violet-500/15 text-violet-300" : "bg-zinc-800 text-zinc-400"
+                  }`}
+                >
+                  {m.role}
+                </span>
+                <span className="truncate font-mono">{m.session_id}</span>
+                <span className="ml-auto">{fmtTime(m.ts)}</span>
+              </div>
+              <p className="line-clamp-3 text-sm text-zinc-300">{m.snippet || m.content}</p>
+            </div>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }

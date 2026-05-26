@@ -240,6 +240,10 @@ POST {url}/exec  {command, cwd, timeout, stdin?, background?, log_path?}
 
 That ~20-line shim is the entire provider integration — no SDK is baked into the repo.
 
+## Cross-session memory (recall)
+
+Every user/assistant turn is indexed in a full-text store (SQLite FTS5, with a LIKE fallback). The agent can search its **own past conversations across all prior sessions** with the `recall_memory` tool ("what did we decide about X last week?"), and you can search them from the dashboard (Memory → *Recall past conversations*) or `GET /api/sessions/search?q=…`.
+
 ## Self-improving skills (evidence-gated evolution)
 
 agent-ai doesn't just rewrite skills on use like other agents — it evolves them **safely and reversibly**:

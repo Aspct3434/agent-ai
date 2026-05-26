@@ -823,6 +823,7 @@ class AgentEngine:
         scheduler: CronScheduler | None = None,
         skill_registry: SkillRegistry | None = None,
         persona_content: str = "",
+        session_store: Any = None,
     ) -> None:
         self._memory = memory
         self._tools = tools
@@ -843,6 +844,7 @@ class AgentEngine:
         self._profile_store = profile_store
         self._scheduler = scheduler
         self._skill_registry = skill_registry
+        self._session_store = session_store
         self._histories: dict[str, list[dict[str, Any]]] = {}
 
     def update_models(
@@ -911,11 +913,17 @@ class AgentEngine:
         # list; the ReAct loop mutates this same list in place, so the assistant
         # and tool turns it produces persist into the next turn automatically.
         messages.append({"role": message.role, "content": message.content})
+        self._record_turn(message.session_id, "user", message.content)
 
+        final_text = ""
         async for event in self._stream_react_loop(
             message.session_id, message.content, messages, all_tools
         ):
+            if event.get("type") in ("text", "final_answer"):
+                final_text = str(event.get("content") or final_text)
             yield event
+        if final_text:
+            self._record_turn(message.session_id, "assistant", final_text)
 
     async def replay_from_checkpoint(
         self,
@@ -2005,6 +2013,11 @@ class AgentEngine:
                 return await self._create_skill(arguments), False, "__builtin__"
             except Exception as exc:
                 return f"[create_skill error] {exc}", True, "__builtin__"
+        if tool_name == "recall_memory":
+            try:
+                return await self._recall_memory(arguments), False, "__builtin__"
+            except Exception as exc:
+                return f"[recall_memory error] {exc}", True, "__builtin__"
 
         server = tool_index.get(tool_name)
         if server is None:
@@ -2073,6 +2086,23 @@ class AgentEngine:
         if self._skill_registry is None:
             return json.dumps({"skills": [], "note": "Skill registry not configured on this engine."})
         return json.dumps({"skills": self._skill_registry.list_skills()}, indent=2)
+
+    def _record_turn(self, session_id: str, role: str, content: str) -> None:
+        """Append a turn to the cross-session memory store (fire-and-forget)."""
+        if self._session_store is None or not content:
+            return
+        asyncio.create_task(  # noqa: RUF006
+            asyncio.to_thread(self._session_store.add_turn, session_id, role, content)
+        )
+
+    async def _recall_memory(self, arguments: dict[str, Any]) -> str:
+        """Full-text search across past conversations (the recall_memory tool)."""
+        if self._session_store is None:
+            return json.dumps({"results": [], "note": "Session memory is not configured."})
+        query = str(arguments.get("query", ""))
+        limit = int(arguments.get("limit", 8) or 8)
+        results = await asyncio.to_thread(self._session_store.search, query, limit)
+        return json.dumps({"query": query, "results": results}, indent=2)
 
     async def _create_skill(self, arguments: dict[str, Any]) -> str:
         """Author a new skill on demand (the auto skill maker) and load it."""

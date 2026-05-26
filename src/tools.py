@@ -1669,6 +1669,27 @@ CREATE_SKILL_TOOL: dict[str, Any] = {
     },
 }
 
+RECALL_MEMORY_TOOL: dict[str, Any] = {
+    "server": "__builtin__",
+    "name": "recall_memory",
+    "description": (
+        "Search your own past conversations (across ALL prior sessions) by "
+        "keyword and get the matching messages back. Use this to remember what "
+        "the user told you before, decisions you made, or context from earlier "
+        "chats — e.g. 'what did we decide about the database schema?'. "
+        "Returns matching turns with a snippet, role, session, and timestamp."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "string", "description": "Keywords to search for."},
+            "limit": {"type": "integer", "description": "Max results (default 8)."},
+        },
+        "additionalProperties": False,
+    },
+}
+
 SCHEDULE_TASK_TOOL: dict[str, Any] = {
     "server": "__builtin__",
     "name": "schedule_task",
@@ -1920,6 +1941,7 @@ class ToolManager:
         results.append(LIST_SCHEDULED_TASKS_TOOL)
         results.append(LIST_SKILLS_TOOL)
         results.append(CREATE_SKILL_TOOL)
+        results.append(RECALL_MEMORY_TOOL)
         self._tools_cache = results
         return results
 

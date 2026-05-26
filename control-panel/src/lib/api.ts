@@ -83,6 +83,14 @@ export interface Tool {
   description: string;
 }
 
+export interface SessionMatch {
+  session_id: string;
+  role: string;
+  ts: number;
+  content: string;
+  snippet: string;
+}
+
 export interface LogEntry {
   time: number;
   level: string;

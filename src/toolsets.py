@@ -98,6 +98,7 @@ _ALWAYS_TOOLS: frozenset[str] = frozenset(
         "update_plan",
         "list_skills",
         "create_skill",
+        "recall_memory",
         "schedule_task",
         "list_scheduled_tasks",
         "analyze_image",

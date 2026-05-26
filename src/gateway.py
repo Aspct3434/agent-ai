@@ -419,6 +419,12 @@ async def lifespan(app: FastAPI):
     # -- Memory -----------------------------------------------------------
     memory = _build_memory()
 
+    # -- Cross-session memory (full-text recall across past chats) --------
+    from session_store import SessionStore
+    session_store = SessionStore(
+        os.getenv("AGENT_SESSION_DB", str(data_dir / "sessions.db"))
+    )
+
     # -- Engine -----------------------------------------------------------
     engine = AgentEngine(
         memory=memory,
@@ -431,6 +437,7 @@ async def lifespan(app: FastAPI):
         profile_store=profile_store,
         skill_registry=skill_registry,
         persona_content=persona_content,
+        session_store=session_store,
     )
 
     # -- Cron scheduler ---------------------------------------------------
@@ -467,6 +474,7 @@ async def lifespan(app: FastAPI):
     app.state.profile_store = profile_store
     app.state.skill_registry = skill_registry
     app.state.scheduler = scheduler
+    app.state.session_store = session_store
     app.state.gateway = gw
     app.state.active_stream_tasks = {}
 
@@ -616,6 +624,21 @@ async def status() -> dict[str, Any]:
         },
         "active_sessions": len(app.state.gateway.active_sessions),
     }
+
+
+@app.get("/api/sessions/search")
+async def search_sessions(q: str = "", limit: int = 20) -> list[dict[str, Any]]:
+    """Full-text search across all past conversation turns."""
+    return await asyncio.to_thread(
+        app.state.session_store.search, q, max(1, min(limit, 100))
+    )
+
+
+@app.get("/api/sessions/recent")
+async def recent_sessions(limit: int = 20) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(
+        app.state.session_store.recent_sessions, max(1, min(limit, 100))
+    )
 
 
 @app.get("/api/tools")
