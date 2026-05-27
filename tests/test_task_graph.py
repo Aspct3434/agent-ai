@@ -246,6 +246,36 @@ def test_repair_preserves_completed_evidence_nodes() -> None:
     assert by_id["serve"]["failure_reason"] == "choose a different port"
 
 
+def test_failed_proof_with_no_active_node_allows_recovery_diagnostics() -> None:
+    engine = TaskGraphEngine()
+    messages = [
+        {"role": "user", "content": "write then verify"},
+        _assistant_tool(
+            "set_task_graph",
+            {
+                "nodes": [
+                    {
+                        "id": "write",
+                        "title": "Write artifact",
+                        "kind": "write",
+                        "status": "done",
+                        "allowed_tools": ["write_text_file"],
+                        "proof_requirements": ["filesystem_artifact"],
+                        "evidence_refs": ["missing_write_ref"],
+                    }
+                ]
+            },
+        ),
+    ]
+
+    allowed = engine.allowed_tools_for_next(messages, [])
+
+    assert "get_filesystem_process_evidence" in allowed
+    assert "update_task_node" in allowed
+    assert "repair_task_graph" in allowed
+    assert "execute_terminal_command" not in allowed
+
+
 @pytest.mark.asyncio
 async def test_gateway_task_graph_endpoints_use_engine() -> None:
     from gateway import app, get_task_graph, verify_task_graph

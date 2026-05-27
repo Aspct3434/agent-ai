@@ -689,6 +689,10 @@ class TaskGraphEngine:
         active = snapshot["active_node"]
         allowed = set(GRAPH_CONTROL_TOOLS)
         if not active:
+            verifier = self.verify_nodes(graph["nodes"], steps)
+            if not verifier.get("passed"):
+                allowed.update(RECOVERY_DIAGNOSTIC_TOOLS)
+                allowed.add(REPAIR_TASK_GRAPH_TOOL_NAME)
             return allowed
         active_allowed = active.get("allowed_tools") or sorted(
             DEFAULT_ALLOWED_TOOLS_BY_KIND.get(str(active.get("kind")), frozenset())
