@@ -1,6 +1,6 @@
 {
   "name": "@aspct3434/distill-agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Distill — interactive installer and lifecycle CLI for the Distill autonomous agent framework.",
   "bin": {
     "distill": "bin/distill.js"
