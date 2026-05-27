@@ -17,6 +17,8 @@ from tools import (
     _detect_posix_shell,
     _DockerSandbox,
     _is_dangerous_command,
+    _normalize_sudo_noninteractive,
+    _sudo_password_input_reason,
     _wrong_environment_command_reason,
 )
 
@@ -139,6 +141,28 @@ class TestWrongEnvironmentCommandReason:
             "mkdir -p /workspace/server && java -version",
             sandbox_active=True,
         ) is None
+
+
+class TestSudoSupport:
+    def test_normalizes_sudo_to_noninteractive(self):
+        assert _normalize_sudo_noninteractive("sudo apt-get update") == (
+            "sudo -n apt-get update"
+        )
+        assert _normalize_sudo_noninteractive("sudo -n apt-get update") == (
+            "sudo -n apt-get update"
+        )
+        assert _normalize_sudo_noninteractive("cd /tmp && sudo systemctl status nginx") == (
+            "cd /tmp && sudo -n systemctl status nginx"
+        )
+
+    def test_blocks_password_fed_sudo(self):
+        reason = _sudo_password_input_reason("echo secret | sudo -S apt-get update")
+        assert reason is not None
+        assert "non-interactive sudo" in reason
+        assert _sudo_password_input_reason("sudo -Sk apt-get update") is not None
+
+    def test_plain_sudo_allowed_to_fail_fast(self):
+        assert _sudo_password_input_reason("sudo apt-get update") is None
 
 
 # ---------------------------------------------------------------------------

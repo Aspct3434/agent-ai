@@ -214,6 +214,11 @@ _WINDOWS_SHELL_INVOKE_RE = re.compile(
     r"(?:^|[;&|]\s*)(?:cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?)\b",
     re.IGNORECASE,
 )
+_SUDO_SEGMENT_RE = re.compile(r"(?P<prefix>^|(?<=[;&|])\s*)sudo\b")
+_SUDO_PASSWORD_INPUT_RE = re.compile(
+    r"(?:^|[;&|]\s*)sudo\b[^;&|]*(?:\s-[A-Za-z]*[SA][A-Za-z]*\b|\s--stdin\b|\s--askpass\b)",
+    re.IGNORECASE,
+)
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"(?:^|[\s\"'])"
     r"(?:[A-Za-z]:[\\/]|%USERPROFILE%|%HOMEDRIVE%|%APPDATA%|%LOCALAPPDATA%)",
@@ -2722,6 +2727,17 @@ class ToolManager:
                 "current_working_directory": self.current_cwd,
             }
 
+        sudo_reason = _sudo_password_input_reason(command)
+        if sudo_reason is not None:
+            return {
+                "exit_code": -1,
+                "stdout": f"SYSTEM ALERT: {sudo_reason}",
+                "stderr": "",
+                "current_working_directory": self.current_cwd,
+                "scope": "docker_sandbox" if self._sandbox is not None else "host",
+            }
+        command = _normalize_sudo_noninteractive(command)
+
         mismatch_reason = _wrong_environment_command_reason(
             command,
             sandbox_active=self._sandbox is not None,
@@ -2901,6 +2917,18 @@ class ToolManager:
                 "log_file": _AGENT_BACKGROUND_LOG_PATH,
                 "scope": "sandbox_unavailable",
             }
+
+        sudo_reason = _sudo_password_input_reason(command)
+        if sudo_reason is not None:
+            return {
+                "pid": None,
+                "status": "error",
+                "message": sudo_reason,
+                "error": "",
+                "log_file": _AGENT_BACKGROUND_LOG_PATH,
+                "scope": "docker_sandbox" if self._sandbox is not None else "host",
+            }
+        command = _normalize_sudo_noninteractive(command)
 
         mismatch_reason = _wrong_environment_command_reason(
             command,
@@ -3177,6 +3205,27 @@ def _is_dangerous_command(command: str) -> bool:
     # Collapse internal whitespace to defeat space-padding bypasses.
     normalized = re.sub(r"\s+", " ", command.strip())
     return any(pat.search(normalized) is not None for pat in _DANGEROUS_PATTERNS)
+
+
+def _sudo_password_input_reason(command: str) -> str | None:
+    if not _SUDO_PASSWORD_INPUT_RE.search(command):
+        return None
+    return (
+        "Interactive/password-fed sudo is not supported. Configure passwordless "
+        "sudo for the required command, run as root, or execute a non-privileged "
+        "alternative. The agent uses non-interactive sudo only."
+    )
+
+
+def _normalize_sudo_noninteractive(command: str) -> str:
+    """Make sudo fail fast instead of waiting for a password prompt."""
+    def _replace(match: re.Match[str]) -> str:
+        rest = command[match.end():]
+        if re.match(r"\s+(?:-[A-Za-z]*n[A-Za-z]*|--non-interactive)\b", rest):
+            return match.group(0)
+        return f"{match.group('prefix')}sudo -n"
+
+    return _SUDO_SEGMENT_RE.sub(_replace, command)
 
 
 def _wrong_environment_command_reason(command: str, *, sandbox_active: bool) -> str | None:

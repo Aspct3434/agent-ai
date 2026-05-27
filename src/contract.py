@@ -22,6 +22,7 @@ import logging
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from evaluator import ExecutionStep
 from toolsets import TOOLSET_NAMES
@@ -533,31 +534,59 @@ def can_stream_text_before_final(
 def _evidence_requirement_satisfied(
     requirement: str, steps: list[ExecutionStep]
 ) -> bool:
+    return evidence_requirement_satisfied_by_steps(requirement, steps)
+
+
+def evidence_requirement_satisfied_by_steps(
+    requirement: str,
+    steps: list[ExecutionStep],
+    *,
+    context_steps: list[ExecutionStep] | None = None,
+) -> bool:
+    context = context_steps or steps
     for step in steps:
         if step.kind != "tool_result" or step.metadata.get("is_error"):
             continue
-        tool_name = step.metadata.get("tool_name")
 
-        if requirement == "running_http_service":
-            if tool_name == "expose_local_http_service" and _expose_local_http_service_evidence_is_positive(step.content):
-                return True
-        elif requirement == "running_tcp_service":
-            if tool_name == "get_filesystem_process_evidence" and _tcp_service_evidence_is_positive(step.content):
-                return True
-            if tool_name == "wait_for_port" and _wait_for_port_evidence_is_positive(step.content):
-                return True
-        elif requirement == "filesystem_artifact":
-            if tool_name == "get_filesystem_process_evidence" and _filesystem_artifact_evidence_is_positive(step.content):
-                return True
-            if tool_name == "write_text_file" and _write_text_file_evidence_is_positive(step.content):
-                return True
-        elif requirement == "database_mutation":
-            if tool_name in {"create_table", "write_query"}:
-                return True
-        elif requirement == "command_output":
-            if _successful_command_output_evidence(tool_name, step.content):
-                return True
+        if _step_evidence_satisfies_requirement(requirement, step):
+            return True
+    if requirement in {"running_http_service", "running_tcp_service"}:
+        return _http_response_matches_known_service(steps, context)
     return False
+
+
+def _step_evidence_satisfies_requirement(
+    requirement: str, step: ExecutionStep
+) -> bool:
+    tool_name = step.metadata.get("tool_name")
+    if _observation_evidence_satisfies_requirement(requirement, step.content):
+        return True
+    if requirement == "running_http_service":
+        return bool(
+            tool_name == "expose_local_http_service"
+            and _expose_local_http_service_evidence_is_positive(step.content)
+        )
+    if requirement == "running_tcp_service":
+        if tool_name == "get_filesystem_process_evidence" and _tcp_service_evidence_is_positive(step.content):
+            return True
+        if tool_name == "wait_for_port" and _wait_for_port_evidence_is_positive(step.content):
+            return True
+    if requirement == "filesystem_artifact":
+        if tool_name == "get_filesystem_process_evidence" and _filesystem_artifact_evidence_is_positive(step.content):
+            return True
+        if tool_name == "write_text_file" and _write_text_file_evidence_is_positive(step.content):
+            return True
+    if requirement == "database_mutation":
+        return tool_name in {"create_table", "write_query"}
+    if requirement == "command_output":
+        return _successful_command_output_evidence(str(tool_name), step.content)
+    if requirement == "artifact_quality" and tool_name == "write_text_file":
+        try:
+            data = json.loads(step.content)
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return _artifact_quality_payload_is_acceptable(data)
+    return requirement == "none"
 
 
 def _successful_command_output_evidence(tool_name: str | None, content: str) -> bool:
@@ -684,6 +713,240 @@ def _expose_local_http_service_evidence_is_positive(content: str) -> bool:
     except (TypeError, json.JSONDecodeError):
         return False
     return bool(data.get("exposed") and data.get("connectable") and data.get("url"))
+
+
+_OBSERVATION_TAGS_BY_REQUIREMENT: dict[str, frozenset[str]] = {
+    "filesystem_artifact": frozenset({"filesystem_artifact"}),
+    "running_http_service": frozenset({"service_exposed"}),
+    "running_tcp_service": frozenset(
+        {"service_exposed", "tcp_open", "process_running"}
+    ),
+    "command_output": frozenset({"command_success"}),
+}
+
+
+def _observation_evidence_satisfies_requirement(
+    requirement: str, content: str
+) -> bool:
+    needed = _OBSERVATION_TAGS_BY_REQUIREMENT.get(requirement)
+    if not needed:
+        return False
+    return bool(_evidence_observation_tags(content) & needed)
+
+
+def _payload_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _evidence_observation_tags(content: str) -> set[str]:
+    try:
+        data = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+
+    status = str(data.get("status") or "").lower()
+    if status in {"error", "failed", "failure", "denied", "blocked"}:
+        return set()
+
+    tags: set[str] = set()
+
+    if data.get("written") and data.get("exists") and _payload_int(data.get("size_bytes")) > 0:
+        tags.add("filesystem_artifact")
+    if data.get("exposed") and data.get("connectable") and data.get("url"):
+        tags.add("service_exposed")
+        tags.add("tcp_open")
+    if data.get("open") and data.get("port"):
+        tags.add("tcp_open")
+    if data.get("connectable"):
+        tags.add("tcp_open")
+
+    status_code = _payload_int(data.get("status_code"))
+    if 200 <= status_code < 400:
+        tags.add("http_response")
+
+    if data.get("exit_code") == 0 and str(
+        data.get("stdout") or data.get("stderr") or ""
+    ).strip():
+        tags.add("command_success")
+
+    paths = data.get("paths") or []
+    if (
+        isinstance(paths, list)
+        and paths
+        and all(isinstance(path, dict) and path.get("exists") for path in paths)
+    ):
+        tags.add("filesystem_artifact")
+    for pid in data.get("pids") or []:
+        if isinstance(pid, dict) and pid.get("running"):
+            tags.add("process_running")
+            break
+    for process in data.get("process_names") or []:
+        if isinstance(process, dict) and _payload_int(process.get("count")) > 0:
+            tags.add("process_running")
+            break
+    for port in data.get("ports") or []:
+        if isinstance(port, dict) and (port.get("connectable") or port.get("open")):
+            tags.add("tcp_open")
+            break
+
+    background_log = data.get("background_log") or {}
+    if (
+        isinstance(background_log, dict)
+        and background_log.get("exists")
+        and background_log.get("tail")
+    ):
+        tags.add("process_running")
+
+    return tags
+
+
+def _step_json_payload(step: ExecutionStep) -> dict[str, Any]:
+    try:
+        data = json.loads(step.content)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _step_command(step: ExecutionStep) -> str:
+    arguments = step.metadata.get("arguments") or {}
+    if isinstance(arguments, dict):
+        return normalize_command(arguments.get("command"))
+    return ""
+
+
+def _step_url(step: ExecutionStep) -> str:
+    payload = _step_json_payload(step)
+    if payload.get("url"):
+        return str(payload.get("url") or "")
+    arguments = step.metadata.get("arguments") or {}
+    if isinstance(arguments, dict):
+        return str(arguments.get("url") or "")
+    return ""
+
+
+def _url_port(url: str) -> int | None:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.port is not None:
+        return parsed.port
+    if parsed.scheme == "http":
+        return 80
+    if parsed.scheme == "https":
+        return 443
+    return None
+
+
+def _url_is_local(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        hostname = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return bool(
+        hostname == "localhost"
+        or hostname == "0.0.0.0"
+        or hostname == "::1"
+        or hostname.startswith("127.")
+    )
+
+
+def _url_matches_prefix(url: str, expected: str) -> bool:
+    if not url or not expected:
+        return False
+    normalized = url.rstrip("/") + "/"
+    expected_normalized = expected.rstrip("/") + "/"
+    return normalized.startswith(expected_normalized) or expected_normalized.startswith(normalized)
+
+
+def _command_ports(command: str) -> set[int]:
+    ports: set[int] = set()
+    patterns = (
+        r"(?:^|\s)(?:--port|-p)\s*=?\s*(\d{2,5})(?:\s|$)",
+        r"(?:^|\s)PORT=(\d{2,5})(?:\s|$)",
+        r"\bhttp\.server\s+(\d{2,5})\b",
+        r"\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, command, flags=re.IGNORECASE):
+            port = _payload_int(match.group(1))
+            if 1 <= port <= 65535:
+                ports.add(port)
+    return ports
+
+
+def _known_service_ports(steps: list[ExecutionStep]) -> set[int]:
+    ports: set[int] = set()
+    for step in steps:
+        if step.kind != "tool_result" or step.metadata.get("is_error"):
+            continue
+        payload = _step_json_payload(step)
+        status = str(payload.get("status") or "").lower()
+        if status in {"error", "failed", "failure", "denied", "blocked"}:
+            continue
+        for key in ("port",):
+            port = _payload_int(payload.get(key))
+            if 1 <= port <= 65535 and (
+                payload.get("open")
+                or payload.get("connectable")
+                or payload.get("exposed")
+                or status in {"launched", "running", "started", "ok", "success"}
+            ):
+                ports.add(port)
+        for port_info in payload.get("ports") or []:
+            if isinstance(port_info, dict) and (port_info.get("connectable") or port_info.get("open")):
+                port = _payload_int(port_info.get("port"))
+                if 1 <= port <= 65535:
+                    ports.add(port)
+        if step.metadata.get("tool_name") == "execute_background_service" and status not in {
+            "error",
+            "failed",
+        }:
+            ports.update(_command_ports(_step_command(step)))
+    return ports
+
+
+def _known_service_urls(steps: list[ExecutionStep]) -> set[str]:
+    urls: set[str] = set()
+    for step in steps:
+        if step.kind != "tool_result" or step.metadata.get("is_error"):
+            continue
+        payload = _step_json_payload(step)
+        if payload.get("exposed") and payload.get("connectable") and payload.get("url"):
+            urls.add(str(payload["url"]))
+    return urls
+
+
+def _http_response_matches_known_service(
+    candidate_steps: list[ExecutionStep],
+    context_steps: list[ExecutionStep],
+) -> bool:
+    known_ports = _known_service_ports(context_steps)
+    known_urls = _known_service_urls(context_steps)
+    for step in candidate_steps:
+        if step.kind != "tool_result" or step.metadata.get("is_error"):
+            continue
+        payload = _step_json_payload(step)
+        status_code = _payload_int(payload.get("status_code"))
+        if status_code < 200 or status_code >= 400:
+            continue
+        url = _step_url(step)
+        if any(_url_matches_prefix(url, known_url) for known_url in known_urls):
+            return True
+        port = _url_port(url)
+        if port is not None and port in known_ports and _url_is_local(url):
+            return True
+    return False
 
 
 def _filesystem_artifact_evidence_is_positive(content: str) -> bool:
@@ -961,6 +1224,10 @@ MAX_IDENTICAL_COMMAND_RUNS = max(
     1, int(os.getenv("AGENT_MAX_IDENTICAL_COMMAND_RUNS", "3"))
 )
 
+MAX_TERMINAL_FAILURES_BEFORE_DIAGNOSTIC = max(
+    2, int(os.getenv("AGENT_MAX_TERMINAL_FAILURES_BEFORE_DIAGNOSTIC", "2"))
+)
+
 
 def host_command_runs_since_state_change(
     steps: list[ExecutionStep], command: Any
@@ -1012,12 +1279,13 @@ def repeated_command_message(tool_name: str, command: Any) -> str:
 
 
 def terminal_failure_since_diagnostic(steps: list[ExecutionStep]) -> bool:
-    """True if the latest relevant event is a failed terminal command.
+    """True after repeated terminal failures without a diagnostic step.
 
-    This forces a non-terminal diagnostic step between "command failed" and
-    "try another shell command", which prevents platform-guessing loops like
+    One failed command can be corrected directly. After repeated failures, force
+    a non-terminal diagnostic step to prevent platform-guessing loops like
     java/java -version/which/cmd/powershell variants.
     """
+    consecutive_failures = 0
     for step in reversed(steps):
         if step.kind != "tool_result":
             continue
@@ -1027,14 +1295,19 @@ def terminal_failure_since_diagnostic(steps: list[ExecutionStep]) -> bool:
         if tool_name in _STATE_CHANGING_TOOLS and not step.metadata.get("is_error"):
             return False
         if tool_name == "execute_terminal_command":
-            return bool(step.metadata.get("is_error"))
+            if step.metadata.get("is_error"):
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_TERMINAL_FAILURES_BEFORE_DIAGNOSTIC:
+                    return True
+                continue
+            return False
     return False
 
 
 def terminal_failure_recovery_message(command: Any) -> str:
     return (
-        "[blocked: unresolved terminal failure] The previous terminal command "
-        "failed, so this new terminal command was NOT executed:\n"
+        "[blocked: repeated terminal failures] Several terminal commands failed "
+        "without a diagnostic step, so this new terminal command was NOT executed:\n"
         f"  {normalize_command(command)[:200]}\n"
         "First diagnose the failure with a non-terminal tool: call "
         "get_system_environment to confirm OS/shell/runtimes, "

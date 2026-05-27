@@ -542,7 +542,7 @@ def test_explicit_task_graph_replaces_plan_and_narrows_to_active_node() -> None:
     ]
     graph_limited = set(model.request_tool_names[2])
     assert "write_text_file" in graph_limited
-    assert "execute_terminal_command" not in graph_limited
+    assert "execute_terminal_command" in graph_limited
     assert tools.written
     assert any(
         event.get("type") == "text" and "sleep-graph" in event.get("content", "")

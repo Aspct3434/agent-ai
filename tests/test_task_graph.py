@@ -35,6 +35,7 @@ def _tool_step(
     content: dict,
     *,
     is_error: bool = False,
+    arguments: dict[str, object] | None = None,
 ) -> ExecutionStep:
     return ExecutionStep(
         kind="tool_result",
@@ -43,7 +44,7 @@ def _tool_step(
             "tool_name": tool_name,
             "tool_call_id": call_id,
             "is_error": is_error,
-            "arguments": {},
+            "arguments": arguments or {},
         },
     )
 
@@ -240,6 +241,50 @@ def test_verifier_accepts_real_file_and_command_evidence() -> None:
     assert result["passed"] is True
 
 
+def test_verifier_accepts_generic_http_observation_as_service_evidence() -> None:
+    engine = TaskGraphEngine()
+    messages = [
+        {"role": "user", "content": "serve site"},
+        _assistant_tool(
+            "set_task_graph",
+            {
+                "nodes": [
+                    {
+                        "id": "verify",
+                        "title": "Verify served site",
+                        "kind": "verify",
+                        "status": "done",
+                        "allowed_tools": ["custom_probe"],
+                        "proof_requirements": ["running_http_service"],
+                        "evidence_refs": ["call_probe"],
+                    }
+                ]
+            },
+        ),
+    ]
+    steps = [
+        _tool_step(
+            "execute_background_service",
+            "call_launch",
+            {"status": "launched", "pid": 123},
+            arguments={"command": "python3 -m http.server 8080"},
+        ),
+        _tool_step(
+            "custom_probe",
+            "call_probe",
+            {
+                "url": "http://127.0.0.1:8080/",
+                "status_code": 200,
+                "content_type": "text/html",
+            },
+        )
+    ]
+
+    result = engine.verify(messages, steps)
+
+    assert result["passed"] is True
+
+
 def test_repair_preserves_completed_evidence_nodes() -> None:
     engine = TaskGraphEngine()
     messages = [
@@ -310,7 +355,7 @@ def test_failed_proof_with_no_active_node_allows_recovery_diagnostics() -> None:
     assert "get_filesystem_process_evidence" in allowed
     assert "update_task_node" in allowed
     assert "repair_task_graph" in allowed
-    assert "execute_terminal_command" not in allowed
+    assert "execute_terminal_command" in allowed
 
 
 @pytest.mark.asyncio

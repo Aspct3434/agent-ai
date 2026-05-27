@@ -12,13 +12,8 @@ from copy import deepcopy
 from typing import Any
 
 from contract import (
-    _expose_local_http_service_evidence_is_positive,
-    _filesystem_artifact_evidence_is_positive,
     _plan_steps_from_args,
-    _successful_command_output_evidence,
-    _tcp_service_evidence_is_positive,
-    _wait_for_port_evidence_is_positive,
-    _write_text_file_evidence_is_positive,
+    evidence_requirement_satisfied_by_steps,
 )
 from evaluator import ExecutionStep
 
@@ -49,6 +44,8 @@ GRAPH_CONTROL_TOOLS: frozenset[str] = frozenset(
         "expand_tool_output",
     }
 )
+
+GUIDELINE_EXECUTION_TOOLS: frozenset[str] = frozenset({"execute_terminal_command"})
 
 RECOVERY_DIAGNOSTIC_TOOLS: frozenset[str] = frozenset(
     {
@@ -606,17 +603,20 @@ class TaskGraphEngine:
                     )
             requirement_results = []
             for requirement in requirements:
-                ref_passed = any(
-                    _step_satisfies_requirement(step, requirement)
-                    for step in candidate_steps
+                ref_passed = evidence_requirement_satisfied_by_steps(
+                    requirement,
+                    candidate_steps,
+                    context_steps=steps,
                 )
-                inferred_passed = any(
-                    _step_satisfies_requirement(step, requirement)
-                    for step in inferred_candidate_steps
+                inferred_passed = evidence_requirement_satisfied_by_steps(
+                    requirement,
+                    inferred_candidate_steps,
+                    context_steps=steps,
                 )
-                passed = any(
-                    _step_satisfies_requirement(step, requirement)
-                    for step in [*candidate_steps, *inferred_candidate_steps]
+                passed = evidence_requirement_satisfied_by_steps(
+                    requirement,
+                    [*candidate_steps, *inferred_candidate_steps],
+                    context_steps=steps,
                 )
                 requirement_results.append(
                     {
@@ -637,7 +637,9 @@ class TaskGraphEngine:
                     step.metadata.get("tool_call_id")
                     for step in inferred_candidate_steps
                     if any(
-                        _step_satisfies_requirement(step, requirement)
+                        evidence_requirement_satisfied_by_steps(
+                            requirement, [step], context_steps=steps
+                        )
                         for requirement in requirements
                     )
                 )
@@ -745,6 +747,7 @@ class TaskGraphEngine:
         snapshot = self._snapshot(graph["nodes"], source=str(graph["source"]))
         active = snapshot["active_node"]
         allowed = set(GRAPH_CONTROL_TOOLS)
+        allowed.update(GUIDELINE_EXECUTION_TOOLS)
         if not active:
             verifier = self.verify_nodes(graph["nodes"], steps)
             if not verifier.get("passed"):
@@ -879,36 +882,4 @@ class TaskGraphEngine:
 
 
 def _step_satisfies_requirement(step: ExecutionStep, requirement: str) -> bool:
-    if step.kind != "tool_result" or step.metadata.get("is_error"):
-        return False
-    tool_name = step.metadata.get("tool_name")
-    content = step.content
-    if requirement == "filesystem_artifact":
-        if tool_name == "write_text_file":
-            return _write_text_file_evidence_is_positive(content)
-        if tool_name == "get_filesystem_process_evidence":
-            return _filesystem_artifact_evidence_is_positive(content)
-    if requirement == "running_http_service":
-        return bool(
-            tool_name == "expose_local_http_service"
-            and _expose_local_http_service_evidence_is_positive(content)
-        )
-    if requirement == "running_tcp_service":
-        if tool_name == "wait_for_port":
-            return _wait_for_port_evidence_is_positive(content)
-        if tool_name == "get_filesystem_process_evidence":
-            return _tcp_service_evidence_is_positive(content)
-    if requirement == "database_mutation":
-        return tool_name in {"create_table", "write_query"}
-    if requirement == "command_output":
-        return _successful_command_output_evidence(str(tool_name), content)
-    if requirement == "artifact_quality":
-        if tool_name != "write_text_file":
-            return False
-        try:
-            data = json.loads(content)
-        except (TypeError, json.JSONDecodeError):
-            return False
-        quality = data.get("artifact_quality")
-        return not isinstance(quality, dict) or not bool(quality.get("placeholder_detected"))
-    return requirement == "none"
+    return evidence_requirement_satisfied_by_steps(requirement, [step])

@@ -21,6 +21,7 @@ from agent import (
 )
 from contract import (
     MAX_CONSECUTIVE_VERIFICATION_CALLS,
+    _evidence_observation_tags,
     _evidence_requirement_satisfied,
     _expose_local_http_service_evidence_is_positive,
     _filesystem_process_evidence_is_positive,
@@ -33,6 +34,7 @@ from contract import (
     consecutive_verification_run_length,
     contract_completion_status,
     duplicate_command_message,
+    evidence_requirement_satisfied_by_steps,
     last_host_command,
     looks_like_finite_background_command,
     should_block_tool_for_action_task,
@@ -149,6 +151,29 @@ class TestExposeLocalHttpServiceEvidence:
         assert not _expose_local_http_service_evidence_is_positive("nope")
 
 
+class TestObservationEvidenceTags:
+    def test_extracts_http_response_without_tool_name(self):
+        content = json.dumps({"status_code": 204, "content_type": "application/json"})
+        assert "http_response" in _evidence_observation_tags(content)
+
+    def test_extracts_file_process_port_and_command_observations(self):
+        content = json.dumps(
+            {
+                "paths": [{"exists": True}],
+                "pids": [{"running": True}],
+                "ports": [{"connectable": True}],
+                "exit_code": 0,
+                "stdout": "ok",
+            }
+        )
+        tags = _evidence_observation_tags(content)
+        assert {"filesystem_artifact", "process_running", "tcp_open", "command_success"} <= tags
+
+    def test_error_status_suppresses_positive_observations(self):
+        content = json.dumps({"status": "error", "status_code": 200, "paths": [{"exists": True}]})
+        assert _evidence_observation_tags(content) == set()
+
+
 class TestFilesystemProcessEvidence:
     def test_path_exists(self):
         content = json.dumps({"paths": [{"exists": True}]})
@@ -238,11 +263,16 @@ class TestSuccessfulCommandOutputEvidence:
         assert not _successful_command_output_evidence("execute_background_service", "bad")
 
 
-def _make_step(tool_name: str, content: str, is_error: bool = False) -> ExecutionStep:
+def _make_step(
+    tool_name: str,
+    content: str,
+    is_error: bool = False,
+    arguments: dict[str, object] | None = None,
+) -> ExecutionStep:
     return ExecutionStep(
         kind="tool_result",
         content=content,
-        metadata={"tool_name": tool_name, "is_error": is_error},
+        metadata={"tool_name": tool_name, "is_error": is_error, "arguments": arguments or {}},
     )
 
 
@@ -251,6 +281,33 @@ class TestEvidenceRequirementSatisfied:
         content = json.dumps({"exposed": True, "connectable": True, "url": "http://localhost:5000"})
         steps = [_make_step("expose_local_http_service", content)]
         assert _evidence_requirement_satisfied("running_http_service", steps)
+
+    def test_http_observation_requires_service_provenance(self):
+        content = json.dumps(
+            {
+                "url": "https://example.com",
+                "status_code": 200,
+                "content_type": "text/html",
+            }
+        )
+        steps = [_make_step("custom_probe", content)]
+        assert not _evidence_requirement_satisfied("running_http_service", steps)
+
+    def test_http_observation_matches_launched_service_port(self):
+        launch = _make_step(
+            "execute_background_service",
+            json.dumps({"status": "launched", "pid": 123}),
+            arguments={"command": "python3 -m http.server 8080"},
+        )
+        probe = _make_step(
+            "custom_probe",
+            json.dumps({"url": "http://127.0.0.1:8080/", "status_code": 200}),
+        )
+        assert evidence_requirement_satisfied_by_steps(
+            "running_http_service",
+            [probe],
+            context_steps=[launch, probe],
+        )
 
     def test_running_tcp_service_via_wait_for_port(self):
         content = json.dumps({"open": True, "port": 25565})
@@ -542,16 +599,23 @@ class TestDuplicateCommandMessage:
 
 
 class TestTerminalFailureRecovery:
-    def test_detects_terminal_failure_until_diagnostic(self):
+    def test_allows_one_terminal_failure_before_requiring_diagnostic(self):
         failed = _make_step(
             "execute_terminal_command",
             json.dumps({"exit_code": 127, "stderr": "java: not found"}),
             is_error=True,
         )
-        assert terminal_failure_since_diagnostic([failed])
+        assert not terminal_failure_since_diagnostic([failed])
+
+        second_failed = _make_step(
+            "execute_terminal_command",
+            json.dumps({"exit_code": 127, "stderr": "which: not found"}),
+            is_error=True,
+        )
+        assert terminal_failure_since_diagnostic([failed, second_failed])
 
         diagnostic = _make_step("get_system_environment", "{}", is_error=False)
-        assert not terminal_failure_since_diagnostic([failed, diagnostic])
+        assert not terminal_failure_since_diagnostic([failed, second_failed, diagnostic])
 
     def test_recovery_message_mentions_diagnostic_tools(self):
         msg = terminal_failure_recovery_message("java -version")
