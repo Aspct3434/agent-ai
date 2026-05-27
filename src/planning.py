@@ -1,7 +1,7 @@
 """Plan management, executive summary, and cross-domain instruction builders.
 
 Sits one layer above contract.py: it imports the plan-lookup helpers from
-there so _contract_completion_status can reference plan state without creating
+there so contract_completion_status can reference plan state without creating
 a circular import, and adds the richer rendering and summary logic that needs
 both plan and contract data.
 """
@@ -14,10 +14,10 @@ import os
 from typing import Any
 
 from contract import (
-    _attempted_tool_names,
     _is_continuation_signal,
     _latest_artifact_quality,
     _latest_plan,
+    attempted_tool_names,
 )
 from evaluator import _SIDE_EFFECT_TOOLS, ExecutionStep
 
@@ -161,7 +161,7 @@ def _build_contract_execution_instruction(
     steps: list[ExecutionStep] | None = None,
 ) -> str:
     _steps = steps or []
-    attempted = set(_attempted_tool_names(_steps))     # all attempts (inc. errors)
+    attempted = set(attempted_tool_names(_steps))     # all attempts (inc. errors)
     plan = _latest_plan(messages)
     plan_guidance = (
         "No update_plan checklist exists yet; call update_plan before continuing."
@@ -252,7 +252,7 @@ def _build_contract_continuation_instruction(
         f"Contract summary: {contract.get('summary')}\n"
         f"Missing evidence: {', '.join(status.get('missing', [])) or 'none'}\n"
         f"Open plan: {status.get('plan_open')}\n"
-        f"Tools attempted: {', '.join(_attempted_tool_names(steps)) or 'none'}\n"
+        f"Tools attempted: {', '.join(attempted_tool_names(steps)) or 'none'}\n"
         f"Current plan:\n{_render_plan(_latest_plan(messages) or [])}\n"
         f"Rejected text: {final_response[:500]}\n\n"
         "Continue with tool calls that close the plan and produce the missing "

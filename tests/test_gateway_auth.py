@@ -1,0 +1,189 @@
+"""Tests for gateway API authentication (AGENT_API_TOKEN) and CORS config.
+
+These exercise the auth helpers and the HTTP middleware directly, without
+booting the full app lifespan (which needs MCP servers / DBs), mirroring the
+import-only style of test_gateway_unit.py. ``_API_TOKEN`` is a module global the
+middleware reads at request time, so monkeypatching it flips auth on/off.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+import pytest
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+
+import gateway
+
+
+def _make_request(path: str = "/api/status", method: str = "GET", headers: dict | None = None):
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "headers": raw,
+        "query_string": b"",
+    }
+    return Request(scope)
+
+
+class _FakeWS:
+    def __init__(self, query: dict | None = None, headers: dict | None = None):
+        self.query_params = query or {}
+        self.headers = headers or {}
+
+
+# ---------------------------------------------------------------------------
+# Token extraction
+# ---------------------------------------------------------------------------
+
+class TestTokenExtraction:
+    def test_bearer_header(self):
+        assert gateway._bearer_or_api_key("Bearer abc123", None) == "abc123"
+
+    def test_bearer_is_case_insensitive_on_scheme(self):
+        assert gateway._bearer_or_api_key("bearer abc123", None) == "abc123"
+
+    def test_x_api_key_header(self):
+        assert gateway._bearer_or_api_key(None, "  k-99 ") == "k-99"
+
+    def test_bearer_wins_over_api_key(self):
+        assert gateway._bearer_or_api_key("Bearer fromauth", "fromkey") == "fromauth"
+
+    def test_none_when_absent(self):
+        assert gateway._bearer_or_api_key(None, None) is None
+
+    def test_http_token_reads_request_headers(self):
+        req = _make_request(headers={"Authorization": "Bearer xyz"})
+        assert gateway._http_token(req) == "xyz"
+
+    def test_ws_token_prefers_query_param(self):
+        ws = _FakeWS(query={"token": "q-tok"}, headers={"authorization": "Bearer h-tok"})
+        assert gateway._ws_token(ws) == "q-tok"
+
+    def test_ws_token_falls_back_to_header(self):
+        ws = _FakeWS(headers={"x-api-key": "h-tok"})
+        assert gateway._ws_token(ws) == "h-tok"
+
+
+# ---------------------------------------------------------------------------
+# _token_ok
+# ---------------------------------------------------------------------------
+
+class TestTokenOk:
+    def test_auth_disabled_allows_everything(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "")
+        assert gateway._token_ok(None) is True
+        assert gateway._token_ok("anything") is True
+
+    def test_correct_token_accepted(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+        assert gateway._token_ok("secret") is True
+
+    def test_wrong_token_rejected(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+        assert gateway._token_ok("nope") is False
+
+    def test_missing_token_rejected_when_required(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+        assert gateway._token_ok(None) is False
+
+
+# ---------------------------------------------------------------------------
+# HTTP middleware
+# ---------------------------------------------------------------------------
+
+class TestAuthMiddleware:
+    @pytest.mark.asyncio
+    async def test_open_when_no_token_configured(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "")
+
+        async def call_next(_req):
+            return PlainTextResponse("ok")
+
+        resp = await gateway._auth_middleware(_make_request(), call_next)
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_health_always_open(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+
+        async def call_next(_req):
+            return PlainTextResponse("ok")
+
+        resp = await gateway._auth_middleware(_make_request(path="/health"), call_next)
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_options_preflight_bypasses_auth(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+
+        async def call_next(_req):
+            return PlainTextResponse("ok")
+
+        resp = await gateway._auth_middleware(
+            _make_request(method="OPTIONS"), call_next
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_401(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+
+        async def call_next(_req):  # pragma: no cover - must not be reached
+            raise AssertionError("call_next should not run for unauthorized request")
+
+        resp = await gateway._auth_middleware(_make_request(), call_next)
+        assert resp.status_code == 401
+        assert resp.headers.get("www-authenticate") == "Bearer"
+
+    @pytest.mark.asyncio
+    async def test_valid_token_passes(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+        called = {"hit": False}
+
+        async def call_next(_req):
+            called["hit"] = True
+            return PlainTextResponse("ok")
+
+        resp = await gateway._auth_middleware(
+            _make_request(headers={"Authorization": "Bearer secret"}), call_next
+        )
+        assert resp.status_code == 200
+        assert called["hit"] is True
+
+    @pytest.mark.asyncio
+    async def test_wrong_token_returns_401(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+
+        async def call_next(_req):  # pragma: no cover
+            raise AssertionError("unauthorized request must not reach the route")
+
+        resp = await gateway._auth_middleware(
+            _make_request(headers={"X-API-Key": "wrong"}), call_next
+        )
+        assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# CORS origin resolution
+# ---------------------------------------------------------------------------
+
+class TestCorsOrigins:
+    def test_default_is_localhost_only(self, monkeypatch):
+        monkeypatch.delenv("AGENT_CORS_ORIGINS", raising=False)
+        origins = gateway._cors_origins()
+        assert "http://localhost:5173" in origins
+        assert "*" not in origins
+
+    def test_wildcard(self, monkeypatch):
+        monkeypatch.setenv("AGENT_CORS_ORIGINS", "*")
+        assert gateway._cors_origins() == ["*"]
+
+    def test_explicit_list(self, monkeypatch):
+        monkeypatch.setenv("AGENT_CORS_ORIGINS", "https://a.example, https://b.example")
+        assert gateway._cors_origins() == ["https://a.example", "https://b.example"]

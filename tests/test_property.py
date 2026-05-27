@@ -17,43 +17,43 @@ from hypothesis import strategies as st
 
 from contract import (
     _normalise_task_contract,
-    _normalize_command,
+    normalize_command,
 )
 
 # ---------------------------------------------------------------------------
-# _normalize_command — universal invariants
+# normalize_command — universal invariants
 # ---------------------------------------------------------------------------
 
 @given(st.text())
 def test_normalize_command_always_returns_str(text: str) -> None:
     """Whatever string we pass in, we always get a string back."""
-    result = _normalize_command(text)
+    result = normalize_command(text)
     assert isinstance(result, str)
 
 
 @given(st.text())
 def test_normalize_command_never_raises(text: str) -> None:
-    """_normalize_command must not raise on any text input."""
-    _normalize_command(text)  # should not raise
+    """normalize_command must not raise on any text input."""
+    normalize_command(text)  # should not raise
 
 
 @given(st.none())
 def test_normalize_command_none_is_empty(none_val: None) -> None:
     """None input returns the empty string (documented contract)."""
-    assert _normalize_command(none_val) == ""
+    assert normalize_command(none_val) == ""
 
 
 @given(st.text(alphabet=st.characters(whitelist_categories=("Zs",))))
 def test_normalize_command_whitespace_only_is_empty(ws: str) -> None:
     """Whitespace-only input normalises to the empty string."""
-    assert _normalize_command(ws) == ""
+    assert normalize_command(ws) == ""
 
 
 @given(st.text(), st.text())
 def test_normalize_command_idempotent(text: str, _ignored: str) -> None:
     """Normalising an already-normalised string returns the same string."""
-    once = _normalize_command(text)
-    twice = _normalize_command(once)
+    once = normalize_command(text)
+    twice = normalize_command(once)
     assert once == twice
 
 

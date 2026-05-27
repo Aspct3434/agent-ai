@@ -53,7 +53,7 @@ class ApprovalGate:
     """Tracks pending command approvals and lets the agent await a decision."""
 
     def __init__(self, mode: str | None = None, timeout: float | None = None) -> None:
-        self._mode = (mode or os.getenv("AGENT_REQUIRE_APPROVAL", "off")).lower()
+        self._mode = (mode or os.getenv("AGENT_REQUIRE_APPROVAL") or "off").lower()
         self._timeout = timeout if timeout is not None else float(
             os.getenv("AGENT_APPROVAL_TIMEOUT", "120")
         )

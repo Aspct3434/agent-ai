@@ -48,7 +48,7 @@ _HELP = Panel(
     "  [bold]/help[/bold]          show this message\n"
     "  [bold]/quit[/bold], [bold]/exit[/bold]   leave",
     border_style="cyan",
-    title="ℹ️ Help",
+    title="ℹ️ Help",  # noqa: RUF001 - intentional info glyph in TUI chrome
     title_align="left",
 )
 
@@ -116,7 +116,7 @@ class AgentTUI:
 
     def _read_line(self) -> str | None:
         try:
-            self._console.print("\n[bold green]❯ You[/bold green]")
+            self._console.print("\n[bold green]❯ You[/bold green]")  # noqa: RUF001 - prompt glyph
             return input("  ")
         except EOFError:
             return None
@@ -127,29 +127,42 @@ class AgentTUI:
 
         await ws.send(json.dumps({"session_id": self._session_id, "text": text}))
         tokens: list[str] = []
-        
+
         status = Status("[bold violet]Thinking...[/bold violet]", console=self._console, spinner="dots")
-        status.start()
+        # rich.Status has no public "running" flag, so track it ourselves.
+        status_running = False
+
+        def start_status() -> None:
+            nonlocal status_running
+            status.start()
+            status_running = True
+
+        def stop_status() -> None:
+            nonlocal status_running
+            status.stop()
+            status_running = False
+
+        start_status()
         live = None
-        
+
         try:
             async for raw in ws:
                 event: dict[str, Any] = json.loads(raw)
                 etype = event.get("type")
-                
+
                 if etype == "token":
-                    if status.is_running:
-                        status.stop()
+                    if status_running:
+                        stop_status()
                     if live is None:
                         live = Live(console=self._console, refresh_per_second=15, transient=False)
                         live.start()
                     tokens.append(str(event.get("content") or ""))
                     live.update(Panel(Markdown("".join(tokens)), border_style="violet", title="🤖 Agent", title_align="left"))
                     continue
-                    
+
                 if etype in ("text", "final_answer"):
-                    if status.is_running:
-                        status.stop()
+                    if status_running:
+                        stop_status()
                     if live is not None:
                         live.stop()
                         live = None
@@ -157,32 +170,32 @@ class AgentTUI:
                     if answer and not tokens:
                         self._console.print(Panel(Markdown(answer), border_style="violet", title="🤖 Agent", title_align="left"))
                     return
-                    
+
                 line = render_event(event)
                 if line:
-                    if status.is_running:
+                    if status_running:
                         status.update(f"[bold cyan]Working:[/bold cyan] {line}")
-                        status.stop()
+                        stop_status()
                         self._console.print(f"  [dim]▸ {line}[/dim]")
-                        status.start()
+                        start_status()
                     elif live is not None:
                         live.stop()
                         self._console.print(f"  [dim]▸ {line}[/dim]")
                         live.start()
                     else:
                         self._console.print(f"  [dim]▸ {line}[/dim]")
-                        
+
         except KeyboardInterrupt:
-            if status.is_running:
-                status.stop()
+            if status_running:
+                stop_status()
             if live is not None:
                 live.stop()
             with suppress(Exception):
                 await ws.send(json.dumps({"type": "cancel", "session_id": self._session_id}))
             self._console.print("[yellow]Interrupted.[/yellow]")
         finally:
-            if status.is_running:
-                status.stop()
+            if status_running:
+                stop_status()
             if live is not None:
                 live.stop()
 

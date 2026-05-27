@@ -52,7 +52,7 @@ def test_npm_cli_quickstart_dry_run(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "AGENT AI" in result.stdout
-    assert "[ Security ]" in result.stdout
+    assert "Security warning - please read." in result.stdout
     assert "git clone --branch master https://github.com/Aspct3434/agent-ai.git" in result.stdout
     assert 'AGENT_MODEL="gpt-4o"' in result.stdout
     assert 'AGENT_SANDBOX_HOST_FALLBACK="false"' in result.stdout

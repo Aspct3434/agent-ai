@@ -58,40 +58,15 @@ jobs:
       - name: Run eval harness self-test (no API key required)
         run: python src/eval_harness.py --self-test
 
-      - name: Run unit tests
-        run: |
-          pytest tests/test_gateway.py \
-                 tests/test_distillation.py \
-                 tests/test_tools.py \
-                 tests/test_task_contract_loop.py \
-                 tests/test_shell_platform.py \
-                 tests/test_contract_planning.py \
-                 tests/test_gateway_unit.py \
-                 tests/test_coverage_boost.py \
-                 tests/test_property.py \
-                 tests/test_node_react_scenario.py \
-                 tests/test_plan_contract_robustness.py \
-                 tests/test_toolsets.py \
-                 tests/test_browser_tools.py \
-                 tests/test_telegram_adapter.py \
-                 tests/test_discord_adapter.py \
-                 tests/test_slack_adapter.py \
-                 tests/test_email_adapter.py \
-                 tests/test_progress_format.py \
-                 tests/test_cron_delivery.py \
-                 tests/test_sandbox_selfheal.py \
-                 tests/test_http_sandbox.py \
-                 tests/test_skill_standard.py \
-                 tests/test_skill_evolution.py \
-                 tests/test_tui.py \
-                 tests/test_oauth.py \
-                 tests/test_session_store.py \
-                 tests/test_approvals.py \
-                 -v --tb=short
-        env:
-          PYTHONPATH: src
-
-      - name: Run tests with coverage
+      - name: Run unit tests with coverage
+        # Run the WHOLE tests/ directory (not a hand-picked list) so a newly
+        # added test file can never be silently omitted from CI. Only the three
+        # files that require live backends are skipped:
+        #   test_end_to_end -> needs a real LLM API key
+        #   test_memory     -> needs ChromaDB + Neo4j + sentence-transformers
+        #   test_swarm      -> needs a real LLM API key (multi-agent live run)
+        # This step is a HARD gate (no continue-on-error): any test failure or a
+        # coverage drop below the fail_under threshold fails the build.
         run: |
           pytest tests/ -v --tb=short \
             --ignore=tests/test_end_to_end.py \
@@ -100,7 +75,6 @@ jobs:
             --cov=src --cov-report=term-missing --cov-report=xml
         env:
           PYTHONPATH: src
-        continue-on-error: true  # memory/neo4j tests need real backends
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
@@ -131,7 +105,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install mypy fastapi pydantic litellm mcp aiosqlite
+      - run: pip install mypy fastapi pydantic litellm mcp aiosqlite httpx rich
       - name: mypy
-        run: mypy src/checkpointer.py src/evaluator.py src/memory.py src/gateway.py src/llm_utils.py src/contract.py src/planning.py
-        continue-on-error: true  # incremental; full strict is a separate effort
+        # Hard gate over the whole src/ tree. ignore_missing_imports (set in
+        # pyproject) treats uninstalled heavy deps (chromadb, neo4j, torch,
+        # playwright) as Any, so they don't need to be installed in CI.
+        run: mypy src/

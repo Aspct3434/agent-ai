@@ -18,7 +18,7 @@ import threading
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from mcp import ClientSession
@@ -622,7 +622,7 @@ class _DockerSandbox(_ScriptSandbox):
         clone, or archive extraction. The list is env-tunable via
         ``AGENT_SANDBOX_BASELINE_PACKAGES``.
         """
-        if not _SANDBOX_BASELINE_PACKAGES:
+        if not _SANDBOX_BASELINE_PACKAGES or not self._container_id:
             return
         pkgs = " ".join(_SANDBOX_BASELINE_PACKAGES)
         logger.info("Installing sandbox baseline packages: %s …", pkgs)
@@ -802,7 +802,7 @@ class _DockerSandbox(_ScriptSandbox):
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "sandbox script failed")
-        return json.loads(result.stdout)
+        return cast("dict[str, Any]", json.loads(result.stdout))
 
     # ------------------------------------------------------------------
     # Environment introspection
@@ -958,7 +958,7 @@ class _SSHSandbox(_ScriptSandbox):
             raise TimeoutError from exc
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "ssh sandbox script failed")
-        return json.loads(result.stdout)
+        return cast("dict[str, Any]", json.loads(result.stdout))
 
     def collect_environment_json(self) -> str:
         script = (
@@ -1091,7 +1091,7 @@ class _HttpExecSandbox(_ScriptSandbox):
             raise TimeoutError from exc
         if int(data.get("exit_code", 0)) != 0:
             raise RuntimeError(data.get("stderr") or "http sandbox script failed")
-        return json.loads(data.get("stdout") or "{}")
+        return cast("dict[str, Any]", json.loads(data.get("stdout") or "{}"))
 
     def collect_environment_json(self) -> str:
         probe = (
@@ -1999,7 +1999,7 @@ class ToolManager:
 
         # Sandbox — started eagerly so the environment is ready before the first
         # terminal command and get_system_environment reflects the actual runtime.
-        self._sandbox: _DockerSandbox | _SSHSandbox | None = None
+        self._sandbox: _DockerSandbox | _SSHSandbox | _HttpExecSandbox | None = None
         self._sandbox_startup_failed: bool = False
         self._host_execution_disabled_reason: str | None = None
         if _SANDBOX_ENABLED:
@@ -2037,8 +2037,8 @@ class ToolManager:
                 )
                 ssh.start()
                 self._sandbox = ssh
-                self.current_cwd: str = _SSH_WORKDIR
-                self._env_snapshot: str = ssh.collect_environment_json()
+                self.current_cwd = _SSH_WORKDIR
+                self._env_snapshot = ssh.collect_environment_json()
                 logger.info("Sandbox mode: ssh (%s@%s)", _SSH_USER, _SSH_HOST)
             except Exception as exc:
                 self._sandbox = None
@@ -2567,11 +2567,11 @@ class ToolManager:
             )
             port_info = (evidence.get("ports") or [{}])[0]
             connectable = bool(port_info.get("connectable"))
-            error = port_info.get("error")
+            error: str | None = port_info.get("error")
             scope = "docker_sandbox"
         else:
             connectable = False
-            error: str | None = None
+            error = None
             scope = "host"
             try:
                 with socket.create_connection(("127.0.0.1", service_port), timeout=1.0):
@@ -3239,7 +3239,7 @@ def _resolve_sandbox_cd(command: str, current_cwd: str) -> str | None:
     if not matches:
         return "/root"  # cd with no args goes to ~ which is /root in most containers
 
-    raw = next(g for g in reversed(matches[-1]) if g)
+    raw: str = next(g for g in reversed(matches[-1]) if g)
     if raw == '-':
         return None
     if raw in ('~', '/root', '$HOME'):
@@ -3249,7 +3249,7 @@ def _resolve_sandbox_cd(command: str, current_cwd: str) -> str | None:
 
     if raw.startswith('/'):
         # Absolute POSIX path — normalise .. without using os.path
-        parts = []
+        parts: list[str] = []
         for segment in raw.split('/'):
             if segment in ('', '.'):
                 continue

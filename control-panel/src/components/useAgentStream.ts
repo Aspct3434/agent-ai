@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { withWsToken } from "../lib/api";
 
 export type ToolCallEvent = {
   type: "tool_call";
@@ -72,7 +73,7 @@ export function useAgentStream(url: string): UseAgentStreamReturn {
       if (!activeRef.current) return;
       setStatus("connecting");
 
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(withWsToken(url));
       socketRef.current = ws;
 
       ws.onopen = () => {

@@ -1,6 +1,8 @@
 # ruff: noqa: E402, I001
 import asyncio
 import base64
+import functools
+import hmac
 import json
 import logging
 import os
@@ -21,6 +23,8 @@ load_dotenv(Path(__file__).resolve().parent.parent / "an-api.env")
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agent import AgentEngine, NormalizedMessage
@@ -594,6 +598,15 @@ async def lifespan(app: FastAPI):
 
     scheduler.set_delivery(_deliver)
 
+    if _API_TOKEN:
+        logger.info("API authentication ENABLED (AGENT_API_TOKEN set)")
+    else:
+        logger.warning(
+            "API authentication DISABLED — every endpoint is open. This is fine "
+            "for localhost single-user use, but set AGENT_API_TOKEN before "
+            "exposing the gateway on any reachable network interface."
+        )
+
     try:
         yield
     finally:
@@ -624,6 +637,101 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# API authentication (opt-in bearer token) + CORS
+#
+# The agent can execute shell commands, so an exposed gateway is a real attack
+# surface. Set AGENT_API_TOKEN to require a token on every endpoint (HTTP and
+# WebSocket); leave it blank for the default localhost single-user dev mode.
+# Either `Authorization: Bearer <token>` or `X-API-Key: <token>` is accepted on
+# HTTP; the WebSocket also accepts `?token=<token>` since browsers can't set
+# custom headers on a WS handshake.
+#
+# /health is always open so container/orchestrator health checks and `npx
+# doctor` keep working without a token.
+# ---------------------------------------------------------------------------
+
+_API_TOKEN = os.getenv("AGENT_API_TOKEN", "").strip()
+_AUTH_OPEN_PATHS = frozenset({"/health"})
+
+
+def _token_ok(provided: str | None) -> bool:
+    """Constant-time check of a presented token against AGENT_API_TOKEN.
+
+    Returns True when auth is disabled (no token configured) so the default
+    local dev experience is unchanged.
+    """
+    if not _API_TOKEN:
+        return True
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, _API_TOKEN)
+
+
+def _bearer_or_api_key(authorization: str | None, api_key: str | None) -> str | None:
+    if authorization and authorization[:7].lower() == "bearer ":
+        return authorization[7:].strip()
+    if api_key:
+        return api_key.strip()
+    return None
+
+
+def _http_token(request: Request) -> str | None:
+    return _bearer_or_api_key(
+        request.headers.get("authorization"), request.headers.get("x-api-key")
+    )
+
+
+def _ws_token(websocket: WebSocket) -> str | None:
+    query_token = websocket.query_params.get("token")
+    if query_token:
+        return query_token
+    return _bearer_or_api_key(
+        websocket.headers.get("authorization"), websocket.headers.get("x-api-key")
+    )
+
+
+@app.middleware("http")
+async def _auth_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    if (
+        not _API_TOKEN
+        or request.method == "OPTIONS"
+        or request.url.path in _AUTH_OPEN_PATHS
+    ):
+        return await call_next(request)
+    if _token_ok(_http_token(request)):
+        return await call_next(request)
+    return JSONResponse(
+        {"detail": "Unauthorized"},
+        status_code=401,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _cors_origins() -> list[str]:
+    configured = os.getenv("AGENT_CORS_ORIGINS", "").strip()
+    if configured == "*":
+        return ["*"]
+    if configured:
+        return [o.strip() for o in configured.split(",") if o.strip()]
+    return [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 _PROXY_REQUEST_SKIP_HEADERS = {
@@ -725,7 +833,8 @@ async def clear_logs() -> dict[str, str]:
 
 @app.get("/api/task-graph/{session_id}")
 async def get_task_graph(session_id: str) -> dict[str, Any]:
-    snapshot = app.state.engine.task_graph_snapshot(session_id)
+    engine: AgentEngine = app.state.engine
+    snapshot = engine.task_graph_snapshot(session_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found")
     return snapshot
@@ -733,7 +842,8 @@ async def get_task_graph(session_id: str) -> dict[str, Any]:
 
 @app.post("/api/task-graph/{session_id}/verify")
 async def verify_task_graph(session_id: str) -> dict[str, Any]:
-    result = app.state.engine.verify_task_graph(session_id)
+    engine: AgentEngine = app.state.engine
+    result = engine.verify_task_graph(session_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Session {session_id!r} not found")
     return result
@@ -746,17 +856,20 @@ async def verify_task_graph(session_id: str) -> dict[str, Any]:
 
 @app.get("/api/evolution/status")
 async def evolution_status() -> dict[str, Any]:
-    return app.state.evolution_engine.status()
+    evolution: EvolutionEngine = app.state.evolution_engine
+    return evolution.status()
 
 
 @app.get("/api/evolution/candidates")
 async def list_evolution_candidates(status: str | None = None) -> list[dict[str, Any]]:
-    return app.state.evolution_engine.list_candidates(status=status)
+    evolution: EvolutionEngine = app.state.evolution_engine
+    return evolution.list_candidates(status=status)
 
 
 @app.get("/api/evolution/candidates/{candidate_id}")
 async def get_evolution_candidate(candidate_id: str) -> dict[str, Any]:
-    candidate = app.state.evolution_engine.inspect_candidate(candidate_id)
+    evolution: EvolutionEngine = app.state.evolution_engine
+    candidate = evolution.inspect_candidate(candidate_id)
     if candidate is None:
         raise HTTPException(status_code=404, detail=f"Candidate {candidate_id!r} not found")
     return candidate
@@ -769,7 +882,8 @@ class EvolutionRunRequest(BaseModel):
 @app.post("/api/evolution/run")
 async def run_evolution(payload: EvolutionRunRequest | None = None) -> dict[str, Any]:
     limit = payload.limit if payload is not None else 5
-    result = app.state.evolution_engine.run_cycle(limit=limit)
+    evolution: EvolutionEngine = app.state.evolution_engine
+    result = evolution.run_cycle(limit=limit)
     try:
         await app.state.tools.connect_skills_server()
     except Exception as exc:
@@ -779,7 +893,8 @@ async def run_evolution(payload: EvolutionRunRequest | None = None) -> dict[str,
 
 @app.post("/api/evolution/candidates/{candidate_id}/rollback")
 async def rollback_evolution_candidate(candidate_id: str) -> dict[str, Any]:
-    result = app.state.evolution_engine.rollback(candidate_id)
+    evolution: EvolutionEngine = app.state.evolution_engine
+    result = evolution.rollback(candidate_id)
     if result.get("error") == "candidate not found":
         raise HTTPException(status_code=404, detail=result["error"])
     try:
@@ -819,7 +934,8 @@ async def resolve_approval(request_id: str, payload: ApprovalDecision) -> dict[s
 
 @app.get("/api/auth/status")
 async def auth_status() -> dict[str, Any]:
-    return app.state.oauth.status()
+    oauth: CodexOAuth = app.state.oauth
+    return oauth.status()
 
 
 @app.post("/api/auth/login")
@@ -1029,6 +1145,11 @@ async def ws_stream(websocket: WebSocket) -> None:
       {"type": "tool_call", "tool": "...", "params": {...}}
       {"type": "text",      "content": "..."}
     """
+    if not _token_ok(_ws_token(websocket)):
+        # 1008 = policy violation. Reject before accept so an unauthorized
+        # client never gets an open socket.
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     current_task: asyncio.Task[None] | None = None
 
@@ -1090,7 +1211,7 @@ async def ws_stream(websocket: WebSocket) -> None:
             current_task = asyncio.create_task(stream_turn(msg))
             app.state.active_stream_tasks[session_id] = current_task
             current_task.add_done_callback(
-                lambda task, sid=session_id: cleanup_stream_task(sid, task)
+                functools.partial(cleanup_stream_task, session_id)
             )
     except WebSocketDisconnect:
         if current_task is not None and not current_task.done():
@@ -1143,7 +1264,8 @@ async def set_model_config(payload: ModelConfigRequest) -> dict[str, Any]:
 
 @app.get("/api/persona")
 async def get_persona() -> dict[str, Any]:
-    return app.state.persona.describe()
+    persona: PersonaLoader = app.state.persona
+    return persona.describe()
 
 
 class PersonaLoadRequest(BaseModel):
@@ -1170,7 +1292,8 @@ async def load_persona(payload: PersonaLoadRequest) -> dict[str, Any]:
 
 @app.get("/api/profile")
 async def get_user_profile() -> dict[str, Any]:
-    return app.state.profile_store.get()
+    profile_store: UserProfileStore = app.state.profile_store
+    return profile_store.get()
 
 
 @app.delete("/api/profile")
@@ -1186,12 +1309,14 @@ async def clear_user_profile() -> dict[str, str]:
 
 @app.get("/api/skills")
 async def list_skills() -> list[dict[str, Any]]:
-    return app.state.skill_registry.list_skills()
+    skill_registry: SkillRegistry = app.state.skill_registry
+    return skill_registry.list_skills()
 
 
 @app.get("/api/skills/{skill_name}/export")
 async def export_skill(skill_name: str) -> dict[str, Any]:
-    result = app.state.skill_registry.export_skill(skill_name)
+    skill_registry: SkillRegistry = app.state.skill_registry
+    result = skill_registry.export_skill(skill_name)
     if result is None:
         raise HTTPException(status_code=404, detail=f"Skill {skill_name!r} not found")
     return result
@@ -1261,7 +1386,8 @@ class CronJobRequest(BaseModel):
 
 @app.get("/api/cron/jobs")
 async def list_cron_jobs() -> list[dict[str, Any]]:
-    return app.state.scheduler.list_jobs()
+    scheduler: CronScheduler = app.state.scheduler
+    return scheduler.list_jobs()
 
 
 @app.post("/api/cron/jobs")
@@ -1270,7 +1396,8 @@ async def create_cron_job(payload: CronJobRequest) -> dict[str, Any]:
         _validate_schedule(payload.schedule_type, payload.schedule_spec)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    job = await app.state.scheduler.add_job(
+    scheduler: CronScheduler = app.state.scheduler
+    job = await scheduler.add_job(
         schedule_type=payload.schedule_type,
         schedule_spec=payload.schedule_spec,
         prompt=payload.prompt,
@@ -1283,7 +1410,8 @@ async def create_cron_job(payload: CronJobRequest) -> dict[str, Any]:
 
 @app.get("/api/cron/jobs/{job_id}")
 async def get_cron_job(job_id: str) -> dict[str, Any]:
-    job = app.state.scheduler.get_job(job_id)
+    scheduler: CronScheduler = app.state.scheduler
+    job = scheduler.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
     return job

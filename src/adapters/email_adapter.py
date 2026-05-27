@@ -51,7 +51,7 @@ def _extract_body(msg: email.message.Message) -> str:
                 part.get("Content-Disposition", "")
             ):
                 payload = part.get_payload(decode=True)
-                if payload:
+                if isinstance(payload, bytes):
                     charset = part.get_content_charset() or "utf-8"
                     return payload.decode(charset, "replace")
         return ""

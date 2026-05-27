@@ -184,6 +184,8 @@ class SkillDistiller:
             await asyncio.to_thread(self._write_skill_file, trajectory, skill_code)
 
     async def _synthesize_skill_code(self, trajectory: ExecutionTrajectory) -> str | None:
+        # Only reached after the caller verifies a synthesis model is configured.
+        assert self._model is not None
         step_summary = _summarize_steps_for_prompt(trajectory.steps)
         prompt = _SKILL_SYNTHESIS_PROMPT.format(
             task=trajectory.prompt,
@@ -784,7 +786,9 @@ class SkillRegistry:
     def _load_stats(self) -> dict[str, Any]:
         try:
             if self._stats_file.exists():
-                return json.loads(self._stats_file.read_text(encoding="utf-8"))
+                data = json.loads(self._stats_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
         except Exception:
             pass
         return {}

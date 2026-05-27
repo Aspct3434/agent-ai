@@ -340,8 +340,9 @@ async def _build_live_engine() -> tuple[AgentEngine, Any]:
 
     tools = ToolManager()
     model = os.getenv("AGENT_MODEL", "gpt-4o-mini")
+    memory: Any = _EmptyMemory()
     engine = AgentEngine(
-        memory=_EmptyMemory(),
+        memory=memory,
         tools=tools,
         model=model,
         fast_model=os.getenv("FAST_AGENT_MODEL", model),
@@ -424,7 +425,9 @@ def run_self_test() -> int:
     original = agent_module.litellm.acompletion
     agent_module.litellm.acompletion = model
     try:
-        engine = AgentEngine(memory=_EmptyMemory(), tools=FakeTools(), model="gpt-4o-mini")
+        memory: Any = _EmptyMemory()
+        fake_tools: Any = FakeTools()
+        engine = AgentEngine(memory=memory, tools=fake_tools, model="gpt-4o-mini")
         task = EvalTask(id="selftest_qa", prompt="What is 2 + 2?", check=_check_contains("4"))
         result = asyncio.run(run_task(engine, task))
     finally:

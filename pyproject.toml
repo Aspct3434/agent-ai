@@ -27,9 +27,12 @@ omit = [
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
-# 60% threshold: accounts for gateway/agent/tools paths that need LLM + MCP servers.
-# Pure-Python modules (contract, planning, llm_utils, checkpointer) are 78-92%.
-fail_under = 60
+# 61% line-coverage floor. The ceiling is bounded by gateway/agent/tools paths
+# that need a live LLM + MCP servers to exercise; those are covered separately by
+# the eval harness and integration tests. Pure-Python modules (contract,
+# planning, llm_utils, checkpointer, evolution, task_graph) sit at 78-92%.
+# Type safety is enforced independently by a full-tree mypy hard gate in CI.
+fail_under = 61
 
 [tool.ruff]
 line-length = 100
@@ -41,6 +44,7 @@ ignore = ["E501", "B008", "RUF012"]
 
 [tool.mypy]
 python_version = "3.11"
+mypy_path = "src"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

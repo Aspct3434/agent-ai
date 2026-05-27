@@ -16,21 +16,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent import _filesystem_process_evidence_has_negative_findings
 from contract import (
-    _blocked_action_tool_message,
-    _build_incomplete_contract_cap_message,
-    _can_stream_text_before_final,
-    _contract_completion_status,
-    _duplicate_command_message,
     _evidence_requirement_satisfied,
     _expose_local_http_service_evidence_is_positive,
     _filesystem_process_evidence_is_positive,
-    _last_host_command,
-    _should_block_tool_for_action_task,
     _successful_command_output_evidence,
-    _terminal_failure_recovery_message,
-    _terminal_failure_since_diagnostic,
-    _tool_names_for_contract_status,
     _write_text_file_evidence_is_positive,
+    blocked_action_tool_message,
+    build_incomplete_contract_cap_message,
+    can_stream_text_before_final,
+    contract_completion_status,
+    duplicate_command_message,
+    last_host_command,
+    should_block_tool_for_action_task,
+    terminal_failure_recovery_message,
+    terminal_failure_since_diagnostic,
+    tool_names_for_contract_status,
 )
 from evaluator import ExecutionStep
 from llm_utils import (
@@ -120,7 +120,7 @@ class TestWriteTextFileEvidence:
             )
         ]
 
-        status = _contract_completion_status(
+        status = contract_completion_status(
             contract, messages, steps, contract_required=True
         )
 
@@ -299,21 +299,21 @@ class TestEvidenceRequirementSatisfied:
 
 class TestToolNamesForContractStatus:
     def test_missing_plan(self):
-        names = _tool_names_for_contract_status(
+        names = tool_names_for_contract_status(
             {"evidence_requirements": ["filesystem_artifact"]},
             {"missing": ["plan"]},
         )
         assert names == {"update_plan"}
 
     def test_missing_evidence(self):
-        names = _tool_names_for_contract_status(
+        names = tool_names_for_contract_status(
             {"evidence_requirements": ["filesystem_artifact"]},
             {"missing": ["filesystem_artifact"]},
         )
         assert "write_text_file" in names or "execute_terminal_command" in names
 
     def test_missing_tcp_evidence(self):
-        names = _tool_names_for_contract_status(
+        names = tool_names_for_contract_status(
             {"evidence_requirements": ["running_tcp_service"]},
             {"missing": ["running_tcp_service"]},
         )
@@ -321,14 +321,14 @@ class TestToolNamesForContractStatus:
         assert "get_filesystem_process_evidence" in names
 
     def test_missing_plan_open_steps(self):
-        names = _tool_names_for_contract_status(
+        names = tool_names_for_contract_status(
             {"evidence_requirements": ["filesystem_artifact"]},
             {"missing": ["plan_open_steps"]},
         )
         assert names == {"update_plan"}
 
     def test_complete(self):
-        names = _tool_names_for_contract_status(
+        names = tool_names_for_contract_status(
             {"evidence_requirements": ["filesystem_artifact"]},
             {"missing": []},
         )
@@ -348,15 +348,15 @@ class TestShouldBlockToolForActionTask:
         contract = self._make_contract()
         messages = [{"role": "user", "content": "do something"}]
         steps: list[ExecutionStep] = []
-        assert _should_block_tool_for_action_task(contract, messages, steps, "delegate_task")
+        assert should_block_tool_for_action_task(contract, messages, steps, "delegate_task")
 
     def test_allows_delegate_when_no_contract(self):
-        assert not _should_block_tool_for_action_task(None, [], [], "delegate_task")
+        assert not should_block_tool_for_action_task(None, [], [], "delegate_task")
 
     def test_allows_non_delegate_tool(self):
         contract = self._make_contract()
         messages = [{"role": "user", "content": "do something"}]
-        assert not _should_block_tool_for_action_task(contract, messages, [], "execute_terminal_command")
+        assert not should_block_tool_for_action_task(contract, messages, [], "execute_terminal_command")
 
 
 class TestLastHostCommand:
@@ -365,22 +365,22 @@ class TestLastHostCommand:
             _make_step("execute_terminal_command", "ok"),
         ]
         steps[0].metadata["arguments"] = {"command": "ls -la"}
-        cmd = _last_host_command(steps)
+        cmd = last_host_command(steps)
         assert cmd == "ls -la"
 
     def test_empty_steps(self):
-        assert _last_host_command([]) == ""
+        assert last_host_command([]) == ""
 
 
 class TestBlockedActionToolMessage:
     def test_message_contains_tool_name(self):
-        msg = _blocked_action_tool_message("delegate_task")
+        msg = blocked_action_tool_message("delegate_task")
         assert "delegate_task" in msg
 
 
 class TestDuplicateCommandMessage:
     def test_message_contains_tool_name(self):
-        msg = _duplicate_command_message("execute_terminal_command")
+        msg = duplicate_command_message("execute_terminal_command")
         assert "execute_terminal_command" in msg
 
 
@@ -391,13 +391,13 @@ class TestTerminalFailureRecovery:
             json.dumps({"exit_code": 127, "stderr": "java: not found"}),
             is_error=True,
         )
-        assert _terminal_failure_since_diagnostic([failed])
+        assert terminal_failure_since_diagnostic([failed])
 
         diagnostic = _make_step("get_system_environment", "{}", is_error=False)
-        assert not _terminal_failure_since_diagnostic([failed, diagnostic])
+        assert not terminal_failure_since_diagnostic([failed, diagnostic])
 
     def test_recovery_message_mentions_diagnostic_tools(self):
-        msg = _terminal_failure_recovery_message("java -version")
+        msg = terminal_failure_recovery_message("java -version")
         assert "get_system_environment" in msg
         assert "java -version" in msg
 
@@ -405,7 +405,7 @@ class TestTerminalFailureRecovery:
 class TestBuildIncompleteContractCapMessage:
     def test_contains_prompt_and_missing(self):
         steps: list[ExecutionStep] = []
-        msg = _build_incomplete_contract_cap_message(
+        msg = build_incomplete_contract_cap_message(
             "build a site",
             {"missing": ["filesystem_artifact"]},
             steps,
@@ -417,17 +417,17 @@ class TestBuildIncompleteContractCapMessage:
 class TestCanStreamTextBeforeFinal:
     def test_answer_mode_always_can_stream(self):
         contract = {"mode": "answer"}
-        assert _can_stream_text_before_final(contract, [], [])
+        assert can_stream_text_before_final(contract, [], [])
 
     def test_none_contract_cannot_stream(self):
-        assert not _can_stream_text_before_final(None, [], [])
+        assert not can_stream_text_before_final(None, [], [])
 
     def test_execute_incomplete_cannot_stream(self):
         contract = {
             "mode": "execute",
             "evidence_requirements": ["filesystem_artifact"],
         }
-        assert not _can_stream_text_before_final(contract, [{"role": "user", "content": "go"}], [])
+        assert not can_stream_text_before_final(contract, [{"role": "user", "content": "go"}], [])
 
 
 # ===========================================================================

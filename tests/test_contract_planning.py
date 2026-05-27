@@ -8,14 +8,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from contract import (
-    _build_task_contract_instruction,
-    _filter_tool_schemas,
     _is_continuation_signal,
     _latest_plan,
     _normalise_task_contract,
-    _normalize_command,
     _plan_has_open_steps,
-    _run_set_task_contract,
+    build_task_contract_instruction,
+    filter_tool_schemas,
+    normalize_command,
+    run_set_task_contract,
 )
 from evaluator import ExecutionStep
 from llm_utils import (
@@ -193,7 +193,7 @@ class TestNormaliseTaskContract:
         assert "filesystem_artifact" in contract["evidence_requirements"]
 
     def test_run_set_task_contract_ok(self):
-        result, is_error = _run_set_task_contract({
+        result, is_error = run_set_task_contract({
             "mode": "answer",
             "summary": "Count to ten",
             "success_criteria": ["counted"],
@@ -204,7 +204,7 @@ class TestNormaliseTaskContract:
         assert data["contract_set"] is True
 
     def test_run_set_task_contract_error(self):
-        result, is_error = _run_set_task_contract({"mode": "bad"})
+        result, is_error = run_set_task_contract({"mode": "bad"})
         assert is_error
         assert "error" in result
 
@@ -301,12 +301,12 @@ class TestFilterToolSchemas:
     ]
 
     def test_keeps_named(self):
-        result = _filter_tool_schemas(self.SCHEMAS, {"tool_a", "tool_c"})
+        result = filter_tool_schemas(self.SCHEMAS, {"tool_a", "tool_c"})
         names = [s["function"]["name"] for s in result]
         assert names == ["tool_a", "tool_c"]
 
     def test_empty_set_returns_empty(self):
-        result = _filter_tool_schemas(self.SCHEMAS, set())
+        result = filter_tool_schemas(self.SCHEMAS, set())
         assert result == []
 
 
@@ -316,11 +316,11 @@ class TestFilterToolSchemas:
 
 class TestNormalizeCommand:
     def test_collapses_spaces(self):
-        assert _normalize_command("  rm  -rf  /  ") == "rm -rf /"
+        assert normalize_command("  rm  -rf  /  ") == "rm -rf /"
 
     def test_empty(self):
-        assert _normalize_command("") == ""
-        assert _normalize_command(None) == ""
+        assert normalize_command("") == ""
+        assert normalize_command(None) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +463,7 @@ class TestBuildExecutiveSummary:
 
 class TestBuildTaskContractInstruction:
     def test_mentions_modes(self):
-        instruction = _build_task_contract_instruction()
+        instruction = build_task_contract_instruction()
         assert "answer" in instruction
         assert "execute" in instruction
         assert "set_task_contract" in instruction

@@ -356,7 +356,9 @@ class EvolutionEngine:
         self._skill_registry = skill_registry
         self._model = model
         self._staging_dir = Path(
-            staging_dir or os.getenv("EVOLUTION_STAGING_DIR", str(self._skills_dir / ".evolution"))
+            staging_dir
+            or os.getenv("EVOLUTION_STAGING_DIR")
+            or (self._skills_dir / ".evolution")
         )
 
     @property

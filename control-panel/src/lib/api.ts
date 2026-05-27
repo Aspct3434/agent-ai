@@ -2,10 +2,38 @@
 
 export const API_BASE = "http://127.0.0.1:8000";
 
+// Optional API token. Only needed when the gateway sets AGENT_API_TOKEN.
+// Resolved from localStorage first (lets an operator paste it at runtime),
+// falling back to the VITE_AGENT_API_TOKEN build-time env var.
+export function getApiToken(): string {
+  try {
+    const stored = localStorage.getItem("agent_api_token");
+    if (stored) return stored;
+  } catch {
+    /* localStorage unavailable (SSR / privacy mode) */
+  }
+  return (import.meta.env.VITE_AGENT_API_TOKEN as string | undefined) ?? "";
+}
+
+// Append the token to a WebSocket URL when one is configured; browsers can't
+// set custom headers on a WS handshake, so the gateway also accepts ?token=.
+export function withWsToken(url: string): string {
+  const token = getApiToken();
+  if (!token) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}token=${encodeURIComponent(token)}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getApiToken();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init?.headers as Record<string, string>) ?? {}),
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...init,
+    headers,
   });
   if (!res.ok) {
     let detail = res.statusText;

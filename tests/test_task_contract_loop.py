@@ -583,7 +583,7 @@ def _contract_messages(plan_status: str = "done") -> list[dict[str, Any]]:
 
 def test_execute_contract_requires_matching_structured_evidence() -> None:
     messages = _contract_messages()
-    contract = agent_module._latest_task_contract(messages)
+    contract = agent_module.latest_task_contract(messages)
     mkdir_step = ExecutionStep(
         kind="tool_result",
         content=json.dumps({"exit_code": 0, "stdout": "created", "stderr": ""}),
@@ -615,16 +615,16 @@ def test_execute_contract_requires_matching_structured_evidence() -> None:
         metadata={"tool_name": "write_text_file", "is_error": False},
     )
 
-    mkdir_status = agent_module._contract_completion_status(
+    mkdir_status = agent_module.contract_completion_status(
         contract, messages, [mkdir_step], contract_required=True
     )
-    serve_status = agent_module._contract_completion_status(
+    serve_status = agent_module.contract_completion_status(
         contract, messages, [mkdir_step, serve_step], contract_required=True
     )
-    open_plan_status = agent_module._contract_completion_status(
+    open_plan_status = agent_module.contract_completion_status(
         contract, _contract_messages(plan_status="in_progress"), [serve_step], contract_required=True
     )
-    dual_evidence_status = agent_module._contract_completion_status(
+    dual_evidence_status = agent_module.contract_completion_status(
         {
             **contract,
             "evidence_requirements": [

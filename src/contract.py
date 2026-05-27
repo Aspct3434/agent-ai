@@ -1,13 +1,19 @@
 """Task-contract system: validation, evidence checking, and status gating.
 
 The contract is the agent's binding commitment declared on the first turn of
-every task via ``set_task_contract``.  In execute mode, ``_contract_completion_status``
+every task via ``set_task_contract``.  In execute mode, ``contract_completion_status``
 gates the final answer on structured evidence so "I'll create the file now"
 with no actual tool call is impossible.
 
 Dependency order: this module imports only from ``evaluator`` (for
 ``ExecutionStep``), so it can be safely imported by ``planning`` and ``agent``
 without creating circular dependencies.
+
+Public API: the module-level names *without* a leading underscore (e.g.
+``run_set_task_contract``, ``contract_completion_status``, ``filter_tool_schemas``,
+``normalize_command``) are the intentional cross-module interface consumed by
+``agent`` and ``planning``. Names that keep a leading underscore are private
+helpers internal to this module.
 """
 from __future__ import annotations
 
@@ -26,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_TASK_CONTRACT_TOOL = "set_task_contract"
+TASK_CONTRACT_TOOL = "set_task_contract"
 
 _TASK_CONTRACT_EVIDENCE: frozenset[str] = frozenset(
     {
@@ -39,7 +45,7 @@ _TASK_CONTRACT_EVIDENCE: frozenset[str] = frozenset(
     }
 )
 
-_HOST_EXECUTION_TOOLS: frozenset[str] = frozenset(
+HOST_EXECUTION_TOOLS: frozenset[str] = frozenset(
     {"execute_terminal_command", "execute_background_service"}
 )
 
@@ -137,7 +143,7 @@ def _current_task_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 # ---------------------------------------------------------------------------
-# Minimal plan lookups (needed by _contract_completion_status; kept here to
+# Minimal plan lookups (needed by contract_completion_status; kept here to
 # avoid a circular import: planning.py imports contract, not vice-versa)
 # ---------------------------------------------------------------------------
 
@@ -271,7 +277,7 @@ def _plan_has_open_steps(messages: list[dict[str, Any]]) -> bool:
 # Tool schema filtering
 # ---------------------------------------------------------------------------
 
-def _filter_tool_schemas(
+def filter_tool_schemas(
     tool_schemas: list[dict[str, Any]], names: set[str]
 ) -> list[dict[str, Any]]:
     return [
@@ -281,7 +287,7 @@ def _filter_tool_schemas(
     ]
 
 
-def _tool_names_for_contract_status(
+def tool_names_for_contract_status(
     contract: dict[str, Any], status: dict[str, Any]
 ) -> set[str]:
     missing = set(status.get("missing") or [])
@@ -310,7 +316,7 @@ def _tool_names_for_contract_status(
 # Contract validation and retrieval
 # ---------------------------------------------------------------------------
 
-def _run_set_task_contract(arguments: dict[str, Any]) -> tuple[str, bool]:
+def run_set_task_contract(arguments: dict[str, Any]) -> tuple[str, bool]:
     contract, error = _normalise_task_contract(arguments)
     if error is not None:
         return f"[set_task_contract error] {error}", True
@@ -440,13 +446,13 @@ def _normalise_task_contract(
     )
 
 
-def _latest_task_contract(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+def latest_task_contract(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
     for msg in reversed(_current_task_messages(messages)):
         if msg.get("role") != "assistant":
             continue
         for tc in reversed(msg.get("tool_calls") or []):
             try:
-                if tc["function"]["name"] != _TASK_CONTRACT_TOOL:
+                if tc["function"]["name"] != TASK_CONTRACT_TOOL:
                     continue
                 args = json.loads(tc["function"].get("arguments") or "{}")
             except (KeyError, TypeError, json.JSONDecodeError):
@@ -461,7 +467,7 @@ def _latest_task_contract(messages: list[dict[str, Any]]) -> dict[str, Any] | No
 # Contract completion status
 # ---------------------------------------------------------------------------
 
-def _contract_completion_status(
+def contract_completion_status(
     contract: dict[str, Any] | None,
     messages: list[dict[str, Any]],
     steps: list[ExecutionStep],
@@ -504,7 +510,7 @@ def _contract_completion_status(
     }
 
 
-def _can_stream_text_before_final(
+def can_stream_text_before_final(
     contract: dict[str, Any] | None,
     messages: list[dict[str, Any]],
     steps: list[ExecutionStep],
@@ -514,7 +520,7 @@ def _can_stream_text_before_final(
     if contract.get("mode") == "answer":
         return True
     return bool(
-        _contract_completion_status(
+        contract_completion_status(
             contract, messages, steps, contract_required=False
         )["complete"]
     )
@@ -721,26 +727,26 @@ def _filesystem_process_evidence_is_positive(content: str) -> bool:
 # Command deduplication helpers
 # ---------------------------------------------------------------------------
 
-def _normalize_command(command: Any) -> str:
+def normalize_command(command: Any) -> str:
     """Collapse whitespace so trivially-different spellings compare equal."""
     if not command:
         return ""
     return " ".join(str(command).split())
 
 
-def _last_host_command(steps: list[ExecutionStep]) -> str:
+def last_host_command(steps: list[ExecutionStep]) -> str:
     """Return the most recent host command (terminal/background) run so far."""
     for step in reversed(steps):
         if step.kind != "tool_result":
             continue
-        if step.metadata.get("tool_name") not in _HOST_EXECUTION_TOOLS:
+        if step.metadata.get("tool_name") not in HOST_EXECUTION_TOOLS:
             continue
         arguments = step.metadata.get("arguments") or {}
-        return _normalize_command(arguments.get("command"))
+        return normalize_command(arguments.get("command"))
     return ""
 
 
-def _duplicate_command_message(tool_name: str) -> str:
+def duplicate_command_message(tool_name: str) -> str:
     return (
         f"[skipped] This is identical to the {tool_name} command you just ran; it "
         "was NOT executed again. Its previous result still applies -- do not repeat "
@@ -776,12 +782,12 @@ _STATE_CHANGING_TOOLS: frozenset[str] = frozenset(
 # past this many attempts the model must change approach instead of spinning.
 # A state change resets the count, so a legitimate edit-then-rebuild or
 # start-then-poll loop is never blocked.
-_MAX_IDENTICAL_COMMAND_RUNS = max(
+MAX_IDENTICAL_COMMAND_RUNS = max(
     1, int(os.getenv("AGENT_MAX_IDENTICAL_COMMAND_RUNS", "3"))
 )
 
 
-def _host_command_runs_since_state_change(
+def host_command_runs_since_state_change(
     steps: list[ExecutionStep], command: Any
 ) -> int:
     """Count prior runs of *command* since the most recent state-changing success.
@@ -790,7 +796,7 @@ def _host_command_runs_since_state_change(
     call resets the window, so commands repeated with no intervening host-state
     change are the only ones that accumulate toward the cap.
     """
-    target = _normalize_command(command)
+    target = normalize_command(command)
     if not target:
         return 0
 
@@ -807,20 +813,20 @@ def _host_command_runs_since_state_change(
     for step in steps[start:]:
         if step.kind != "tool_result":
             continue
-        if step.metadata.get("tool_name") not in _HOST_EXECUTION_TOOLS:
+        if step.metadata.get("tool_name") not in HOST_EXECUTION_TOOLS:
             continue
         arguments = step.metadata.get("arguments") or {}
-        if _normalize_command(arguments.get("command")) == target:
+        if normalize_command(arguments.get("command")) == target:
             count += 1
     return count
 
 
-def _repeated_command_message(tool_name: str, command: Any) -> str:
+def repeated_command_message(tool_name: str, command: Any) -> str:
     return (
         f"[skipped: repeated command] You have already run this exact {tool_name} "
         "command several times in this task with nothing changed in between, so it "
         "was NOT executed again:\n"
-        f"  {_normalize_command(command)[:200]}\n"
+        f"  {normalize_command(command)[:200]}\n"
         "Repeating an identical command cannot produce a new result. If it FAILED "
         "before, it is wrong for the active execution environment -- re-read the "
         "execution-environment summary from the start of the session (OS, shell, "
@@ -830,7 +836,7 @@ def _repeated_command_message(tool_name: str, command: Any) -> str:
     )
 
 
-def _terminal_failure_since_diagnostic(steps: list[ExecutionStep]) -> bool:
+def terminal_failure_since_diagnostic(steps: list[ExecutionStep]) -> bool:
     """True if the latest relevant event is a failed terminal command.
 
     This forces a non-terminal diagnostic step between "command failed" and
@@ -850,11 +856,11 @@ def _terminal_failure_since_diagnostic(steps: list[ExecutionStep]) -> bool:
     return False
 
 
-def _terminal_failure_recovery_message(command: Any) -> str:
+def terminal_failure_recovery_message(command: Any) -> str:
     return (
         "[blocked: unresolved terminal failure] The previous terminal command "
         "failed, so this new terminal command was NOT executed:\n"
-        f"  {_normalize_command(command)[:200]}\n"
+        f"  {normalize_command(command)[:200]}\n"
         "First diagnose the failure with a non-terminal tool: call "
         "get_system_environment to confirm OS/shell/runtimes, "
         "get_filesystem_process_evidence to inspect actual files/processes/ports, "
@@ -888,13 +894,13 @@ _REPEAT_CAP_EXEMPT_TOOLS: frozenset[str] = frozenset(
 )
 
 # Host-execution tools have their own command-signature guard
-# (_host_command_runs_since_state_change); exclude them here to avoid double
+# (host_command_runs_since_state_change); exclude them here to avoid double
 # counting and to preserve that path's specialised escalation messaging.
-_GENERIC_CAP_SKIP_TOOLS: frozenset[str] = _REPEAT_CAP_EXEMPT_TOOLS | _HOST_EXECUTION_TOOLS
+GENERIC_CAP_SKIP_TOOLS: frozenset[str] = _REPEAT_CAP_EXEMPT_TOOLS | HOST_EXECUTION_TOOLS
 
 # How many times one tool may be called with identical arguments since the last
 # state change before further identical calls are short-circuited. Env-tunable.
-_MAX_IDENTICAL_TOOL_CALLS = max(
+MAX_IDENTICAL_TOOL_CALLS = max(
     1, int(os.getenv("AGENT_MAX_IDENTICAL_TOOL_CALLS", "3"))
 )
 
@@ -906,7 +912,7 @@ _MAX_IDENTICAL_TOOL_CALLS = max(
 # identical-call guard above catches *exact* repeats; this cap catches the
 # harder "varied spin" pattern where each command is slightly different but the
 # agent is still not making progress. Tunable via env var.
-_MAX_CONSECUTIVE_TERMINAL_COMMANDS = max(
+MAX_CONSECUTIVE_TERMINAL_COMMANDS = max(
     4, int(os.getenv("AGENT_MAX_CONSECUTIVE_TERMINAL_COMMANDS", "8"))
 )
 
@@ -933,7 +939,7 @@ def _is_state_change_reset(step: ExecutionStep) -> bool:
     return name in _STATE_CHANGING_TOOLS or name == "execute_background_service"
 
 
-def _identical_tool_call_runs_since_state_change(
+def identical_tool_call_runs_since_state_change(
     steps: list[ExecutionStep],
     tool_name: str,
     arguments: dict[str, Any],
@@ -963,7 +969,7 @@ def _identical_tool_call_runs_since_state_change(
     return count
 
 
-def _repeated_tool_call_message(tool_name: str, arguments: dict[str, Any]) -> str:
+def repeated_tool_call_message(tool_name: str, arguments: dict[str, Any]) -> str:
     """Block message for a repeated identical tool call.
 
     The redirect is keyed off the *resource being polled* (the ``ports``
@@ -1007,7 +1013,7 @@ def _repeated_tool_call_message(tool_name: str, arguments: dict[str, Any]) -> st
 # a trial-and-error loop that will hit rate limits before making real progress.
 # ---------------------------------------------------------------------------
 
-def _consecutive_terminal_run_length(steps: list[ExecutionStep]) -> int:
+def consecutive_terminal_run_length(steps: list[ExecutionStep]) -> int:
     """Count how many consecutive ``execute_terminal_command`` tool results appear
     at the tail of *steps* with no other tool type in between.
 
@@ -1026,7 +1032,7 @@ def _consecutive_terminal_run_length(steps: list[ExecutionStep]) -> int:
     return count
 
 
-def _consecutive_terminal_cap_message(run_length: int) -> str:
+def consecutive_terminal_cap_message(run_length: int) -> str:
     """Block message for a consecutive terminal-command run that exceeded the cap."""
     return (
         f"[blocked: command-only run ({run_length})] You have issued {run_length} "
@@ -1048,7 +1054,7 @@ def _consecutive_terminal_cap_message(run_length: int) -> str:
 # Action-task tool blocking
 # ---------------------------------------------------------------------------
 
-def _should_block_tool_for_action_task(
+def should_block_tool_for_action_task(
     contract: dict[str, Any] | None,
     messages: list[dict[str, Any]],
     steps: list[ExecutionStep],
@@ -1058,13 +1064,13 @@ def _should_block_tool_for_action_task(
         tool_name == "delegate_task"
         and contract is not None
         and contract.get("mode") == "execute"
-        and not _contract_completion_status(
+        and not contract_completion_status(
             contract, messages, steps, contract_required=False
         )["complete"]
     )
 
 
-def _blocked_action_tool_message(tool_name: str) -> str:
+def blocked_action_tool_message(tool_name: str) -> str:
     return (
         f"[{tool_name} blocked] This is an environment-changing task and the requested "
         "artifacts have not been verified yet. Use execute_terminal_command or "
@@ -1072,7 +1078,7 @@ def _blocked_action_tool_message(tool_name: str) -> str:
     )
 
 
-def _attempted_tool_names(steps: list[ExecutionStep]) -> list[str]:
+def attempted_tool_names(steps: list[ExecutionStep]) -> list[str]:
     return sorted({
         str(step.metadata.get("tool_name"))
         for step in steps
@@ -1084,7 +1090,7 @@ def _attempted_tool_names(steps: list[ExecutionStep]) -> list[str]:
 # Instruction builders (contract-only; plan-aware builders live in planning.py)
 # ---------------------------------------------------------------------------
 
-def _build_task_contract_instruction() -> str:
+def build_task_contract_instruction() -> str:
     return (
         "Before doing any other work, call set_task_contract for the current user "
         "task. Choose mode='answer' for pure text answers. Choose mode='execute' "
@@ -1101,7 +1107,7 @@ def _build_task_contract_instruction() -> str:
     )
 
 
-def _build_incomplete_contract_cap_message(
+def build_incomplete_contract_cap_message(
     original_prompt: str,
     status: dict[str, Any],
     steps: list[ExecutionStep],
@@ -1110,6 +1116,6 @@ def _build_incomplete_contract_cap_message(
         "**Task paused before completion**\n\n"
         f"I could not verify that this request was completed: `{original_prompt}`.\n\n"
         f"**Missing evidence:** {', '.join(status.get('missing', [])) or 'none'}\n"
-        f"**Tools attempted:** {', '.join(_attempted_tool_names(steps)) or 'none'}\n\n"
+        f"**Tools attempted:** {', '.join(attempted_tool_names(steps)) or 'none'}\n\n"
         "Send `continue` and I will resume from the current contract."
     )

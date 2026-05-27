@@ -142,6 +142,19 @@ Open `http://localhost:8000` for the API. Docker Compose serves the chat UI at `
 | `AGENT_SANDBOX_HOST_FALLBACK` | `false` | Allow direct host execution if a requested sandbox fails. The installer sets this to `true` only for sandbox-off host mode. |
 | `AGENT_USE_HYBRID_MEMORY` | `true` | Enable ChromaDB + Neo4j memory |
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j (optional; falls back to Chroma-only) |
+| `AGENT_API_TOKEN` | blank | Require this bearer token on every API/WS request. Blank = open (localhost dev). |
+| `AGENT_CORS_ORIGINS` | localhost | Comma-separated browser CORS allow-list, or `*` for any. |
+
+## API authentication
+
+The gateway drives an agent that can execute shell commands, so the API is a real attack surface once it leaves `localhost`. By default it runs open for single-user local development (and logs a startup warning saying so). To lock it down, set `AGENT_API_TOKEN`:
+
+- **HTTP** — send `Authorization: Bearer <token>` or `X-API-Key: <token>` on every request. Missing/invalid tokens get `401`.
+- **WebSocket** — pass `?token=<token>` on the `/ws/stream` URL (browsers can't set custom WS headers); an unauthorized socket is closed before it opens.
+- **`/health`** stays open with or without a token so container/orchestrator health checks and `npx doctor` keep working.
+- **Control panel** — reads the token from `localStorage["agent_api_token"]` (paste it at runtime) or the `VITE_AGENT_API_TOKEN` build-time var, and attaches it to both REST and WS automatically.
+
+`AGENT_CORS_ORIGINS` controls the browser CORS allow-list (defaults to `localhost:5173` + `localhost:8000`; set explicit origins or `*`).
 
 ## Sign in with OpenAI (Codex OAuth)
 

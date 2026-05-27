@@ -101,7 +101,7 @@ class CodexOAuth:
 
     def __init__(self, store_path: str | Path | None = None) -> None:
         default = Path.home() / ".agent-ai" / "codex_auth.json"
-        self._path = Path(store_path or os.getenv("AGENT_AUTH_FILE", str(default)))
+        self._path = Path(store_path or os.getenv("AGENT_AUTH_FILE") or default)
         self._pending: dict[str, str] = {}  # state -> code_verifier
         self._lock = threading.Lock()
         self._tokens = self._load()

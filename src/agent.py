@@ -14,34 +14,34 @@ from pydantic import BaseModel
 
 from checkpointer import StateCheckpointer
 from contract import (
-    _GENERIC_CAP_SKIP_TOOLS,
-    _HOST_EXECUTION_TOOLS,
-    _MAX_CONSECUTIVE_TERMINAL_COMMANDS,
-    _MAX_IDENTICAL_COMMAND_RUNS,
-    _MAX_IDENTICAL_TOOL_CALLS,
-    _TASK_CONTRACT_TOOL,
-    _attempted_tool_names,
-    _blocked_action_tool_message,
-    _build_incomplete_contract_cap_message,
-    _build_task_contract_instruction,
-    _can_stream_text_before_final,
-    _consecutive_terminal_cap_message,
-    _consecutive_terminal_run_length,
-    _contract_completion_status,
-    _duplicate_command_message,
-    _filter_tool_schemas,
-    _host_command_runs_since_state_change,
-    _identical_tool_call_runs_since_state_change,
-    _last_host_command,
-    _latest_task_contract,
-    _normalize_command,
-    _repeated_command_message,
-    _repeated_tool_call_message,
-    _run_set_task_contract,
-    _should_block_tool_for_action_task,
-    _terminal_failure_recovery_message,
-    _terminal_failure_since_diagnostic,
-    _tool_names_for_contract_status,
+    GENERIC_CAP_SKIP_TOOLS,
+    HOST_EXECUTION_TOOLS,
+    MAX_CONSECUTIVE_TERMINAL_COMMANDS,
+    MAX_IDENTICAL_COMMAND_RUNS,
+    MAX_IDENTICAL_TOOL_CALLS,
+    TASK_CONTRACT_TOOL,
+    attempted_tool_names,
+    blocked_action_tool_message,
+    build_incomplete_contract_cap_message,
+    build_task_contract_instruction,
+    can_stream_text_before_final,
+    consecutive_terminal_cap_message,
+    consecutive_terminal_run_length,
+    contract_completion_status,
+    duplicate_command_message,
+    filter_tool_schemas,
+    host_command_runs_since_state_change,
+    identical_tool_call_runs_since_state_change,
+    last_host_command,
+    latest_task_contract,
+    normalize_command,
+    repeated_command_message,
+    repeated_tool_call_message,
+    run_set_task_contract,
+    should_block_tool_for_action_task,
+    terminal_failure_recovery_message,
+    terminal_failure_since_diagnostic,
+    tool_names_for_contract_status,
 )
 from evaluator import (
     ExecutionStep,
@@ -373,7 +373,7 @@ def _preferred_recovery_tool_name(
             return "execute_terminal_command"
 
         if requirement == "filesystem_artifact":
-            if any(name in succeeded for name in _HOST_EXECUTION_TOOLS):
+            if any(name in succeeded for name in HOST_EXECUTION_TOOLS):
                 if "get_filesystem_process_evidence" in available_tool_names:
                     return "get_filesystem_process_evidence"
             if any(token in text for token in ("install", "build", "download", "run", "compile")):
@@ -1133,7 +1133,7 @@ class AgentEngine:
         *,
         contract_required: bool,
     ) -> dict[str, Any]:
-        status = _contract_completion_status(
+        status = contract_completion_status(
             contract,
             messages,
             steps,
@@ -1176,7 +1176,7 @@ class AgentEngine:
         if graph_status.get("source") == "explicit" and not graph_status.get("complete"):
             return self._task_graph.allowed_tools_for_next(messages, steps)
 
-        allowed = _tool_names_for_contract_status(contract, status)
+        allowed = tool_names_for_contract_status(contract, status)
         missing = set(status.get("missing") or [])
         if "plan" in missing:
             allowed.update({SET_TASK_GRAPH_TOOL_NAME, INSPECT_TASK_GRAPH_TOOL_NAME})
@@ -1219,7 +1219,7 @@ class AgentEngine:
         if tool_schemas and self._caching_enabled:
             tool_schemas[-1]["cache_control"] = {"type": "ephemeral"}
         tool_index: dict[str, str] = {t["name"]: t["server"] for t in all_tools}
-        contract_tool_available = any(t["name"] == _TASK_CONTRACT_TOOL for t in all_tools)
+        contract_tool_available = any(t["name"] == TASK_CONTRACT_TOOL for t in all_tools)
         contract_required = self._require_task_contract and contract_tool_available
 
         completion_kwargs: dict[str, Any] = {
@@ -1250,7 +1250,7 @@ class AgentEngine:
                 if iteration > 0:
                     yield {"type": "status", "message": "Thinking..."}
 
-                contract = _latest_task_contract(messages)
+                contract = latest_task_contract(messages)
                 must_set_contract = contract_required and contract is None
                 completion_status = self._completion_status_with_task_graph(
                     contract,
@@ -1280,10 +1280,10 @@ class AgentEngine:
                 if must_set_contract:
                     request_messages = [
                         *request_messages,
-                        {"role": "system", "content": _build_task_contract_instruction()},
+                        {"role": "system", "content": build_task_contract_instruction()},
                     ]
-                    request_tool_schemas = _filter_tool_schemas(
-                        tool_schemas, {_TASK_CONTRACT_TOOL}
+                    request_tool_schemas = filter_tool_schemas(
+                        tool_schemas, {TASK_CONTRACT_TOOL}
                     )
                 elif needs_execution:
                     assert contract is not None  # needs_execution implies contract is set
@@ -1321,7 +1321,7 @@ class AgentEngine:
                             + recovery_note,
                         },
                     ]
-                    request_tool_schemas = _filter_tool_schemas(
+                    request_tool_schemas = filter_tool_schemas(
                         tool_schemas,
                         allowed_tool_names,
                     )
@@ -1388,7 +1388,7 @@ class AgentEngine:
                                 elif delta.content and is_text_response is None:
                                     is_text_response = True
                                 if is_text_response and delta.content:
-                                    if _can_stream_text_before_final(contract, messages, steps):
+                                    if can_stream_text_before_final(contract, messages, steps):
                                         emitted_tokens = True
                                         yield {"type": "token", "content": delta.content}
                                     else:
@@ -1405,7 +1405,7 @@ class AgentEngine:
                 if choice.finish_reason != "tool_calls" or not assistant_msg.tool_calls:
                     final_response = assistant_msg.content or ""
                     final_status = self._completion_status_with_task_graph(
-                        _latest_task_contract(messages),
+                        latest_task_contract(messages),
                         messages,
                         steps,
                         contract_required=contract_required,
@@ -1413,7 +1413,7 @@ class AgentEngine:
                     if not final_status["complete"]:
                         contract_text_rejections += 1
                         forced_recovery_tool = _preferred_recovery_tool_name(
-                            _latest_task_contract(messages),
+                            latest_task_contract(messages),
                             final_status,
                             steps,
                             original_prompt,
@@ -1436,7 +1436,7 @@ class AgentEngine:
                             }
 
                         instruction = _build_contract_continuation_instruction(
-                            _latest_task_contract(messages),
+                            latest_task_contract(messages),
                             final_status,
                             final_response,
                             messages,
@@ -1457,13 +1457,13 @@ class AgentEngine:
                             "(contract_mode=%s, missing=%s, open_plan=%s, attempted_tools=%s): %r",
                             session_id,
                             (
-                                (_latest_task_contract(messages) or {}).get("mode")
-                                if _latest_task_contract(messages)
+                                (latest_task_contract(messages) or {}).get("mode")
+                                if latest_task_contract(messages)
                                 else "missing"
                             ),
                             final_status["missing"],
                             final_status["plan_open"],
-                            _attempted_tool_names(steps),
+                            attempted_tool_names(steps),
                             final_response[:120],
                         )
                         yield {
@@ -1489,7 +1489,7 @@ class AgentEngine:
                         continue
                     final_response = _ensure_evidence_in_final_response(
                         final_response,
-                        contract=_latest_task_contract(messages),
+                        contract=latest_task_contract(messages),
                         original_prompt=original_prompt,
                         steps=steps,
                         messages=messages,
@@ -1625,7 +1625,7 @@ class AgentEngine:
             # Transient instruction -- kept out of the persisted history so it does
             # not leak into the next turn; only the summary reply is recorded.
             cap_status = self._completion_status_with_task_graph(
-                _latest_task_contract(messages),
+                latest_task_contract(messages),
                 messages,
                 steps,
                 contract_required=contract_required,
@@ -1634,7 +1634,7 @@ class AgentEngine:
                 # Don't terminate here: hand control back to the auto-continuing
                 # driver with whether this batch made progress. The driver either
                 # launches another batch or surfaces this paused message.
-                final_response = _build_incomplete_contract_cap_message(
+                final_response = build_incomplete_contract_cap_message(
                     original_prompt, cap_status, steps
                 )
                 tools_attempted = sorted({
@@ -1748,7 +1748,7 @@ class AgentEngine:
             )
 
         final_contract_status = self._completion_status_with_task_graph(
-            _latest_task_contract(messages),
+            latest_task_contract(messages),
             messages,
             steps,
             contract_required=contract_required,
@@ -1825,12 +1825,12 @@ class AgentEngine:
                     results[tc_id] = (graph_block, True, "__builtin__")
                     continue
                 if (
-                    name not in _GENERIC_CAP_SKIP_TOOLS
-                    and _identical_tool_call_runs_since_state_change(steps, name, args)
-                    >= _MAX_IDENTICAL_TOOL_CALLS
+                    name not in GENERIC_CAP_SKIP_TOOLS
+                    and identical_tool_call_runs_since_state_change(steps, name, args)
+                    >= MAX_IDENTICAL_TOOL_CALLS
                 ):
                     results[tc_id] = (
-                        _repeated_tool_call_message(name, args),
+                        repeated_tool_call_message(name, args),
                         True,
                         "__builtin__",
                     )
@@ -1849,7 +1849,7 @@ class AgentEngine:
         # Track the most recent host command so an immediately-repeated,
         # identical one is short-circuited -- the real anti-spin guard
         # (e.g. the model issuing `mkdir -p x` twice).
-        last_host_cmd = _last_host_command(steps)
+        last_host_cmd = last_host_command(steps)
         # Count identical-command repeats accumulated *within this iteration* so a
         # command emitted several times in one turn also trips the cap; the
         # cross-iteration count is recovered from `steps` via the helper.
@@ -1857,11 +1857,11 @@ class AgentEngine:
         # Consecutive terminal-command run counter: cross-turn baseline + intra-turn
         # accumulator. Catches "varied spin" where commands differ but the agent is
         # still running terminal-only calls with no evidence/file-write in between.
-        local_terminal_run_count = _consecutive_terminal_run_length(steps)
+        local_terminal_run_count = consecutive_terminal_run_length(steps)
         for tc_id, name, args in serial:
-            cmd = _normalize_command(args.get("command")) if name in _HOST_EXECUTION_TOOLS else ""
+            cmd = normalize_command(args.get("command")) if name in HOST_EXECUTION_TOOLS else ""
             repeat_runs = (
-                _host_command_runs_since_state_change(steps, cmd)
+                host_command_runs_since_state_change(steps, cmd)
                 + local_repeat_counts.get(cmd, 0)
                 if cmd
                 else 0
@@ -1871,23 +1871,23 @@ class AgentEngine:
                 results[tc_id] = (graph_block, True, "__builtin__")
             elif (
                 not self._task_graph_explicitly_allows(name, messages, steps)
-                and _should_block_tool_for_action_task(
-                    _latest_task_contract(messages), messages, steps, name
+                and should_block_tool_for_action_task(
+                    latest_task_contract(messages), messages, steps, name
                 )
             ):
-                results[tc_id] = (_blocked_action_tool_message(name), True, "__builtin__")
+                results[tc_id] = (blocked_action_tool_message(name), True, "__builtin__")
             elif (
                 name == "execute_terminal_command"
-                and _terminal_failure_since_diagnostic(steps)
+                and terminal_failure_since_diagnostic(steps)
             ):
                 results[tc_id] = (
-                    _terminal_failure_recovery_message(args.get("command")),
+                    terminal_failure_recovery_message(args.get("command")),
                     True,
                     "__builtin__",
                 )
             elif (
                 name == "execute_terminal_command"
-                and local_terminal_run_count >= _MAX_CONSECUTIVE_TERMINAL_COMMANDS
+                and local_terminal_run_count >= MAX_CONSECUTIVE_TERMINAL_COMMANDS
             ):
                 # Varied-spin guard: too many terminal commands in a row with no
                 # other tool type (evidence check, file write, etc.) in between.
@@ -1895,27 +1895,27 @@ class AgentEngine:
                 # command is different -- the problem is the *lack of inspection*,
                 # not the repetition of one specific command.
                 results[tc_id] = (
-                    _consecutive_terminal_cap_message(local_terminal_run_count),
+                    consecutive_terminal_cap_message(local_terminal_run_count),
                     True,
                     "__builtin__",
                 )
-            elif cmd and repeat_runs >= _MAX_IDENTICAL_COMMAND_RUNS:
+            elif cmd and repeat_runs >= MAX_IDENTICAL_COMMAND_RUNS:
                 # Identical command re-run too many times with no state change in
                 # between -- a spin. Hard-block it (is_error=True) so the loop also
                 # escalates the model tier instead of burning the whole budget.
                 local_repeat_counts[cmd] = local_repeat_counts.get(cmd, 0) + 1
-                results[tc_id] = (_repeated_command_message(name, cmd), True, "__builtin__")
+                results[tc_id] = (repeated_command_message(name, cmd), True, "__builtin__")
             elif cmd and cmd == last_host_cmd:
-                results[tc_id] = (_duplicate_command_message(name), False, "__builtin__")
+                results[tc_id] = (duplicate_command_message(name), False, "__builtin__")
             elif (
                 not cmd
-                and name not in _GENERIC_CAP_SKIP_TOOLS
-                and _identical_tool_call_runs_since_state_change(steps, name, args)
-                >= _MAX_IDENTICAL_TOOL_CALLS
+                and name not in GENERIC_CAP_SKIP_TOOLS
+                and identical_tool_call_runs_since_state_change(steps, name, args)
+                >= MAX_IDENTICAL_TOOL_CALLS
             ):
                 # Generic anti-spin guard for non-host serial tools (e.g. MCP
                 # reads): identical call, no state change, no new information.
-                results[tc_id] = (_repeated_tool_call_message(name, args), True, "__builtin__")
+                results[tc_id] = (repeated_tool_call_message(name, args), True, "__builtin__")
             else:
                 results[tc_id] = await self._execute_single_tool(
                     name, args, messages, steps, tool_index, session_id
@@ -1924,7 +1924,7 @@ class AgentEngine:
                     last_host_cmd = cmd
                     local_repeat_counts[cmd] = local_repeat_counts.get(cmd, 0) + 1
                 # A successful execute_terminal_command extends the run; reset only
-                # when a non-terminal tool runs (handled by _consecutive_terminal_run_length).
+                # when a non-terminal tool runs (handled by consecutive_terminal_run_length).
                 if name == "execute_terminal_command":
                     local_terminal_run_count += 1
 
@@ -2121,8 +2121,8 @@ class AgentEngine:
             return content, is_error, "__builtin__"
         if tool_name == VERIFY_TASK_GRAPH_TOOL_NAME:
             return json.dumps(self._task_graph.verify(messages, steps), indent=2), False, "__builtin__"
-        if tool_name == _TASK_CONTRACT_TOOL:
-            content, is_error = _run_set_task_contract(arguments)
+        if tool_name == TASK_CONTRACT_TOOL:
+            content, is_error = run_set_task_contract(arguments)
             return content, is_error, "__builtin__"
 
         if tool_name == "analyze_image":
@@ -2137,8 +2137,8 @@ class AgentEngine:
                 return f"[generate_image error] {exc}", True, "__builtin__"
         if tool_name == "schedule_task":
             try:
-                result = await self._schedule_task(arguments, session_id)
-                return result, False, "__builtin__"
+                output = await self._schedule_task(arguments, session_id)
+                return output, False, "__builtin__"
             except Exception as exc:
                 return f"[schedule_task error] {exc}", True, "__builtin__"
         if tool_name == "list_scheduled_tasks":
@@ -2173,22 +2173,22 @@ class AgentEngine:
                 return f"[inspect_evolution_candidate error] {exc}", True, "__builtin__"
         if tool_name == "run_evolution_cycle":
             try:
-                result = self._run_evolution_cycle(arguments)
+                output = self._run_evolution_cycle(arguments)
                 try:
                     await self._tools.connect_skills_server()
                 except Exception as exc:
                     logger.warning("run_evolution_cycle: skills reconnect failed: %s", exc)
-                return result, False, "__builtin__"
+                return output, False, "__builtin__"
             except Exception as exc:
                 return f"[run_evolution_cycle error] {exc}", True, "__builtin__"
         if tool_name == "rollback_evolution_candidate":
             try:
-                result = self._rollback_evolution_candidate(arguments)
+                output = self._rollback_evolution_candidate(arguments)
                 try:
                     await self._tools.connect_skills_server()
                 except Exception as exc:
                     logger.warning("rollback_evolution_candidate: skills reconnect failed: %s", exc)
-                return result, False, "__builtin__"
+                return output, False, "__builtin__"
             except Exception as exc:
                 return f"[rollback_evolution_candidate error] {exc}", True, "__builtin__"
 
@@ -2323,14 +2323,14 @@ class AgentEngine:
         messages: list[dict[str, Any]],
         steps: list[ExecutionStep],
     ) -> str | None:
-        contract = _latest_task_contract(messages)
+        contract = latest_task_contract(messages)
         if contract is None or contract.get("mode") != "execute":
             return None
         graph_status = self._task_graph.completion_status(messages, steps)
         if graph_status.get("source") != "explicit" or graph_status.get("complete"):
             return None
         allowed = self._task_graph.allowed_tools_for_next(messages, steps)
-        if tool_name in allowed or tool_name == _TASK_CONTRACT_TOOL:
+        if tool_name in allowed or tool_name == TASK_CONTRACT_TOOL:
             return None
         active = graph_status.get("active_node") or {}
         return (
@@ -2346,7 +2346,7 @@ class AgentEngine:
         messages: list[dict[str, Any]],
         steps: list[ExecutionStep],
     ) -> bool:
-        contract = _latest_task_contract(messages)
+        contract = latest_task_contract(messages)
         if contract is None or contract.get("mode") != "execute":
             return False
         graph_status = self._task_graph.completion_status(messages, steps)
@@ -2964,15 +2964,19 @@ def _summarize_host_environment(
         )
 
     os_label = str(data.get("os") or "unknown")
-    shell = data.get("shell") if isinstance(data.get("shell"), dict) else {}
+    shell_raw = data.get("shell")
+    shell = shell_raw if isinstance(shell_raw, dict) else {}
     shell_name = str(shell.get("shell") or "unknown")
     posix = bool(shell.get("posix"))
-    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    user_raw = data.get("user")
+    user = user_raw if isinstance(user_raw, dict) else {}
     is_root = bool(user.get("is_root"))
     sudo = bool(user.get("sudo_available"))
-    runtimes = data.get("runtimes") if isinstance(data.get("runtimes"), dict) else {}
+    runtimes_raw = data.get("runtimes")
+    runtimes = runtimes_raw if isinstance(runtimes_raw, dict) else {}
     available = sorted(name for name, present in runtimes.items() if present)
-    sandbox = data.get("sandbox") if isinstance(data.get("sandbox"), dict) else {}
+    sandbox_raw = data.get("sandbox")
+    sandbox = sandbox_raw if isinstance(sandbox_raw, dict) else {}
 
     pkg_present = [name for name in _OS_PACKAGE_MANAGERS if name in available]
     runtime_present = [name for name in available if name not in _OS_PACKAGE_MANAGERS]
