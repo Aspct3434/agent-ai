@@ -154,6 +154,43 @@ def test_verifier_rejects_fake_evidence_ref() -> None:
     assert result["invalid_evidence_refs"][0]["evidence_ref"] == "missing_call"
 
 
+def test_verifier_infers_real_evidence_when_ref_name_is_wrong() -> None:
+    engine = TaskGraphEngine()
+    messages = [
+        {"role": "user", "content": "write file"},
+        _assistant_tool(
+            "set_task_graph",
+            {
+                "nodes": [
+                    {
+                        "id": "write",
+                        "title": "Write artifact",
+                        "kind": "write",
+                        "status": "done",
+                        "allowed_tools": ["write_text_file"],
+                        "proof_requirements": ["filesystem_artifact"],
+                        "evidence_refs": ["hallucinated_ref"],
+                    }
+                ]
+            },
+        ),
+    ]
+    steps = [
+        _tool_step(
+            "write_text_file",
+            "call_write",
+            {"written": True, "exists": True, "size_bytes": 12},
+        )
+    ]
+
+    result = engine.verify(messages, steps)
+
+    assert result["passed"] is True
+    assert result["invalid_evidence_refs"] == []
+    assert result["ignored_invalid_evidence_refs"][0]["evidence_ref"] == "hallucinated_ref"
+    assert result["proof_report"][0]["suggested_evidence_refs"] == ["call_write"]
+
+
 def test_verifier_accepts_real_file_and_command_evidence() -> None:
     engine = TaskGraphEngine()
     messages = [

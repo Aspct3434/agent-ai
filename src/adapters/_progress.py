@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from contract import background_service_misuse_message
+
 # Internal / read-only introspection tools that produce no user-visible step.
 # Keeping these out of the feed stops it from being drowned in noise.
 _SILENT_TOOLS: frozenset[str] = frozenset(
@@ -56,6 +58,9 @@ def format_tool_call(tool: str, params: dict[str, Any]) -> str | None:
     if tool == "execute_terminal_command":
         return f"🔧 Running: {_truncate(str(params.get('command', '')), 300)}"
     if tool == "execute_background_service":
+        command = str(params.get("command", ""))
+        if background_service_misuse_message(command):
+            return f"[blocked] Background probe: {_truncate(command, 260)}"
         return f"🚀 Starting service: {_truncate(str(params.get('command', '')), 300)}"
     if tool in ("write_text_file", "write_file"):
         return f"📝 Writing {params.get('path') or params.get('file_path') or '(file)'}"

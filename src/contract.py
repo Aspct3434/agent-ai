@@ -734,6 +734,181 @@ def normalize_command(command: Any) -> str:
     return " ".join(str(command).split())
 
 
+_LONG_RUNNING_SERVICE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+http\.server\b",
+        r"\buvicorn\b",
+        r"\bgunicorn\b",
+        r"\bhypercorn\b",
+        r"\bflask\s+run\b",
+        r"\bstreamlit\s+run\b",
+        r"\b(?:npm|pnpm|yarn)\s+(?:run\s+)?dev\b",
+        r"\b(?:npm|pnpm|yarn)\s+start\b",
+        r"\b(?:vite|next\s+dev|astro\s+dev|remix\s+dev)\b",
+        r"\b(?:serve|http-server)\b",
+        (
+            r"\b(?:node|python(?:\d+(?:\.\d+)?)?)\s+[^;&|]*"
+            r"(?:server|app|main)\.(?:js|mjs|cjs|ts|py)\b"
+        ),
+    )
+)
+
+_FINITE_BACKGROUND_PROGRAMS: frozenset[str] = frozenset(
+    {
+        "awk",
+        "cat",
+        "curl",
+        "df",
+        "du",
+        "echo",
+        "false",
+        "find",
+        "grep",
+        "head",
+        "hostname",
+        "ifconfig",
+        "ip",
+        "lsof",
+        "ls",
+        "netstat",
+        "pgrep",
+        "ps",
+        "pwd",
+        "sed",
+        "ss",
+        "stat",
+        "tail",
+        "test",
+        "true",
+        "wc",
+        "wget",
+        "which",
+        "where",
+    }
+)
+
+_FINITE_NPM_COMMANDS: frozenset[str] = frozenset(
+    {"audit", "build", "ci", "install", "lint", "pack", "publish", "test"}
+)
+
+
+def _looks_like_long_running_service_command(command: str) -> bool:
+    return any(pattern.search(command) for pattern in _LONG_RUNNING_SERVICE_PATTERNS)
+
+
+def _split_shell_segments(command: str) -> list[str]:
+    return [
+        segment.strip()
+        for segment in re.split(r"\s*(?:&&|\|\||[|;])\s*", command)
+        if segment.strip()
+    ]
+
+
+def _command_words(segment: str) -> list[str]:
+    cleaned = segment.strip().strip("()")
+    if not cleaned:
+        return []
+    return cleaned.split()
+
+
+def _program_basename(token: str) -> str:
+    token = token.strip("\"'").rstrip(":")
+    token = token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return token.lower()
+
+
+def _first_effective_program(words: list[str]) -> tuple[str, list[str]]:
+    index = 0
+    while index < len(words):
+        word = words[index]
+        lowered = _program_basename(word)
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", word):
+            index += 1
+            continue
+        if lowered in {"sudo", "command", "env", "time", "nohup"}:
+            index += 1
+            continue
+        if lowered == "timeout":
+            index += 2 if index + 1 < len(words) else 1
+            continue
+        return lowered, words[index + 1 :]
+    return "", []
+
+
+def _python_background_invocation_is_finite(program: str, args: list[str]) -> bool:
+    if not re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", program):
+        return False
+    if not args:
+        return True
+    first = args[0].lower()
+    if first in {"-c", "-v", "-vv", "-h", "--help", "--version"}:
+        return True
+    if first == "-m" and len(args) > 1:
+        module = args[1].lower()
+        return module in {"pip", "pytest", "unittest", "compileall", "venv"}
+    return False
+
+
+def _node_background_invocation_is_finite(program: str, args: list[str]) -> bool:
+    if program != "node":
+        return False
+    if not args:
+        return True
+    return args[0].lower() in {"-e", "-p", "--eval", "--print", "-v", "--version"}
+
+
+def _npm_background_invocation_is_finite(program: str, args: list[str]) -> bool:
+    if program not in {"npm", "pnpm", "yarn", "npx"} or not args:
+        return False
+    first = args[0].lower()
+    if first == "run" and len(args) > 1:
+        return args[1].lower() in _FINITE_NPM_COMMANDS
+    return first in _FINITE_NPM_COMMANDS
+
+
+def looks_like_finite_background_command(command: Any) -> bool:
+    """Return True when a background-service command is clearly finite/probing.
+
+    The classifier is intentionally conservative: unknown commands are allowed
+    because they may be custom daemons, while common one-shot diagnostics and
+    build/test/install commands are blocked from ``execute_background_service``.
+    """
+    normalized = normalize_command(command)
+    if not normalized:
+        return True
+    if _looks_like_long_running_service_command(normalized):
+        return False
+
+    for segment in _split_shell_segments(normalized):
+        program, args = _first_effective_program(_command_words(segment))
+        if not program:
+            continue
+        if program in _FINITE_BACKGROUND_PROGRAMS:
+            return True
+        if _python_background_invocation_is_finite(program, args):
+            return True
+        if _node_background_invocation_is_finite(program, args):
+            return True
+        if _npm_background_invocation_is_finite(program, args):
+            return True
+    return False
+
+
+def background_service_misuse_message(command: Any) -> str | None:
+    if not looks_like_finite_background_command(command):
+        return None
+    return (
+        "[execute_background_service blocked: finite/probe command] This command "
+        "looks like a diagnostic, build, test, install, or other finite command, "
+        "so it was NOT started as a background service:\n"
+        f"  {normalize_command(command)[:200]}\n"
+        "Use execute_terminal_command for commands that should finish. Reserve "
+        "execute_background_service only for non-terminating servers, daemons, "
+        "watchers, and development servers."
+    )
+
+
 def last_host_command(steps: list[ExecutionStep]) -> str:
     """Return the most recent host command (terminal/background) run so far."""
     for step in reversed(steps):

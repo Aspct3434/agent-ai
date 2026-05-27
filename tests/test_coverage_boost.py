@@ -14,7 +14,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent import AgentEngine, _filesystem_process_evidence_has_negative_findings
+from agent import (
+    AgentEngine,
+    _filesystem_process_evidence_has_negative_findings,
+    _should_emit_tool_call_progress,
+)
 from contract import (
     MAX_CONSECUTIVE_VERIFICATION_CALLS,
     _evidence_requirement_satisfied,
@@ -22,6 +26,7 @@ from contract import (
     _filesystem_process_evidence_is_positive,
     _successful_command_output_evidence,
     _write_text_file_evidence_is_positive,
+    background_service_misuse_message,
     blocked_action_tool_message,
     build_incomplete_contract_cap_message,
     can_stream_text_before_final,
@@ -29,6 +34,7 @@ from contract import (
     contract_completion_status,
     duplicate_command_message,
     last_host_command,
+    looks_like_finite_background_command,
     should_block_tool_for_action_task,
     terminal_failure_recovery_message,
     terminal_failure_since_diagnostic,
@@ -337,6 +343,32 @@ class TestConsecutiveVerificationRun:
         assert consecutive_verification_run_length(steps) == 0
 
 
+class TestBackgroundServiceCommandClassifier:
+    def test_blocks_shell_probe_chain(self):
+        command = "ss -tlnp | grep 3000 || netstat -tlnp | grep 3000 || lsof -i :3000"
+        assert looks_like_finite_background_command(command)
+        assert "finite/probe" in str(background_service_misuse_message(command))
+
+    def test_blocks_common_finite_commands(self):
+        for command in (
+            "curl -s http://localhost:3000",
+            "ls -la site && wc -l site/index.html",
+            "npm run build",
+            "python -m pytest",
+        ):
+            assert looks_like_finite_background_command(command), command
+
+    def test_allows_common_long_running_servers(self):
+        for command in (
+            "cd site && python3 -m http.server 3000",
+            "uvicorn app:app --host 0.0.0.0 --port 8000",
+            "npm run dev -- --host 0.0.0.0",
+            "python app.py",
+        ):
+            assert not looks_like_finite_background_command(command), command
+            assert background_service_misuse_message(command) is None
+
+
 class TestVerificationLoopDispatchGuard:
     @pytest.mark.asyncio
     async def test_parallel_verification_tool_is_blocked_after_cap(self):
@@ -365,6 +397,61 @@ class TestVerificationLoopDispatchGuard:
         assert error_count == 1
         assert "verification loop" in steps[-1].content
         assert events[-1]["is_error"] is True
+
+    @pytest.mark.asyncio
+    async def test_background_probe_is_blocked_before_execution(self):
+        class DummyEngine:
+            def _task_graph_tool_block(self, *_args, **_kwargs):
+                return None
+
+            async def _execute_single_tool(self, *_args, **_kwargs):
+                raise AssertionError("background probe guard should block before execution")
+
+        steps: list[ExecutionStep] = []
+        messages: list[dict[str, object]] = []
+
+        error_count, events = await AgentEngine._dispatch_tool_calls(
+            DummyEngine(),
+            calls=[
+                (
+                    "tc-probe",
+                    "execute_background_service",
+                    {"command": "ss -tlnp | grep 3000 || lsof -i :3000"},
+                )
+            ],
+            messages=messages,
+            steps=steps,
+            tool_index={},
+            session_id="test",
+        )
+
+        assert error_count == 1
+        assert "finite/probe" in steps[-1].content
+        assert events[-1]["is_error"] is True
+
+
+class TestToolCallProgressEmission:
+    def test_suppresses_duplicate_background_service_in_same_batch(self):
+        prior = [
+            (
+                "tc-1",
+                "execute_background_service",
+                {"command": "python3 -m http.server 3000"},
+            )
+        ]
+
+        assert not _should_emit_tool_call_progress(
+            "execute_background_service",
+            {"command": "  python3   -m   http.server   3000  "},
+            prior,
+        )
+
+    def test_allows_non_duplicate_background_service_progress(self):
+        assert _should_emit_tool_call_progress(
+            "execute_background_service",
+            {"command": "python3 -m http.server 3001"},
+            [],
+        )
 
 
 class TestToolNamesForContractStatus:

@@ -508,6 +508,7 @@ class TaskGraphEngine:
                 "passed": False,
                 "missing_nodes": ["task_graph"],
                 "invalid_evidence_refs": [],
+                "ignored_invalid_evidence_refs": [],
                 "blocked_nodes": [],
                 "proof_report": [],
             }
@@ -535,6 +536,7 @@ class TaskGraphEngine:
         ]
 
         invalid_refs: list[dict[str, str]] = []
+        ignored_invalid_refs: list[dict[str, str]] = []
         proof_report: list[dict[str, Any]] = []
         for node in nodes:
             node_id = str(node["id"])
@@ -573,30 +575,84 @@ class TaskGraphEngine:
                 req for req in node.get("proof_requirements", []) if req != "none"
             ]
             if not requirements:
-                proof_report.append({"node_id": node_id, "passed": True, "detail": "no proof required"})
+                proof_report.append(
+                    {"node_id": node_id, "passed": True, "detail": "no proof required"}
+                )
                 continue
 
             candidate_steps = self._candidate_steps_for_node(node, steps)
+            inferred_candidate_steps = self._candidate_steps_for_node(
+                node, steps, ignore_evidence_refs=True
+            )
             ref_lookup = self._step_lookup(steps)
+            node_invalid_refs: list[dict[str, str]] = []
             for ref in node.get("evidence_refs", []):
                 step = ref_lookup.get(str(ref))
                 if step is None:
-                    invalid_refs.append({"node_id": node_id, "evidence_ref": str(ref), "reason": "not found"})
+                    node_invalid_refs.append(
+                        {
+                            "node_id": node_id,
+                            "evidence_ref": str(ref),
+                            "reason": "not found",
+                        }
+                    )
                 elif step.metadata.get("is_error"):
-                    invalid_refs.append({"node_id": node_id, "evidence_ref": str(ref), "reason": "tool result is an error"})
+                    node_invalid_refs.append(
+                        {
+                            "node_id": node_id,
+                            "evidence_ref": str(ref),
+                            "reason": "tool result is an error",
+                        }
+                    )
             requirement_results = []
             for requirement in requirements:
-                passed = any(
+                ref_passed = any(
                     _step_satisfies_requirement(step, requirement)
                     for step in candidate_steps
                 )
-                requirement_results.append({"requirement": requirement, "passed": passed})
+                inferred_passed = any(
+                    _step_satisfies_requirement(step, requirement)
+                    for step in inferred_candidate_steps
+                )
+                passed = any(
+                    _step_satisfies_requirement(step, requirement)
+                    for step in [*candidate_steps, *inferred_candidate_steps]
+                )
+                requirement_results.append(
+                    {
+                        "requirement": requirement,
+                        "passed": passed,
+                        "passed_by_evidence_ref": ref_passed,
+                        "passed_by_inference": inferred_passed,
+                    }
+                )
+            requirements_passed = all(item["passed"] for item in requirement_results)
+            if node_invalid_refs and requirements_passed:
+                ignored_invalid_refs.extend(node_invalid_refs)
+            else:
+                invalid_refs.extend(node_invalid_refs)
+            inferred_refs = [
+                str(ref)
+                for ref in (
+                    step.metadata.get("tool_call_id")
+                    for step in inferred_candidate_steps
+                    if any(
+                        _step_satisfies_requirement(step, requirement)
+                        for requirement in requirements
+                    )
+                )
+                if ref
+            ]
             proof_report.append(
                 {
                     "node_id": node_id,
-                    "passed": all(item["passed"] for item in requirement_results),
+                    "passed": requirements_passed,
                     "requirements": requirement_results,
                     "evidence_refs": list(node.get("evidence_refs", [])),
+                    "suggested_evidence_refs": inferred_refs,
+                    "ignored_invalid_evidence_refs": node_invalid_refs
+                    if requirements_passed
+                    else [],
                 }
             )
 
@@ -610,6 +666,7 @@ class TaskGraphEngine:
             "passed": passed,
             "missing_nodes": missing_nodes,
             "invalid_evidence_refs": invalid_refs,
+            "ignored_invalid_evidence_refs": ignored_invalid_refs,
             "blocked_nodes": blocked_nodes,
             "proof_report": proof_report,
             "node_count": len(by_id),
@@ -799,11 +856,15 @@ class TaskGraphEngine:
         return lookup
 
     def _candidate_steps_for_node(
-        self, node: dict[str, Any], steps: list[ExecutionStep]
+        self,
+        node: dict[str, Any],
+        steps: list[ExecutionStep],
+        *,
+        ignore_evidence_refs: bool = False,
     ) -> list[ExecutionStep]:
         refs = [str(ref) for ref in node.get("evidence_refs", [])]
         lookup = self._step_lookup(steps)
-        if refs:
+        if refs and not ignore_evidence_refs:
             return [lookup[ref] for ref in refs if ref in lookup]
         allowed = {str(tool) for tool in node.get("allowed_tools", [])}
         if not allowed:

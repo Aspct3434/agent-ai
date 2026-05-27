@@ -23,6 +23,7 @@ from contract import (
     TASK_CONTRACT_TOOL,
     VERIFICATION_TOOLS,
     attempted_tool_names,
+    background_service_misuse_message,
     blocked_action_tool_message,
     build_incomplete_contract_cap_message,
     build_task_contract_instruction,
@@ -1530,8 +1531,10 @@ class AgentEngine:
                 calls: list[tuple[str, str, dict[str, Any]]] = []
                 for tc in tool_calls:
                     args = json.loads(tc.function.arguments)
-                    yield {"type": "tool_call", "tool": tc.function.name, "params": args}
-                    calls.append((str(tc.id), str(tc.function.name), args))
+                    name = str(tc.function.name)
+                    if _should_emit_tool_call_progress(name, args, calls):
+                        yield {"type": "tool_call", "tool": name, "params": args}
+                    calls.append((str(tc.id), name, args))
 
                 iter_error_count, tool_result_events = await self._dispatch_tool_calls(
                     calls=calls,
@@ -1889,6 +1892,10 @@ class AgentEngine:
             graph_block = self._task_graph_tool_block(name, messages, steps)
             if graph_block is not None:
                 results[tc_id] = (graph_block, True, "__builtin__")
+            elif name == "execute_background_service" and (
+                misuse_message := background_service_misuse_message(args.get("command"))
+            ):
+                results[tc_id] = (misuse_message, True, "__builtin__")
             elif (
                 not self._task_graph_explicitly_allows(name, messages, steps)
                 and should_block_tool_for_action_task(
@@ -2034,6 +2041,9 @@ class AgentEngine:
                     "__builtin__",
                 )
         if tool_name == "execute_background_service":
+            misuse_message = background_service_misuse_message(arguments.get("command"))
+            if misuse_message is not None:
+                return misuse_message, True, "__builtin__"
             denial = await self._check_approval(arguments.get("command", ""), session_id)
             if denial is not None:
                 return json.dumps({"status": "denied", "reason": denial}), True, "__builtin__"
@@ -2859,6 +2869,24 @@ def _summarize_tool_output(text: str, handle: str, tool_name: str) -> str:
         f"[... {hidden} line(s) / {len(text)} chars hidden. Retrieve more with "
         f'expand_tool_output(handle="{handle}", start_line=...) ...]\n'
         f"{tail}"
+    )
+
+
+def _should_emit_tool_call_progress(
+    tool_name: str,
+    arguments: dict[str, Any],
+    prior_batch_calls: list[tuple[str, str, dict[str, Any]]],
+) -> bool:
+    """Avoid showing duplicate service starts that dispatch will skip."""
+    if tool_name != "execute_background_service":
+        return True
+    command = normalize_command(arguments.get("command"))
+    if not command:
+        return True
+    return not any(
+        previous_name == "execute_background_service"
+        and normalize_command(previous_args.get("command")) == command
+        for _, previous_name, previous_args in prior_batch_calls
     )
 
 

@@ -43,6 +43,15 @@ class TestActionTools:
         out = format_tool_call("execute_background_service", {"command": "python app.py"})
         assert out is not None and "python app.py" in out
 
+    def test_background_probe_shows_blocked_not_starting(self) -> None:
+        out = format_tool_call(
+            "execute_background_service",
+            {"command": "ss -tlnp | grep 3000 || lsof -i :3000"},
+        )
+        assert out is not None
+        assert "[blocked] Background probe" in out
+        assert "Starting service" not in out
+
     def test_write_file_shows_path(self) -> None:
         assert "server.properties" in str(
             format_tool_call("write_text_file", {"path": "server.properties"})
