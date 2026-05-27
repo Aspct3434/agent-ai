@@ -6,6 +6,18 @@
 
 A production-grade ReAct agent built for reliability. Features **task-contract execution** to prevent hallucination, **skill distillation** to evolve its own tools, **hybrid memory**, and a real-time streaming control panel.
 
+### Distill TUI
+
+Launch the interactive terminal interface with:
+
+```bash
+distill
+# or
+distill tui
+```
+
+![Distill TUI command demo](docs/assets/distill-tui.gif)
+
 ## Architecture
 
 ```mermaid
@@ -72,18 +84,6 @@ graph TD
         Eval -.->|Synthesizes & Validates| Skills
     end
 ```
-
-### Distill TUI
-
-Launch the interactive terminal interface with:
-
-```bash
-distill
-# or
-distill tui
-```
-
-![Distill TUI command demo](docs/assets/distill-tui.gif)
 
 ### Directory Structure
 
