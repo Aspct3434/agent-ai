@@ -69,6 +69,18 @@ graph TD
     end
 ```
 
+### Distill TUI
+
+Launch the interactive terminal interface with:
+
+```bash
+distill
+# or
+distill tui
+```
+
+![Distill TUI command demo](docs/assets/distill-tui.gif)
+
 ### Directory Structure
 
 ```text
