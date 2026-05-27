@@ -111,7 +111,7 @@ docker compose up -d --build
 
 ### CLI Installation
 
-You can also install Distill globally using `npm` to get the robust interactive CLI installer:
+You can also install Distill globally using `npm` to get the robust interactive CLI installer and TUI:
 
 ```powershell
 npx @aspct3434/distill-agent install
@@ -119,6 +119,13 @@ npx @aspct3434/distill-agent install
 
 After installation, use the CLI to manage the agent:
 ```bash
+npm install -g @aspct3434/distill-agent
+distill                           # Open the interactive terminal UI
+distill start                     # Start the backend and control panel
+distill logs                      # View running logs
+distill update                    # Pull the latest changes
+
+# npx works too if you prefer not to install globally:
 npx @aspct3434/distill-agent start    # Start the backend and control panel
 npx @aspct3434/distill-agent logs     # View running logs
 npx @aspct3434/distill-agent update   # Pull the latest changes

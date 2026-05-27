@@ -30,6 +30,18 @@ class TestRenderEvent:
     def test_status_rendered(self) -> None:
         assert render_event({"type": "status", "message": "Escalating…"}) == "Escalating…"
 
+    def test_tool_result_rendered(self) -> None:
+        out = render_event(
+            {
+                "type": "tool_result",
+                "tool": "execute_terminal_command",
+                "is_error": False,
+                "content": "exit_code=0",
+            }
+        )
+        assert out is not None
+        assert "execute_terminal_command finished" in out
+
     def test_thinking_status_hidden(self) -> None:
         assert render_event({"type": "status", "message": "Thinking..."}) is None
 
@@ -67,6 +79,17 @@ class TestCommands:
         tui, buf = _tui()
         assert tui._handle_command("/help") is True
         assert "/quit" in buf.getvalue()
+
+    def test_details_cycle(self) -> None:
+        tui, _ = _tui()
+        assert tui._detail_mode == "expanded"
+        assert tui._handle_command("/details") is True
+        assert tui._detail_mode == "collapsed"
+
+    def test_theme_command(self) -> None:
+        tui, _ = _tui()
+        assert tui._handle_command("/theme ocean") is True
+        assert tui._theme_name == "ocean"
 
     def test_unknown_command(self) -> None:
         tui, buf = _tui()

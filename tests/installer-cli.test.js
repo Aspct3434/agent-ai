@@ -129,8 +129,18 @@ function assertIncludes(text, expected) {
   const result = run(["help"]);
   assert.strictEqual(result.status, 0, result.stderr);
   assertIncludes(result.stdout, "distill install");
+  assertIncludes(result.stdout, "distill                         Launch the interactive Terminal UI");
   assertIncludes(result.stdout, "npx @aspct3434/distill-agent install");
   assertIncludes(result.stdout, "npx @aspct3434/distill-agent doctor");
+}
+
+{
+  const { parseArgs } = require(path.join(root, "lib", "distill-cli.js"));
+  assert.strictEqual(parseArgs([]).command, "tui");
+  const parsed = parseArgs(["--url", "ws://localhost:9000/ws/stream", "--theme", "ocean"]);
+  assert.strictEqual(parsed.command, "tui");
+  assert.strictEqual(parsed.options.url, "ws://localhost:9000/ws/stream");
+  assert.strictEqual(parsed.options.theme, "ocean");
 }
 
 {
