@@ -1051,6 +1051,74 @@ def consecutive_terminal_cap_message(run_length: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Consecutive verification-tool cycling guard
+#
+# Catches the pattern where the agent cycles between DIFFERENT verification
+# tools (expose -> web_fetch -> wait_for_port -> expose ...) without any
+# state-changing tool in between.  The identical-call guard catches exact
+# repeats; the terminal-run guard catches terminal-only runs; this covers
+# the remaining gap: read-only verification cycling.
+# ---------------------------------------------------------------------------
+
+VERIFICATION_TOOLS: frozenset[str] = frozenset(
+    {
+        "expose_local_http_service",
+        "wait_for_port",
+        "get_filesystem_process_evidence",
+        "web_fetch",
+        "browser_navigate",
+        "browser_screenshot",
+        "browser_get_text",
+    }
+)
+
+MAX_CONSECUTIVE_VERIFICATION_CALLS = max(
+    4, int(os.getenv("AGENT_MAX_CONSECUTIVE_VERIFICATION_CALLS", "6"))
+)
+
+
+def consecutive_verification_run_length(steps: list[ExecutionStep]) -> int:
+    """Count consecutive verification-only tool results at the tail of *steps*.
+
+    A "verification tool" is any read-only tool whose purpose is checking
+    whether prior state-changing work succeeded (port open? file exists?
+    page loads?).  State-changing tools (writes, commands, service launches)
+    break the streak.
+    """
+    count = 0
+    for step in reversed(steps):
+        if step.kind != "tool_result":
+            continue
+        if step.metadata.get("tool_name") in VERIFICATION_TOOLS:
+            count += 1
+        else:
+            break
+    return count
+
+
+def consecutive_verification_cap_message(run_length: int) -> str:
+    """Block message for a verification-only run that exceeded the cap."""
+    return (
+        f"[blocked: verification loop ({run_length})] You have called {run_length} "
+        "verification/evidence tools in a row without any state-changing tool "
+        "(write_text_file, execute_terminal_command, execute_background_service) "
+        "in between. Repeating verification checks cannot make a failing service "
+        "start working. STOP and do ONE of the following:\n"
+        "  1. Read the background-service log (cat /tmp/background_task.log or the "
+        "     path from the execute_background_service result) to see if the "
+        "     service crashed or failed to start.\n"
+        "  2. Call get_system_environment to confirm the runtime is available.\n"
+        "  3. Kill the old process and re-launch the service with a corrected "
+        "     command via execute_background_service.\n"
+        "  4. If the service is running but verification probes fail due to "
+        "     networking, update the task graph/plan to mark verification as "
+        "     best-effort and close out the task.\n"
+        "Do not call another verification tool until you have taken a "
+        "state-changing action."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Action-task tool blocking
 # ---------------------------------------------------------------------------
 

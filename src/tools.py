@@ -2573,11 +2573,25 @@ class ToolManager:
             connectable = False
             error = None
             scope = "host"
-            try:
-                with socket.create_connection(("127.0.0.1", service_port), timeout=1.0):
-                    connectable = True
-            except OSError as exc:
-                error = str(exc)
+            # Retry with backoff: background services often need a moment to
+            # bind their port after launch.  A single instantaneous probe fails
+            # on the normal race between execute_background_service returning
+            # and the child process calling bind().  Retrying for a short window
+            # eliminates this without burning an extra agent iteration.
+            _expose_max_wait = float(os.getenv("AGENT_EXPOSE_MAX_WAIT", "10"))
+            _expose_interval = 1.0
+            _waited = 0.0
+            while True:
+                try:
+                    with socket.create_connection(("127.0.0.1", service_port), timeout=1.0):
+                        connectable = True
+                        break
+                except OSError as exc:
+                    error = str(exc)
+                _waited += _expose_interval
+                if _waited >= _expose_max_wait:
+                    break
+                time.sleep(_expose_interval)
 
         if not connectable:
             raise ConnectionError(

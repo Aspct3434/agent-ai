@@ -14,8 +14,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from agent import _filesystem_process_evidence_has_negative_findings
+from agent import AgentEngine, _filesystem_process_evidence_has_negative_findings
 from contract import (
+    MAX_CONSECUTIVE_VERIFICATION_CALLS,
     _evidence_requirement_satisfied,
     _expose_local_http_service_evidence_is_positive,
     _filesystem_process_evidence_is_positive,
@@ -24,6 +25,7 @@ from contract import (
     blocked_action_tool_message,
     build_incomplete_contract_cap_message,
     can_stream_text_before_final,
+    consecutive_verification_run_length,
     contract_completion_status,
     duplicate_command_message,
     last_host_command,
@@ -295,6 +297,74 @@ class TestEvidenceRequirementSatisfied:
     def test_wrong_tool_not_satisfied(self):
         steps = [_make_step("some_tool", "ok")]
         assert not _evidence_requirement_satisfied("running_http_service", steps)
+
+    def test_failed_http_verification_never_satisfies_service_evidence(self):
+        steps = [
+            _make_step(
+                "execute_background_service",
+                json.dumps({"status": "launched", "pid": 123}),
+            ),
+            _make_step(
+                "write_text_file",
+                json.dumps({"written": True, "exists": True, "size_bytes": 10}),
+            ),
+            *[
+                _make_step(
+                    "expose_local_http_service",
+                    "[expose_local_http_service error] connection refused",
+                    is_error=True,
+                )
+                for _ in range(4)
+            ],
+        ]
+        assert not _evidence_requirement_satisfied("running_http_service", steps)
+
+
+class TestConsecutiveVerificationRun:
+    def test_counts_varied_verification_tools(self):
+        steps = [
+            _make_step("write_text_file", "{}"),
+            _make_step("web_fetch", "{}", is_error=True),
+            _make_step("get_filesystem_process_evidence", "{}"),
+        ]
+        assert consecutive_verification_run_length(steps) == 2
+
+    def test_state_changing_tool_breaks_streak(self):
+        steps = [
+            _make_step("web_fetch", "{}", is_error=True),
+            _make_step("write_text_file", "{}"),
+        ]
+        assert consecutive_verification_run_length(steps) == 0
+
+
+class TestVerificationLoopDispatchGuard:
+    @pytest.mark.asyncio
+    async def test_parallel_verification_tool_is_blocked_after_cap(self):
+        class DummyEngine:
+            def _task_graph_tool_block(self, *_args, **_kwargs):
+                return None
+
+            async def _execute_single_tool(self, *_args, **_kwargs):
+                raise AssertionError("verification guard should block before execution")
+
+        steps = [
+            _make_step("web_fetch", "{}", is_error=True)
+            for _ in range(MAX_CONSECUTIVE_VERIFICATION_CALLS)
+        ]
+        messages: list[dict[str, object]] = []
+
+        error_count, events = await AgentEngine._dispatch_tool_calls(
+            DummyEngine(),
+            calls=[("tc-next", "web_fetch", {"url": "http://127.0.0.1:9999"})],
+            messages=messages,
+            steps=steps,
+            tool_index={},
+            session_id="test",
+        )
+
+        assert error_count == 1
+        assert "verification loop" in steps[-1].content
+        assert events[-1]["is_error"] is True
 
 
 class TestToolNamesForContractStatus:

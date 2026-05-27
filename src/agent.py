@@ -17,9 +17,11 @@ from contract import (
     GENERIC_CAP_SKIP_TOOLS,
     HOST_EXECUTION_TOOLS,
     MAX_CONSECUTIVE_TERMINAL_COMMANDS,
+    MAX_CONSECUTIVE_VERIFICATION_CALLS,
     MAX_IDENTICAL_COMMAND_RUNS,
     MAX_IDENTICAL_TOOL_CALLS,
     TASK_CONTRACT_TOOL,
+    VERIFICATION_TOOLS,
     attempted_tool_names,
     blocked_action_tool_message,
     build_incomplete_contract_cap_message,
@@ -27,6 +29,8 @@ from contract import (
     can_stream_text_before_final,
     consecutive_terminal_cap_message,
     consecutive_terminal_run_length,
+    consecutive_verification_cap_message,
+    consecutive_verification_run_length,
     contract_completion_status,
     duplicate_command_message,
     filter_tool_schemas,
@@ -1811,6 +1815,9 @@ class AgentEngine:
         results: dict[str, tuple[str, bool, str | None]] = {}
         parallel = [c for c in calls if c[1] in _PARALLEL_SAFE_TOOLS]
         serial = [c for c in calls if c[1] not in _PARALLEL_SAFE_TOOLS]
+        # Consecutive verification tool counter: catches loops of varying
+        # read-only probes (expose -> wait -> fetch) with no state change.
+        local_verification_run_count = consecutive_verification_run_length(steps)
 
         if parallel:
             # Pre-screen parallel (read-only) tools with the generic anti-spin
@@ -1825,6 +1832,17 @@ class AgentEngine:
                     results[tc_id] = (graph_block, True, "__builtin__")
                     continue
                 if (
+                    name in VERIFICATION_TOOLS
+                    and local_verification_run_count >= MAX_CONSECUTIVE_VERIFICATION_CALLS
+                ):
+                    results[tc_id] = (
+                        consecutive_verification_cap_message(local_verification_run_count),
+                        True,
+                        "__builtin__",
+                    )
+                    local_verification_run_count += 1
+                    continue
+                if (
                     name not in GENERIC_CAP_SKIP_TOOLS
                     and identical_tool_call_runs_since_state_change(steps, name, args)
                     >= MAX_IDENTICAL_TOOL_CALLS
@@ -1836,6 +1854,8 @@ class AgentEngine:
                     )
                     continue
                 parallel_to_run.append((tc_id, name, args))
+                if name in VERIFICATION_TOOLS:
+                    local_verification_run_count += 1
 
             gathered = await asyncio.gather(
                 *(
@@ -1899,6 +1919,16 @@ class AgentEngine:
                     True,
                     "__builtin__",
                 )
+            elif (
+                name in VERIFICATION_TOOLS
+                and local_verification_run_count >= MAX_CONSECUTIVE_VERIFICATION_CALLS
+            ):
+                results[tc_id] = (
+                    consecutive_verification_cap_message(local_verification_run_count),
+                    True,
+                    "__builtin__",
+                )
+                local_verification_run_count += 1
             elif cmd and repeat_runs >= MAX_IDENTICAL_COMMAND_RUNS:
                 # Identical command re-run too many times with no state change in
                 # between -- a spin. Hard-block it (is_error=True) so the loop also
@@ -1927,6 +1957,11 @@ class AgentEngine:
                 # when a non-terminal tool runs (handled by consecutive_terminal_run_length).
                 if name == "execute_terminal_command":
                     local_terminal_run_count += 1
+                if name in VERIFICATION_TOOLS:
+                    local_verification_run_count += 1
+                elif name in HOST_EXECUTION_TOOLS or name == "write_text_file":
+                    # State-changing tools break the verification run
+                    local_verification_run_count = 0
 
         # Record steps and tool messages in the original call order.
         iter_error_count = 0
@@ -2095,7 +2130,9 @@ class AgentEngine:
         if tool_name == "expose_local_http_service":
             try:
                 return (
-                    self._tools.expose_local_http_service(**arguments),
+                    await asyncio.to_thread(
+                        self._tools.expose_local_http_service, **arguments
+                    ),
                     False,
                     "__builtin__",
                 )
