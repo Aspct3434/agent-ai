@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="270" viewBox="0 0 980 270" role="img" aria-labelledby="title desc">
+  <title id="title">Distill terminal banner</title>
+  <desc id="desc">The colored Distill command-line banner shown when running the distill command.</desc>
+  <rect width="980" height="270" rx="18" fill="#05070D"/>
+  <text x="50" y="60" fill="#8B5CF6" font-family="Consolas, Menlo, Monaco, 'Courier New', monospace" font-size="26" font-weight="700">    ██████╗  ██╗ ███████╗████████╗██╗██╗     ██╗</text>
+  <text x="50" y="92" fill="#7C3AED" font-family="Consolas, Menlo, Monaco, 'Courier New', monospace" font-size="26" font-weight="700">    ██╔══██╗ ██║ ██╔════╝╚══██╔══╝██║██║     ██║</text>
+  <text x="50" y="124" fill="#A855F7" font-family="Consolas, Menlo, Monaco, 'Courier New', monospace" font-size="26" font-weight="700">    ██║  ██║ ██║ ███████╗   ██║   ██║██║     ██║</text>
+  <text x="50" y="156" fill="#9333EA" font-family="Consolas, Menlo, Monaco, 'Courier New', monospace" font-size="26" font-weight="700">    ██║  ██║ ██║ ╚════██║   ██║   ██║██║     ██║</text>
+  <text x="50" y="188" fill="#C084FC" font-family="Consolas, Menlo, Monaco, 'Courier New', monospace" font-size="26" font-weight="700">    ██████╔╝ ██║ ███████║   ██║   ██║███████╗███████╗</text>
+  <text x="50" y="220" fill="#7C3AED" font-family="Consolas, Menlo, Monaco, 'Courier New', monospace" font-size="26" font-weight="700">    ╚═════╝  ╚═╝ ╚══════╝   ╚═╝   ╚═╝╚══════╝╚══════╝</text>
+  <text x="396" y="252" fill="#A855F7" font-family="Consolas, Menlo, Monaco, 'Courier New', monospace" font-size="18" font-weight="700">DISTILL</text>
+</svg>
