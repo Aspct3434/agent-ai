@@ -25,12 +25,42 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, PaginatedRequestParams
 
-from proxy_auth import append_signed_proxy_query
+from proxy_auth import (
+    PROXY_EXPIRES_PARAM,
+    PROXY_TOKEN_PARAM,
+    append_signed_proxy_query,
+)
 
 logger = logging.getLogger(__name__)
 
 # Project root is one level above this file (src/../)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _auto_sign_proxy_url(url: str) -> str:
+    """If *url* targets our own gateway's /proxy/<port>/ path without auth
+    tokens, append a fresh signed token so the request is not rejected with
+    401.  Leaves all other URLs (and already-signed proxy URLs) untouched.
+    """
+    from urllib.parse import parse_qsl, urlsplit
+
+    split = urlsplit(url)
+    # Only rewrite requests aimed at the local gateway (localhost / 127.0.0.1).
+    if split.hostname not in ("localhost", "127.0.0.1"):
+        return url
+    parts = split.path.rstrip("/").split("/")
+    # Path must be /proxy/<port>[/...] — parts[0]='' parts[1]='proxy' parts[2]=port
+    if len(parts) < 3 or parts[1] != "proxy":
+        return url
+    try:
+        port = int(parts[2])
+    except (ValueError, IndexError):
+        return url
+    # Skip if token is already present.
+    existing = dict(parse_qsl(split.query))
+    if PROXY_EXPIRES_PARAM in existing and PROXY_TOKEN_PARAM in existing:
+        return url
+    return append_signed_proxy_query(url, port)
 
 # ------------------------------------------------------------------
 # Built-in (non-MCP) tool schemas
@@ -2355,6 +2385,7 @@ class ToolManager:
         """
         import httpx as _httpx
 
+        url = _auto_sign_proxy_url(url)
         max_chars = min(max(100, int(max_chars)), 40_000)
         timeout = min(max(1.0, float(timeout)), 60.0)
 
