@@ -40,6 +40,25 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
 )
 
 
+def _step_declares_state_change(step: ExecutionStep) -> bool:
+    args = step.metadata.get("arguments") or {}
+    if not isinstance(args, dict):
+        return False
+    return args.get("changes_state") is True
+
+
+def tool_result_is_meaningful_side_effect(step: ExecutionStep) -> bool:
+    """True when a successful tool result represents a durable state change."""
+    if step.kind != "tool_result" or step.metadata.get("is_error"):
+        return False
+    if step.metadata.get("changes_state") is True:
+        return True
+    tool_name = step.metadata.get("tool_name")
+    if tool_name == "execute_terminal_command":
+        return _step_declares_state_change(step)
+    return tool_name in _SIDE_EFFECT_TOOLS
+
+
 def _skill_synthesis_temperature() -> float:
     """Return the configured synthesis temperature without provider branching."""
     raw = os.getenv("AGENT_SKILL_SYNTHESIS_TEMPERATURE", "0.2").strip()
@@ -67,6 +86,12 @@ Generate a reusable Python skill using the @skill decorator. Requirements:
 2. Contain real executable Python -- use subprocess for shell ops, pathlib for files
 3. Return a meaningful string describing what was accomplished
 4. Have a clear, snake_case name and a one-sentence description
+5. Declare side-effect metadata in the decorator:
+   - `changes_state=True` only if the skill creates/edits/deletes files, installs/builds/runs services, mutates databases, or otherwise changes durable state.
+   - `changes_state=False` for read-only analysis, search, parsing, summarization, or inspection.
+   - `evidence_types=[...]` lists the task-contract evidence the skill can produce, using only:
+     filesystem_artifact, running_http_service, running_tcp_service, database_mutation, command_output.
+6. Return a JSON-serialisable dict when the skill changes state, including `success`, `changes_state`, `evidence_types`, and concrete evidence fields such as `path`, `paths`, `url`, `port`, `stdout`, or `status`.
 
 Exact format to use:
 ```python
@@ -75,8 +100,13 @@ from _skill import skill
 import subprocess
 from pathlib import Path
 
-@skill(name="<snake_case_name>", description="<one sentence: what it does and its parameters>")
-def <function_name>(<param1>: <type>, <param2>: <type> = <default>) -> str:
+@skill(
+    name="<snake_case_name>",
+    description="<one sentence: what it does and its parameters>",
+    changes_state=<True_or_False>,
+    evidence_types=["<evidence_type_if_any>"],
+)
+def <function_name>(<param1>: <type>, <param2>: <type> = <default>) -> dict[str, object] | str:
     \"\"\"<one-line docstring>\"\"\"
     # Real implementation using subprocess / pathlib / etc.
     return "<meaningful result string>"
@@ -265,15 +295,7 @@ class SkillDistiller:
 
 def _has_meaningful_execution(steps: list[ExecutionStep]) -> bool:
     """True when the trajectory has at least _MIN_SIDE_EFFECT_STEPS successful side effects."""
-    count = sum(
-        1
-        for step in steps
-        if (
-            step.kind == "tool_result"
-            and not step.metadata.get("is_error")
-            and step.metadata.get("tool_name") in _SIDE_EFFECT_TOOLS
-        )
-    )
+    count = sum(1 for step in steps if tool_result_is_meaningful_side_effect(step))
     return count >= _MIN_SIDE_EFFECT_STEPS
 
 
@@ -336,6 +358,69 @@ def _skill_function_names(code: str) -> set[str]:
     }
 
 
+_VALID_SKILL_EVIDENCE_TYPES: frozenset[str] = frozenset(
+    {
+        "filesystem_artifact",
+        "running_http_service",
+        "running_tcp_service",
+        "database_mutation",
+        "command_output",
+    }
+)
+
+
+def _skill_decorator_metadata(code: str) -> dict[str, Any]:
+    """Extract @skill metadata without importing untrusted skill code."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return {"tool_names": [], "changes_state": None, "evidence_types": []}
+
+    tool_names: list[str] = []
+    changes_state: bool | None = None
+    evidence_types: list[str] = []
+
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        discovered_name = node.name
+        for decorator in node.decorator_list:
+            call = decorator if isinstance(decorator, ast.Call) else None
+            target = call.func if call is not None else decorator
+            is_skill = (
+                (isinstance(target, ast.Name) and target.id == "skill")
+                or (isinstance(target, ast.Attribute) and target.attr == "skill")
+            )
+            if not is_skill:
+                continue
+            if call is not None:
+                for keyword in call.keywords:
+                    try:
+                        value = ast.literal_eval(keyword.value)
+                    except (ValueError, TypeError):
+                        continue
+                    if keyword.arg == "name":
+                        if isinstance(value, str) and value:
+                            discovered_name = value
+                    elif keyword.arg == "changes_state":
+                        if isinstance(value, bool):
+                            changes_state = value
+                    elif keyword.arg in {"evidence_types", "evidence_requirements"}:
+                        if isinstance(value, (list, tuple, set)):
+                            evidence_types = [
+                                str(item)
+                                for item in value
+                                if str(item) in _VALID_SKILL_EVIDENCE_TYPES
+                            ]
+            tool_names.append(discovered_name)
+
+    return {
+        "tool_names": sorted(set(tool_names)),
+        "changes_state": changes_state,
+        "evidence_types": sorted(set(evidence_types)),
+    }
+
+
 _TRIVIAL_PROMPTS: frozenset[str] = frozenset(
     {
         "hi", "hello", "hey", "yo", "sup", "hiya",
@@ -378,6 +463,9 @@ Improve the skill to:
 2. Be more robust and parameterized
 3. Return richer, more informative results
 4. Fix any issues seen in failed runs
+5. Preserve or add @skill metadata: changes_state and evidence_types. If the
+   skill changes durable state, return a JSON-serialisable dict with success,
+   changes_state, evidence_types, and concrete evidence fields.
 
 Output ONLY the improved Python code block (same @skill format). If the original
 is already optimal, output it unchanged. Do NOT output NOT_DISTILLABLE.
@@ -447,11 +535,15 @@ class SkillRegistry:
             name = py_file.stem
             stats = self._stats.get(name, {})
             version_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+            metadata = _skill_decorator_metadata(code)
             skills.append({
                 "name": name,
                 "file": py_file.name,
+                "tool_names": metadata["tool_names"] or [name],
                 "description": _extract_skill_description(code),
                 "tags": _extract_skill_tags(code),
+                "changes_state": metadata["changes_state"],
+                "evidence_types": metadata["evidence_types"],
                 "use_count": stats.get("use_count", 0),
                 "success_rate": stats.get("success_rate", 1.0),
                 "version": stats.get("version", 1),
@@ -464,6 +556,19 @@ class SkillRegistry:
                 "rollback_count": stats.get("rollback_count", 0),
             })
         return skills
+
+    def skill_metadata_for_tool(self, tool_name: str) -> dict[str, Any] | None:
+        """Return metadata for the generated skill MCP tool named *tool_name*."""
+        for skill_info in self.list_skills():
+            tool_names = skill_info.get("tool_names") or [skill_info.get("name")]
+            if tool_name in {str(name) for name in tool_names if name}:
+                return {
+                    "name": skill_info.get("name"),
+                    "tool_names": tool_names,
+                    "changes_state": skill_info.get("changes_state"),
+                    "evidence_types": skill_info.get("evidence_types") or [],
+                }
+        return None
 
     def record_use(self, skill_name: str, *, success: bool) -> None:
         """Record one invocation of *skill_name* (overall + per-version)."""

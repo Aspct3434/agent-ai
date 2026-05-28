@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 from websockets.asyncio.client import connect as ws_connect
 
+from adapters._commands import is_stop_command
 from adapters._progress import format_tool_call
 
 logger = logging.getLogger(__name__)
@@ -207,7 +208,7 @@ class SlackAdapter:
 
         channel: str = str(event.get("channel") or "")
 
-        if text.startswith("/"):
+        if text.startswith("/") or is_stop_command(text):
             await self._handle_command(channel, text)
             return
 
@@ -248,7 +249,7 @@ class SlackAdapter:
         if cmd in ("/new", "/reset"):
             self._reset_fn(f"slack:{channel}")
             await self._post_message(channel, "🧹 Started a new conversation.")
-        elif cmd == "/stop":
+        elif is_stop_command(text):
             task = self._turn_tasks.get(channel)
             if task is not None and not task.done():
                 task.cancel()

@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agent import AgentEngine, NormalizedMessage
+from adapters._commands import is_stop_command
 from approvals import ApprovalGate
 from auth.oauth import CodexOAuth, wait_for_callback
 from checkpointer import StateCheckpointer, initialize_checkpoints_db
@@ -1346,7 +1347,8 @@ async def ws_stream(websocket: WebSocket) -> None:
             raw = await websocket.receive_text()
             data = json.loads(raw)
             session_id = data.get("session_id", "__anon__")
-            if data.get("type") == "cancel":
+            text = str(data.get("text") or "")
+            if data.get("type") == "cancel" or is_stop_command(text):
                 task = app.state.active_stream_tasks.get(session_id)
                 if task is not None and not task.done():
                     task.cancel()
@@ -1371,7 +1373,7 @@ async def ws_stream(websocket: WebSocket) -> None:
             msg = NormalizedMessage(
                 session_id=session_id,
                 role="user",
-                content=data["text"],
+                content=text,
             )
             current_task = asyncio.create_task(stream_turn(msg))
             app.state.active_stream_tasks[session_id] = current_task

@@ -19,7 +19,7 @@ from contract import (
     _latest_plan,
     attempted_tool_names,
 )
-from evaluator import _SIDE_EFFECT_TOOLS, ExecutionStep
+from evaluator import ExecutionStep, tool_result_is_meaningful_side_effect
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +91,7 @@ def _count_done_plan_steps(messages: list[dict[str, Any]]) -> int:
 
 def _count_successful_side_effects(steps: list[ExecutionStep]) -> int:
     """Number of successful host-changing tool results recorded in *steps*."""
-    return sum(
-        1
-        for step in steps
-        if step.kind == "tool_result"
-        and not step.metadata.get("is_error")
-        and step.metadata.get("tool_name") in _SIDE_EFFECT_TOOLS
-    )
+    return sum(1 for step in steps if tool_result_is_meaningful_side_effect(step))
 
 
 def _render_plan(plan: list[dict[str, Any]]) -> str:
@@ -381,7 +375,19 @@ def _build_executive_summary(messages: list[dict[str, Any]]) -> str:
         name, raw_args = call_meta.get(
             msg.get("tool_call_id", ""), ("unknown_tool", "")
         )
-        if name not in _SIDE_EFFECT_TOOLS:
+        try:
+            parsed_args = json.loads(raw_args) if raw_args else {}
+        except (json.JSONDecodeError, TypeError):
+            parsed_args = {}
+        step = ExecutionStep(
+            kind="tool_result",
+            content=msg.get("content", ""),
+            metadata={
+                "tool_name": name,
+                "arguments": parsed_args,
+            },
+        )
+        if not tool_result_is_meaningful_side_effect(step):
             continue
         is_error, _ = _classify_tool_result(name, msg.get("content", ""))
         if is_error:

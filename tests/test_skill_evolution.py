@@ -39,6 +39,14 @@ _DROPS_FUNCTION = (
 )
 _BAD_SYNTAX = "from _skill import skill\n@skill\ndef greet(:\n"
 _NO_DECORATOR = "def greet(name):\n    return name\n"
+_STATEFUL = (
+    "from _skill import skill\n\n\n"
+    "@skill(name=\"write_report\", description=\"Write a report.\", "
+    "changes_state=True, evidence_types=[\"filesystem_artifact\"])\n"
+    "def write_report(path: str) -> dict[str, object]:\n"
+    '    "Write a report file."\n'
+    "    return {\"success\": True, \"path\": path}\n"
+)
 
 
 def _reg(tmp_path, **kw) -> SkillRegistry:
@@ -60,6 +68,19 @@ class TestCreateSkill:
         assert Path(path).exists()
         assert Path(path).stem == "my_tool"
         assert reg._stats["my_tool"]["created_by"] == "agent"
+
+    def test_lists_stateful_skill_metadata_by_tool_name(self, tmp_path) -> None:
+        reg = _reg(tmp_path)
+        (tmp_path / "write_report_file.py").write_text(_STATEFUL, encoding="utf-8")
+
+        listed = reg.list_skills()
+        metadata = reg.skill_metadata_for_tool("write_report")
+
+        assert listed[0]["tool_names"] == ["write_report"]
+        assert listed[0]["changes_state"] is True
+        assert listed[0]["evidence_types"] == ["filesystem_artifact"]
+        assert metadata is not None
+        assert metadata["changes_state"] is True
 
     def test_rejects_bad_syntax(self, tmp_path) -> None:
         with pytest.raises(ValueError):

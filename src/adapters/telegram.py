@@ -31,6 +31,7 @@ from typing import Any
 
 import httpx
 
+from adapters._commands import is_stop_command
 from adapters._progress import format_tool_call
 from adapters._telegram_format import html_to_plain, render_telegram_html_chunks
 
@@ -282,8 +283,8 @@ class TelegramAdapter:
             if not text:
                 return
 
-        # Slash commands are handled out-of-band (so /stop can interrupt a turn).
-        if text.startswith("/"):
+        # Control commands are handled out-of-band so stop/cancel can interrupt.
+        if text.startswith("/") or is_stop_command(text):
             await self._handle_command(chat_id, text, message_id)
             return
 
@@ -306,7 +307,7 @@ class TelegramAdapter:
         if cmd in ("/new", "/reset"):
             self._reset_fn(f"tg:{chat_id}")
             await self._send_message(chat_id, "🧹 Started a new conversation.", reply_to_message_id=message_id)
-        elif cmd == "/stop":
+        elif is_stop_command(text):
             task = self._turn_tasks.get(chat_id)
             if task is not None and not task.done():
                 task.cancel()

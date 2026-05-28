@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 from websockets.asyncio.client import connect as ws_connect
 
+from adapters._commands import is_stop_command
 from adapters._progress import format_tool_call
 
 logger = logging.getLogger(__name__)
@@ -321,8 +322,8 @@ class DiscordAdapter:
 
         channel_id: str = str(data.get("channel_id") or "")
 
-        # Slash commands are handled out-of-band (so /stop can interrupt a turn).
-        if content.startswith("/"):
+        # Control commands are handled out-of-band so stop/cancel can interrupt.
+        if content.startswith("/") or is_stop_command(content):
             await self._handle_command(channel_id, content)
             return
 
@@ -345,7 +346,7 @@ class DiscordAdapter:
         if cmd in ("/new", "/reset"):
             self._reset_fn(f"discord:{channel_id}")
             await self._post_message(channel_id, "🧹 Started a new conversation.")
-        elif cmd == "/stop":
+        elif is_stop_command(content):
             task = self._turn_tasks.get(channel_id)
             if task is not None and not task.done():
                 task.cancel()

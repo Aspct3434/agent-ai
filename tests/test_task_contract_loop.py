@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
@@ -125,6 +127,28 @@ class _FakeTools:
         }
         self.served.append(payload)
         return json.dumps(payload)
+
+
+class _FakeSkillRegistry:
+    def list_skills(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": "write_topic_site_file",
+                "tool_names": ["write_topic_site"],
+                "changes_state": True,
+                "evidence_types": ["filesystem_artifact"],
+            }
+        ]
+
+    def skill_metadata_for_tool(self, tool_name: str) -> dict[str, Any] | None:
+        if tool_name != "write_topic_site":
+            return None
+        return {
+            "name": "write_topic_site_file",
+            "tool_names": ["write_topic_site"],
+            "changes_state": True,
+            "evidence_types": ["filesystem_artifact"],
+        }
 
 
 def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> Any:
@@ -338,6 +362,30 @@ def test_execute_contract_suppresses_rejected_streamed_prose() -> None:
     )
     assert any("mkdir -p /tmp/sleep-website" in command for command in tools.commands)
     assert tools.served and tools.served[-1]["connectable"] is True
+
+
+def test_missing_evidence_allows_matching_generated_skill() -> None:
+    engine = AgentEngine(
+        memory=_EmptyMemory(),
+        tools=_FakeTools(),
+        model="test-model",
+        skill_registry=_FakeSkillRegistry(),
+    )
+    contract = {
+        "mode": "execute",
+        "summary": "Create a topic site.",
+        "success_criteria": ["A file exists."],
+        "evidence_requirements": ["filesystem_artifact"],
+    }
+    status = {
+        "complete": False,
+        "missing": ["filesystem_artifact"],
+        "plan_open": False,
+    }
+
+    allowed = engine._tool_names_for_status_with_task_graph(contract, status, [], [])
+
+    assert "write_topic_site" in allowed
 
 
 def test_answer_contract_streams_tokens_immediately() -> None:
@@ -994,3 +1042,54 @@ def test_failed_tool_result_is_streamed_and_triggers_self_repair_instruction() -
         for request in model.request_messages
         for message in request
     )
+
+
+def test_no_progress_guard_pauses_varied_tool_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_module, "_NO_PROGRESS_ITERATION_LIMIT", 3)
+    monkeypatch.setattr(agent_module, "_OBSTACLE_RECOVERY_AFTER_STALLED_ITERATIONS", 2)
+    script = [
+        _completion(tool_calls=[_contract_tool("execute", ["filesystem_artifact"])]),
+        _completion(tool_calls=[_plan_tool("in_progress")]),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_probe_1",
+                    "execute_terminal_command",
+                    {"command": "pwd", "changes_state": False},
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_probe_2",
+                    "execute_terminal_command",
+                    {"command": "ls -la", "changes_state": False},
+                )
+            ]
+        ),
+        _completion(
+            tool_calls=[
+                _tool_call(
+                    "call_probe_3",
+                    "execute_terminal_command",
+                    {"command": "date", "changes_state": False},
+                )
+            ]
+        ),
+        _completion(content="This should not be reached."),
+    ]
+
+    events, tools, model = asyncio.run(_run_engine_with_model(script))
+
+    final_events = [event for event in events if event.get("type") == "final_answer"]
+    assert final_events
+    assert final_events[-1]["reason"] == "no_progress"
+    assert "no-progress loop" in final_events[-1]["content"]
+    assert "filesystem_artifact" in final_events[-1]["content"]
+    assert any(
+        "OBSTACLE RECOVERY MODE" in str(message.get("content", ""))
+        for request in model.request_messages
+        for message in request
+    )
+    assert len(tools.commands) == 3

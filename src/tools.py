@@ -1378,6 +1378,15 @@ EXECUTE_TERMINAL_COMMAND_TOOL: dict[str, Any] = {
                 "type": "string",
                 "description": "The shell command to execute, exactly as you would type it in a terminal.",
             },
+            "changes_state": {
+                "type": "boolean",
+                "description": (
+                    "Set true only when this command is expected to create, modify, "
+                    "install, build, start, stop, or otherwise change durable host "
+                    "state. Set false for inspection/probe commands that only read "
+                    "state, such as status checks or fetching a local page."
+                ),
+            },
         },
         "additionalProperties": False,
     },
@@ -1812,11 +1821,15 @@ CREATE_SKILL_TOOL: dict[str, Any] = {
         "instead of waiting for post-task distillation.\n"
         "The code MUST: start with `from _skill import skill`, decorate the "
         "function with `@skill`, define a single well-named function with typed "
-        "parameters and a docstring, and return a JSON-serialisable result. Keep "
-        "it self-contained (imports inside the function) and side-effect-aware.\n"
+        "parameters and a docstring, declare `changes_state` and `evidence_types` "
+        "in the decorator, and return a JSON-serialisable result. State-changing "
+        "skills should return a dict with `success`, `changes_state`, "
+        "`evidence_types`, and concrete evidence fields (`path`, `paths`, `url`, "
+        "`port`, `stdout`, or `status`). Keep it self-contained (imports inside "
+        "the function) and side-effect-aware.\n"
         "Example code:\n"
         "from _skill import skill\n\n"
-        "@skill\n"
+        "@skill(name=\"count_lines\", description=\"Count lines in a file.\", changes_state=False, evidence_types=[])\n"
         "def count_lines(path: str) -> int:\n"
         "    \"Return the number of lines in a file.\"\n"
         "    with open(path) as f:\n"
@@ -4027,8 +4040,16 @@ def _ensure_skills_dir(skills_dir: Path) -> None:
     are always written so that image updates propagate on restart.
     """
     skills_dir.mkdir(parents=True, exist_ok=True)
-    _write_if_absent(skills_dir / "_skill.py", _SKILL_DECORATOR_SRC)
-    _write_if_absent(skills_dir / "server.py", _SKILLS_SERVER_SRC)
+    _write_if_absent_or_missing_feature(
+        skills_dir / "_skill.py",
+        _SKILL_DECORATOR_SRC,
+        "changes_state=None",
+    )
+    _write_if_absent_or_missing_feature(
+        skills_dir / "server.py",
+        _SKILLS_SERVER_SRC,
+        "_skill_changes_state",
+    )
 
     # Deploy built-in skills when their content changes. Avoid rewriting identical
     # files: uvicorn --reload watches the repo root in local dev, and touching
@@ -4061,6 +4082,20 @@ def _write_if_changed(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def _write_if_absent_or_missing_feature(
+    path: Path,
+    content: str,
+    feature_token: str,
+) -> None:
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        existing = ""
+    if existing and feature_token in existing:
+        return
+    path.write_text(content, encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap file sources
 # Written to skills/ on first call to connect_skills_server.
@@ -4070,7 +4105,7 @@ _SKILL_DECORATOR_SRC = """\
 from __future__ import annotations
 
 
-def skill(fn=None, *, name=None, description=None):
+def skill(fn=None, *, name=None, description=None, changes_state=None, evidence_types=None):
     '''Mark a function as an MCP skill so the skills server auto-discovers it.
 
     Use as a plain decorator or with keyword arguments::
@@ -4082,7 +4117,12 @@ def skill(fn=None, *, name=None, description=None):
             "Return a personalised greeting."
             return f"Hello, {name}!"
 
-        @skill(name="shout", description="Return an uppercased string.")
+        @skill(
+            name="shout",
+            description="Return an uppercased string.",
+            changes_state=False,
+            evidence_types=[],
+        )
         def shout(text: str) -> str:
             return text.upper()
     '''
@@ -4090,6 +4130,8 @@ def skill(fn=None, *, name=None, description=None):
         f._is_skill = True
         f._skill_name = name or f.__name__
         f._skill_description = description or f.__doc__ or ""
+        f._skill_changes_state = changes_state
+        f._skill_evidence_types = list(evidence_types or [])
         return f
 
     return _decorate(fn) if fn is not None else _decorate
@@ -4131,10 +4173,21 @@ def _load_skills() -> None:
         for attr_name in dir(module):
             obj = getattr(module, attr_name)
             if callable(obj) and getattr(obj, "_is_skill", False):
+                description = getattr(obj, "_skill_description", None)
+                metadata_bits = []
+                changes_state = getattr(obj, "_skill_changes_state", None)
+                if changes_state is not None:
+                    metadata_bits.append(f"changes_state={bool(changes_state)}")
+                evidence_types = getattr(obj, "_skill_evidence_types", None) or []
+                if evidence_types:
+                    metadata_bits.append(f"evidence_types={list(evidence_types)!r}")
+                if metadata_bits:
+                    suffix = "Skill metadata: " + "; ".join(metadata_bits)
+                    description = f"{description}\\n{suffix}" if description else suffix
                 mcp.add_tool(
                     obj,
                     name=getattr(obj, "_skill_name", attr_name),
-                    description=getattr(obj, "_skill_description", None),
+                    description=description,
                 )
                 logger.info("Registered skill: %s (from %s)", attr_name, skill_path.name)
 

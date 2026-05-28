@@ -559,6 +559,8 @@ def _step_evidence_satisfies_requirement(
     requirement: str, step: ExecutionStep
 ) -> bool:
     tool_name = step.metadata.get("tool_name")
+    if _step_declares_evidence_requirement(requirement, step):
+        return True
     if _observation_evidence_satisfies_requirement(requirement, step.content):
         return True
     if requirement == "running_http_service":
@@ -587,6 +589,27 @@ def _step_evidence_satisfies_requirement(
             return False
         return _artifact_quality_payload_is_acceptable(data)
     return requirement == "none"
+
+
+def _step_declares_evidence_requirement(
+    requirement: str,
+    step: ExecutionStep,
+) -> bool:
+    evidence_types = step.metadata.get("evidence_types") or step.metadata.get(
+        "evidence_requirements"
+    )
+    if not isinstance(evidence_types, list) or requirement not in evidence_types:
+        return False
+    payload = _step_json_payload(step)
+    if payload:
+        if payload.get("success") is False or payload.get("ok") is False:
+            return False
+        status = str(payload.get("status") or "").lower()
+        if status in {"error", "failed", "failure", "denied", "blocked"}:
+            return False
+        if payload.get("error"):
+            return False
+    return True
 
 
 def _successful_command_output_evidence(tool_name: str | None, content: str) -> bool:
@@ -1214,6 +1237,21 @@ _STATE_CHANGING_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+
+def terminal_command_declares_state_change(arguments: dict[str, Any] | None) -> bool:
+    """Whether a terminal command was explicitly marked as changing host state."""
+    if not isinstance(arguments, dict):
+        return False
+    return arguments.get("changes_state") is True
+
+
+def tool_call_changes_state(tool_name: str, arguments: dict[str, Any] | None) -> bool:
+    """Whether a tool call should reset no-progress verification counters."""
+    if tool_name == "execute_terminal_command":
+        return terminal_command_declares_state_change(arguments)
+    return tool_name in _STATE_CHANGING_TOOLS or tool_name == "execute_background_service"
+
+
 # Anti-thrash cap: how many times one identical host command may run since the
 # last host-state change before further repeats are short-circuited. Re-running
 # the same command with nothing changed in between cannot produce a new result;
@@ -1247,7 +1285,10 @@ def host_command_runs_since_state_change(
         if (
             step.kind == "tool_result"
             and not step.metadata.get("is_error")
-            and step.metadata.get("tool_name") in _STATE_CHANGING_TOOLS
+            and (
+                step.metadata.get("changes_state") is True
+                or step.metadata.get("tool_name") in _STATE_CHANGING_TOOLS
+            )
         ):
             start = index + 1
 
@@ -1292,7 +1333,13 @@ def terminal_failure_since_diagnostic(steps: list[ExecutionStep]) -> bool:
         tool_name = step.metadata.get("tool_name")
         if tool_name in _RECOVERY_DIAGNOSTIC_TOOLS:
             return False
-        if tool_name in _STATE_CHANGING_TOOLS and not step.metadata.get("is_error"):
+        if (
+            not step.metadata.get("is_error")
+            and (
+                tool_name in _STATE_CHANGING_TOOLS
+                or step.metadata.get("changes_state") is True
+            )
+        ):
             return False
         if tool_name == "execute_terminal_command":
             if step.metadata.get("is_error"):
@@ -1383,8 +1430,11 @@ def _is_state_change_reset(step: ExecutionStep) -> bool:
     """
     if step.kind != "tool_result" or step.metadata.get("is_error"):
         return False
-    name = step.metadata.get("tool_name")
-    return name in _STATE_CHANGING_TOOLS or name == "execute_background_service"
+    if step.metadata.get("changes_state") is True:
+        return True
+    name = str(step.metadata.get("tool_name") or "")
+    arguments = step.metadata.get("arguments") or {}
+    return tool_call_changes_state(name, arguments)
 
 
 def identical_tool_call_runs_since_state_change(
@@ -1520,6 +1570,17 @@ VERIFICATION_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+
+def tool_call_is_verification_probe(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> bool:
+    """Whether a call observes prior work rather than creating new durable state."""
+    if tool_name == "execute_terminal_command":
+        return not terminal_command_declares_state_change(arguments)
+    return tool_name in VERIFICATION_TOOLS
+
+
 MAX_CONSECUTIVE_VERIFICATION_CALLS = max(
     4, int(os.getenv("AGENT_MAX_CONSECUTIVE_VERIFICATION_CALLS", "6"))
 )
@@ -1537,7 +1598,9 @@ def consecutive_verification_run_length(steps: list[ExecutionStep]) -> int:
     for step in reversed(steps):
         if step.kind != "tool_result":
             continue
-        if step.metadata.get("tool_name") in VERIFICATION_TOOLS:
+        name = str(step.metadata.get("tool_name") or "")
+        arguments = step.metadata.get("arguments") or {}
+        if tool_call_is_verification_probe(name, arguments):
             count += 1
         else:
             break

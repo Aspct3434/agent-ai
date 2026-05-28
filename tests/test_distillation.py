@@ -25,7 +25,10 @@ def _trajectory() -> ExecutionTrajectory:
                 metadata={
                     "tool_name": "execute_terminal_command",
                     "is_error": False,
-                    "arguments": {"command": "create site files"},
+                    "arguments": {
+                        "command": "create site files",
+                        "changes_state": True,
+                    },
                 },
             ),
             ExecutionStep(
@@ -71,13 +74,25 @@ from __future__ import annotations
 from _skill import skill
 from pathlib import Path
 
-@skill(name="write_topic_site", description="Create a tiny static site for a topic.")
-def write_topic_site(topic: str, output_dir: str = "/tmp/topic-site") -> str:
+@skill(
+    name="write_topic_site",
+    description="Create a tiny static site for a topic.",
+    changes_state=True,
+    evidence_types=["filesystem_artifact"],
+)
+def write_topic_site(topic: str, output_dir: str = "/tmp/topic-site") -> dict[str, object]:
     \"\"\"Create an index.html file for a topic site.\"\"\"
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
-    (path / "index.html").write_text(f"<h1>{topic}</h1>", encoding="utf-8")
-    return f"Created topic site for {topic} at {path}"
+    file_path = path / "index.html"
+    file_path.write_text(f"<h1>{topic}</h1>", encoding="utf-8")
+    return {
+        "success": True,
+        "changes_state": True,
+        "evidence_types": ["filesystem_artifact"],
+        "path": str(file_path),
+        "exists": file_path.exists(),
+    }
 ```"""
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=code))]
@@ -107,6 +122,8 @@ async def _distill_with_model() -> None:
         assert len(created) == 1
         source = created[0].read_text(encoding="utf-8")
         assert "@skill" in source
+        assert "changes_state=True" in source
+        assert 'evidence_types=["filesystem_artifact"]' in source
         assert "def write_topic_site(topic: str" in source
         assert "Path(output_dir)" in source
         assert trajectory.final_output not in source

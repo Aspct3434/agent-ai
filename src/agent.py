@@ -23,7 +23,6 @@ from contract import (
     MAX_IDENTICAL_COMMAND_RUNS,
     MAX_IDENTICAL_TOOL_CALLS,
     TASK_CONTRACT_TOOL,
-    VERIFICATION_TOOLS,
     attempted_tool_names,
     background_service_misuse_message,
     blocked_action_tool_message,
@@ -48,6 +47,8 @@ from contract import (
     should_block_tool_for_action_task,
     terminal_failure_recovery_message,
     terminal_failure_since_diagnostic,
+    tool_call_changes_state,
+    tool_call_is_verification_probe,
     tool_names_for_contract_status,
 )
 from evaluator import (
@@ -503,6 +504,16 @@ _LLM_FINAL_MAX_TOKENS = int(os.getenv("AGENT_FINAL_MAX_TOKENS", "8192"))
 # every iteration, to cut redundant full-history writes.
 _CHECKPOINT_EVERY = max(1, int(os.getenv("AGENT_CHECKPOINT_EVERY", "4")))
 
+# Execute-mode tool turns that do not advance the contract, plan, or task graph
+# are useful only for a short diagnostic window. Past that point the agent is
+# spinning, even if each individual tool call has a different name or argument.
+_NO_PROGRESS_ITERATION_LIMIT = max(
+    3, int(os.getenv("AGENT_NO_PROGRESS_ITERATION_LIMIT", "5"))
+)
+_OBSTACLE_RECOVERY_AFTER_STALLED_ITERATIONS = max(
+    1, int(os.getenv("AGENT_OBSTACLE_RECOVERY_AFTER_STALLED_ITERATIONS", "2"))
+)
+
 # The old first-turn bootstrap duplicated the tool list into chat history while
 # the same tool schemas were also sent in the tools block. Leave it available for
 # local debugging, but keep it off by default to reduce input TPM pressure.
@@ -609,6 +620,11 @@ SYSTEM_DIRECTIVE = (
     "message before assuming you need a custom workaround. A failed tool call is "
     "not a reason to ask the user to debug for you: use your environment, evidence, "
     "web, and log-inspection tools to repair your own approach. "
+    "When an obstacle appears, do not answer with a bare 'I can't' statement. "
+    "Diagnose the obstacle, choose another route that still satisfies the user's "
+    "constraints, and keep working. Only report a blocker after tool evidence shows "
+    "there is no viable route; then name the exact blocker, the evidence, and the "
+    "next practical option. "
     # â”€â”€ Terminal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     "You have root access to a terminal shell tool. If the user requests an "
     "installation, setup, or file-system operation, DO NOT explain how the user "
@@ -626,6 +642,10 @@ SYSTEM_DIRECTIVE = (
     "MUST execute a follow-up verification check (e.g., ls -la, cat, or ps aux) "
     "in the very next iteration to verify the physical state inside the active "
     "execution environment before declaring a task finished. "
+    "For execute_terminal_command, set changes_state=true only for commands "
+    "intended to modify durable state (create/edit/install/build/start/stop); set "
+    "changes_state=false for commands that only inspect or fetch existing state. "
+    "Inspection commands are verification, not progress. "
     "If you are asked to START or RUN a server or continuous process (one that never "
     "terminates on its own), you MUST use the execute_background_service tool; using "
     "the standard terminal for such a process will deadlock. "
@@ -833,6 +853,51 @@ class SubAgentResult:
         if self.error:
             payload["error"] = self.error
         return payload
+
+
+@dataclass(frozen=True)
+class _ContractProgressFingerprint:
+    """Completion-facing progress state for execute-mode no-progress detection."""
+
+    missing: tuple[str, ...]
+    plan_open: bool
+    done_plan_steps: int
+    done_task_graph_nodes: int
+
+
+class _NoProgressTracker:
+    """Count consecutive execute-mode tool turns that do not move completion."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, limit)
+        self.stalled_iterations = 0
+        self._recovery_instruction_sent = False
+
+    @property
+    def in_recovery(self) -> bool:
+        return self._recovery_instruction_sent
+
+    def observe(
+        self,
+        before: _ContractProgressFingerprint,
+        after: _ContractProgressFingerprint,
+    ) -> bool:
+        if after != before:
+            self.stalled_iterations = 0
+            self._recovery_instruction_sent = False
+            return False
+        self.stalled_iterations += 1
+        return self.stalled_iterations >= self._limit
+
+    def should_enter_recovery(self, threshold: int) -> bool:
+        return (
+            self.stalled_iterations >= max(1, threshold)
+            and self.stalled_iterations < self._limit
+            and not self._recovery_instruction_sent
+        )
+
+    def mark_recovery_instruction_sent(self) -> None:
+        self._recovery_instruction_sent = True
 
 
 class SubAgentOrchestrator:
@@ -1211,16 +1276,18 @@ class AgentEngine:
 
             # Auto-continue exhausted or no progress: surface the paused message.
             final_response = incomplete["final_response"]
+            final_reason = str(incomplete.get("reason") or "iteration_limit")
             messages.append({"role": "assistant", "content": final_response})
-            yield _make_final_answer("iteration_limit", final_response)
-            await _store_iteration_cap_memory(
-                self._memory,
-                session_id,
-                original_prompt,
-                incomplete.get("tools_attempted", []),
-                final_response,
-                MAX_REACT_ITERATIONS,
-            )
+            yield _make_final_answer(final_reason, final_response)
+            if final_reason == "iteration_limit":
+                await _store_iteration_cap_memory(
+                    self._memory,
+                    session_id,
+                    original_prompt,
+                    incomplete.get("tools_attempted", []),
+                    final_response,
+                    MAX_REACT_ITERATIONS,
+                )
             return
 
     def _completion_status_with_task_graph(
@@ -1275,6 +1342,7 @@ class AgentEngine:
             return self._task_graph.allowed_tools_for_next(messages, steps)
 
         allowed = tool_names_for_contract_status(contract, status)
+        allowed.update(self._skill_tool_names_for_status(status))
         missing = set(status.get("missing") or [])
         if "plan" in missing:
             allowed.update({SET_TASK_GRAPH_TOOL_NAME, INSPECT_TASK_GRAPH_TOOL_NAME})
@@ -1287,6 +1355,127 @@ class AgentEngine:
         if graph is None:
             return 0
         return sum(1 for node in graph["nodes"] if node.get("status") == "done")
+
+    def _skill_tool_names_for_status(self, status: dict[str, Any]) -> set[str]:
+        if self._skill_registry is None:
+            return set()
+        missing = {str(item) for item in status.get("missing") or []}
+        if not missing:
+            return set()
+        names: set[str] = set()
+        for skill_info in self._skill_registry.list_skills():
+            evidence_types = {str(item) for item in skill_info.get("evidence_types") or []}
+            if not (missing & evidence_types):
+                continue
+            for tool_name in skill_info.get("tool_names") or [skill_info.get("name")]:
+                if tool_name:
+                    names.add(str(tool_name))
+        return names
+
+    def _skill_result_metadata(
+        self,
+        skill_name: str,
+        content: str,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {"skill_name": skill_name}
+        if self._skill_registry is not None:
+            registry_metadata = self._skill_registry.skill_metadata_for_tool(skill_name)
+            if registry_metadata:
+                if registry_metadata.get("changes_state") is not None:
+                    metadata["changes_state"] = bool(registry_metadata["changes_state"])
+                evidence_types = registry_metadata.get("evidence_types") or []
+                if evidence_types:
+                    metadata["evidence_types"] = [str(item) for item in evidence_types]
+
+        payload = _load_json_object(content)
+        if payload:
+            if isinstance(payload.get("changes_state"), bool):
+                metadata["changes_state"] = payload["changes_state"]
+            evidence_payload = payload.get("evidence_types") or payload.get(
+                "evidence_requirements"
+            )
+            if isinstance(evidence_payload, list):
+                metadata["evidence_types"] = [str(item) for item in evidence_payload]
+        return metadata
+
+    def _contract_progress_fingerprint(
+        self,
+        status: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> _ContractProgressFingerprint:
+        missing = tuple(sorted(str(item) for item in status.get("missing") or []))
+        return _ContractProgressFingerprint(
+            missing=missing,
+            plan_open=bool(status.get("plan_open")),
+            done_plan_steps=_count_done_plan_steps(messages),
+            done_task_graph_nodes=self._task_graph_done_count(messages),
+        )
+
+    def _build_no_progress_pause_message(
+        self,
+        original_prompt: str,
+        status: dict[str, Any],
+        steps: list[ExecutionStep],
+        stalled_iterations: int,
+    ) -> str:
+        missing = [str(item) for item in status.get("missing") or []]
+        missing_text = ", ".join(missing) if missing else "unknown required evidence"
+        recent_tools: list[str] = []
+        for step in reversed(steps):
+            if step.kind != "tool_result":
+                continue
+            tool_name = str(step.metadata.get("tool_name") or "unknown_tool")
+            if tool_name not in recent_tools:
+                recent_tools.append(tool_name)
+            if len(recent_tools) >= 5:
+                break
+        recent_text = ", ".join(reversed(recent_tools)) or "none"
+        return (
+            "Task paused after obstacle recovery. I detected a no-progress loop "
+            "while working on: "
+            f"{original_prompt[:180]}\n\n"
+            f"For {stalled_iterations} consecutive tool turn(s), the required "
+            "completion state did not change: no missing requirement was resolved, "
+            "no plan step was completed, and no task-graph node moved to done. "
+            f"Still missing: {missing_text}.\n"
+            f"Recent tools: {recent_text}.\n\n"
+            "I stopped automatically after switching into recovery mode, so the "
+            "agent does not keep repeating checks or alternate between tool calls "
+            "without producing new evidence. The next attempt should use a "
+            "different recovery route tied to the missing evidence above."
+        )
+
+    def _build_obstacle_recovery_instruction(
+        self,
+        status: dict[str, Any],
+        steps: list[ExecutionStep],
+    ) -> str:
+        missing = ", ".join(str(item) for item in status.get("missing") or [])
+        missing_text = missing or "the remaining contract evidence"
+        recent_tools: list[str] = []
+        for step in reversed(steps):
+            if step.kind != "tool_result":
+                continue
+            tool_name = str(step.metadata.get("tool_name") or "unknown_tool")
+            if tool_name not in recent_tools:
+                recent_tools.append(tool_name)
+            if len(recent_tools) >= 5:
+                break
+        recent_text = ", ".join(reversed(recent_tools)) or "none"
+        return (
+            "OBSTACLE RECOVERY MODE: recent tool use has not advanced the task "
+            f"contract. Still missing: {missing_text}. Recent tools: {recent_text}.\n"
+            "Do not answer with a generic refusal or an 'I can't' statement. Work "
+            "through the obstacle using evidence. On the next turn, do one of these "
+            "concrete recovery moves:\n"
+            "1. Use a diagnostic tool that can reveal a new fact about the blocker.\n"
+            "2. Take a different state-changing route that satisfies the same missing "
+            "evidence while respecting the user's requested constraints.\n"
+            "3. Repair the plan or task graph if the current path is invalid.\n"
+            "Only report a blocker after diagnostics show there is no viable route; "
+            "then name the exact blocker, cite the evidence, and give the next "
+            "practical option instead of saying only that the task cannot be done."
+        )
 
     async def _run_react_batch(
         self,
@@ -1335,6 +1524,7 @@ class AgentEngine:
         consecutive_error_iters = 0
         forced_recovery_tool: str | None = None
         contract_text_rejections = 0
+        no_progress_tracker = _NoProgressTracker(_NO_PROGRESS_ITERATION_LIMIT)
         available_tool_names = {tool["name"] for tool in all_tools}
         # Contract negotiation costs one model turn up front. Use the larger cap
         # whenever contracts are enabled so execute-mode tasks do not stop one
@@ -1360,6 +1550,11 @@ class AgentEngine:
                     contract is not None
                     and contract.get("mode") == "execute"
                     and not completion_status["complete"]
+                )
+                progress_before = (
+                    self._contract_progress_fingerprint(completion_status, messages)
+                    if needs_execution
+                    else None
                 )
                 completion_kwargs["model"] = active_model
                 request_messages = self._compact_context_window(messages)
@@ -1407,6 +1602,18 @@ class AgentEngine:
                                 if name in available_tool_names
                             )
                             recovery_note = "\n" + _build_self_repair_instruction(steps)
+                        if no_progress_tracker.in_recovery:
+                            allowed_tool_names.update(
+                                name
+                                for name in _SELF_REPAIR_TOOLS
+                                if name in available_tool_names
+                            )
+                            recovery_note += (
+                                "\n"
+                                + self._build_obstacle_recovery_instruction(
+                                    completion_status, steps
+                                )
+                            )
                     request_messages = [
                         *request_messages,
                         {
@@ -1649,6 +1856,62 @@ class AgentEngine:
                     )
                     yield {"type": "status", "message": f"Escalating to {active_model}â€¦"}
 
+                if needs_execution and progress_before is not None:
+                    progress_status = self._completion_status_with_task_graph(
+                        latest_task_contract(messages),
+                        messages,
+                        steps,
+                        contract_required=contract_required,
+                    )
+                    progress_after = self._contract_progress_fingerprint(
+                        progress_status, messages
+                    )
+                    if no_progress_tracker.observe(progress_before, progress_after):
+                        final_response = self._build_no_progress_pause_message(
+                            original_prompt,
+                            progress_status,
+                            steps,
+                            no_progress_tracker.stalled_iterations,
+                        )
+                        tools_attempted = sorted({
+                            step.metadata["tool_name"]
+                            for step in steps
+                            if step.kind == "tool_result"
+                        })
+                        logger.warning(
+                            "Pausing session %s after %d no-progress tool iteration(s); missing=%s",
+                            session_id,
+                            no_progress_tracker.stalled_iterations,
+                            progress_status.get("missing"),
+                        )
+                        yield {
+                            "type": "_batch_incomplete",
+                            "reason": "no_progress",
+                            "progressing": False,
+                            "final_response": final_response,
+                            "tools_attempted": tools_attempted,
+                        }
+                        return
+                    if no_progress_tracker.should_enter_recovery(
+                        _OBSTACLE_RECOVERY_AFTER_STALLED_ITERATIONS
+                    ):
+                        no_progress_tracker.mark_recovery_instruction_sent()
+                        if active_model != self._strong_model:
+                            active_model = self._strong_model
+                            logger.info(
+                                "Escalating to strong model %s for session %s after stalled progress",
+                                active_model,
+                                session_id,
+                            )
+                            yield {
+                                "type": "status",
+                                "message": f"Escalating to {active_model}...",
+                            }
+                        yield {
+                            "type": "status",
+                            "message": "Switching recovery strategy...",
+                        }
+
                 # Checkpoint on the first iteration and then every Nth, rather than
                 # every iteration, to cut redundant full-history writes. Replay
                 # resumes from the most recent checkpoint (at most _CHECKPOINT_EVERY-1
@@ -1733,6 +1996,7 @@ class AgentEngine:
                 )
                 yield {
                     "type": "_batch_incomplete",
+                    "reason": "iteration_limit",
                     "progressing": progressing,
                     "final_response": final_response,
                     "tools_attempted": tools_attempted,
@@ -1910,8 +2174,9 @@ class AgentEngine:
                 if graph_block is not None:
                     results[tc_id] = (graph_block, True, "__builtin__")
                     continue
+                is_verification_probe = tool_call_is_verification_probe(name, args)
                 if (
-                    name in VERIFICATION_TOOLS
+                    is_verification_probe
                     and local_verification_run_count >= MAX_CONSECUTIVE_VERIFICATION_CALLS
                 ):
                     results[tc_id] = (
@@ -1933,7 +2198,7 @@ class AgentEngine:
                     )
                     continue
                 parallel_to_run.append((tc_id, name, args))
-                if name in VERIFICATION_TOOLS:
+                if is_verification_probe:
                     local_verification_run_count += 1
 
             gathered = await asyncio.gather(
@@ -2003,7 +2268,7 @@ class AgentEngine:
                     "__builtin__",
                 )
             elif (
-                name in VERIFICATION_TOOLS
+                tool_call_is_verification_probe(name, args)
                 and local_verification_run_count >= MAX_CONSECUTIVE_VERIFICATION_CALLS
             ):
                 results[tc_id] = (
@@ -2036,13 +2301,11 @@ class AgentEngine:
                 if cmd:
                     last_host_cmd = cmd
                     local_repeat_counts[cmd] = local_repeat_counts.get(cmd, 0) + 1
-                # A successful execute_terminal_command extends the run; reset only
-                # when a non-terminal tool runs (handled by consecutive_terminal_run_length).
                 if name == "execute_terminal_command":
                     local_terminal_run_count += 1
-                if name in VERIFICATION_TOOLS:
+                if tool_call_is_verification_probe(name, args):
                     local_verification_run_count += 1
-                elif name in HOST_EXECUTION_TOOLS or name == "write_text_file":
+                elif tool_call_changes_state(name, args):
                     # State-changing tools break the verification run
                     local_verification_run_count = 0
 
@@ -2053,17 +2316,20 @@ class AgentEngine:
             content, is_error, server = results[tc_id]
             if is_error:
                 iter_error_count += 1
+            result_metadata: dict[str, Any] = {
+                "tool_name": tool_name,
+                "tool_call_id": tc_id,
+                "server": server,
+                "arguments": arguments,
+                "is_error": is_error,
+            }
+            if server == "skills":
+                result_metadata.update(self._skill_result_metadata(tool_name, content))
             steps.append(
                 ExecutionStep(
                     kind="tool_result",
                     content=content,
-                    metadata={
-                        "tool_name": tool_name,
-                        "tool_call_id": tc_id,
-                        "server": server,
-                        "arguments": arguments,
-                        "is_error": is_error,
-                    },
+                    metadata=result_metadata,
                 )
             )
             messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})

@@ -40,6 +40,7 @@ from contract import (
     should_block_tool_for_action_task,
     terminal_failure_recovery_message,
     terminal_failure_since_diagnostic,
+    tool_call_is_verification_probe,
     tool_names_for_contract_status,
 )
 from evaluator import ExecutionStep
@@ -136,6 +137,30 @@ class TestWriteTextFileEvidence:
 
         assert status["complete"] is False
         assert "artifact_quality" in status["missing"]
+
+    def test_generated_skill_metadata_satisfies_contract_evidence(self):
+        step = ExecutionStep(
+            kind="tool_result",
+            content=json.dumps(
+                {
+                    "success": True,
+                    "changes_state": True,
+                    "evidence_types": ["filesystem_artifact"],
+                    "path": "/tmp/generated/index.html",
+                    "exists": True,
+                }
+            ),
+            metadata={
+                "tool_name": "write_topic_site",
+                "server": "skills",
+                "is_error": False,
+                "changes_state": True,
+                "evidence_types": ["filesystem_artifact"],
+            },
+        )
+
+        assert evidence_requirement_satisfied_by_steps("filesystem_artifact", [step])
+        assert _count_successful_side_effects([step]) == 1
 
 
 class TestExposeLocalHttpServiceEvidence:
@@ -399,6 +424,32 @@ class TestConsecutiveVerificationRun:
         ]
         assert consecutive_verification_run_length(steps) == 0
 
+    def test_observation_terminal_command_counts_as_verification(self):
+        steps = [
+            _make_step("web_fetch", "{}", is_error=True),
+            _make_step(
+                "execute_terminal_command",
+                json.dumps({"exit_code": 0, "stdout": "200", "stderr": ""}),
+                arguments={"command": "curl -sI http://127.0.0.1:8080/"},
+            ),
+        ]
+        assert consecutive_verification_run_length(steps) == 2
+        assert tool_call_is_verification_probe(
+            "execute_terminal_command",
+            {"command": "curl -sI http://127.0.0.1:8080/"},
+        )
+
+    def test_declared_state_changing_terminal_command_breaks_streak(self):
+        steps = [
+            _make_step("web_fetch", "{}", is_error=True),
+            _make_step(
+                "execute_terminal_command",
+                json.dumps({"exit_code": 0, "stdout": "built", "stderr": ""}),
+                arguments={"command": "npm run build", "changes_state": True},
+            ),
+        ]
+        assert consecutive_verification_run_length(steps) == 0
+
 
 class TestBackgroundServiceCommandClassifier:
     def test_blocks_shell_probe_chain(self):
@@ -484,6 +535,50 @@ class TestVerificationLoopDispatchGuard:
 
         assert error_count == 1
         assert "finite/probe" in steps[-1].content
+        assert events[-1]["is_error"] is True
+
+    @pytest.mark.asyncio
+    async def test_terminal_observation_probe_does_not_reset_verification_cap(self):
+        class DummyEngine:
+            def _task_graph_tool_block(self, *_args, **_kwargs):
+                return None
+
+            def _task_graph_explicitly_allows(self, *_args, **_kwargs):
+                return False
+
+            async def _execute_single_tool(self, *_args, **_kwargs):
+                raise AssertionError("verification guard should block before execution")
+
+        steps = []
+        for i in range(MAX_CONSECUTIVE_VERIFICATION_CALLS):
+            if i % 2:
+                steps.append(
+                    _make_step(
+                        "execute_terminal_command",
+                        json.dumps({"exit_code": 0, "stdout": "ok", "stderr": ""}),
+                        arguments={"command": f"curl -s http://127.0.0.1:{8000 + i}/"},
+                    )
+                )
+            else:
+                steps.append(_make_step("web_fetch", "{}", is_error=True))
+
+        error_count, events = await AgentEngine._dispatch_tool_calls(
+            DummyEngine(),
+            calls=[
+                (
+                    "tc-next",
+                    "execute_terminal_command",
+                    {"command": "curl -s http://127.0.0.1:8080/"},
+                )
+            ],
+            messages=[],
+            steps=steps,
+            tool_index={},
+            session_id="test",
+        )
+
+        assert error_count == 1
+        assert "verification loop" in steps[-1].content
         assert events[-1]["is_error"] is True
 
 
@@ -741,7 +836,11 @@ class TestBuildPlanContinuationInstruction:
 class TestCountSuccessfulSideEffects:
     def test_counts_correct(self):
         steps = [
-            _make_step("execute_terminal_command", json.dumps({"exit_code": 0, "stdout": "ok"})),
+            _make_step(
+                "execute_terminal_command",
+                json.dumps({"exit_code": 0, "stdout": "ok"}),
+                arguments={"command": "pip install flask", "changes_state": True},
+            ),
             _make_step("write_text_file", json.dumps({"written": True, "exists": True, "size_bytes": 10})),
             _make_step("execute_terminal_command", "fail", is_error=True),
         ]

@@ -438,7 +438,10 @@ class TestBuildExecutiveSummary:
                     "type": "function",
                     "function": {
                         "name": "execute_terminal_command",
-                        "arguments": json.dumps({"command": "pip install flask"}),
+                        "arguments": json.dumps({
+                            "command": "pip install flask",
+                            "changes_state": True,
+                        }),
                     },
                 }],
             },
@@ -450,6 +453,34 @@ class TestBuildExecutiveSummary:
         ]
         summary = _build_executive_summary(messages)
         assert "pip install flask" in summary
+
+    def test_omits_observation_terminal_commands_from_completed_actions(self):
+        messages = [
+            {"role": "user", "content": "check service"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "execute_terminal_command",
+                        "arguments": json.dumps({
+                            "command": "curl -sI http://127.0.0.1:8080/",
+                            "changes_state": False,
+                        }),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "tc1",
+                "content": json.dumps({"exit_code": 0, "stdout": "HTTP/1.0 200 OK", "stderr": ""}),
+            },
+        ]
+        summary = _build_executive_summary(messages)
+        assert "curl -sI" not in summary
+        assert "None yet" in summary
 
     def test_shows_none_when_no_actions(self):
         messages = [{"role": "user", "content": "explain X"}]
