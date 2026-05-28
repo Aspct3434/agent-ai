@@ -1,0 +1,662 @@
+{
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\cli_chat.py": {
+    "mtime": 1779274831.477201,
+    "ast_hash": "a007d90c759c4738fc19e4d633b18062",
+    "semantic_hash": "a007d90c759c4738fc19e4d633b18062"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\package.json": {
+    "mtime": 1779891827.3665183,
+    "ast_hash": "f75256d7205a6902910cabd7144d5d98",
+    "semantic_hash": "f75256d7205a6902910cabd7144d5d98"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\.run-venv\\Include\\site\\python3.13\\greenlet\\greenlet.h": {
+    "mtime": 1779545100.0118418,
+    "ast_hash": "cc0e0312fb195f7869ed488415d18243",
+    "semantic_hash": "cc0e0312fb195f7869ed488415d18243"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\.run-venv\\Scripts\\Activate.ps1": {
+    "mtime": 1749651080.0,
+    "ast_hash": "c32677ff1a8444fc54b6dfa2c40c4f84",
+    "semantic_hash": "c32677ff1a8444fc54b6dfa2c40c4f84"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\.run-venv\\Scripts\\pywin32_postinstall.py": {
+    "mtime": 1779543658.2610672,
+    "ast_hash": "e4a35db96d1d595fa2b09b0eefaccac2",
+    "semantic_hash": "e4a35db96d1d595fa2b09b0eefaccac2"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\.run-venv\\Scripts\\pywin32_testall.py": {
+    "mtime": 1779543658.2745097,
+    "ast_hash": "4a68cb6a05b3e4c3d716b61f77e92f4c",
+    "semantic_hash": "4a68cb6a05b3e4c3d716b61f77e92f4c"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\bin\\distill.js": {
+    "mtime": 1779886688.6160488,
+    "ast_hash": "0235454b49f1a07b2b0248f1ae167a9d",
+    "semantic_hash": "0235454b49f1a07b2b0248f1ae167a9d"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\eslint.config.js": {
+    "mtime": 1779275268.6805692,
+    "ast_hash": "0355276bc79439afe3c53e3a2470ca1e",
+    "semantic_hash": "0355276bc79439afe3c53e3a2470ca1e"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\package.json": {
+    "mtime": 1779300813.8884542,
+    "ast_hash": "b4274d64391f6c96791e93ff16cec313",
+    "semantic_hash": "b4274d64391f6c96791e93ff16cec313"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\tailwind.config.js": {
+    "mtime": 1779275482.0158815,
+    "ast_hash": "3346df3fd0a1ea3f84440703bf8fd2cb",
+    "semantic_hash": "3346df3fd0a1ea3f84440703bf8fd2cb"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\tsconfig.app.json": {
+    "mtime": 1779275268.7139938,
+    "ast_hash": "136630b5accce1ca50663df229534a26",
+    "semantic_hash": "136630b5accce1ca50663df229534a26"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\tsconfig.json": {
+    "mtime": 1779275268.7203948,
+    "ast_hash": "a3d39fa780ebff65444de257f291ce6c",
+    "semantic_hash": "a3d39fa780ebff65444de257f291ce6c"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\tsconfig.node.json": {
+    "mtime": 1779275268.7284362,
+    "ast_hash": "70bdd0a673bcfc0e828080b306e7c680",
+    "semantic_hash": "70bdd0a673bcfc0e828080b306e7c680"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\vite.config.ts": {
+    "mtime": 1779277323.9060822,
+    "ast_hash": "5b641ab5f85eff4b0b9acec3417ca9b5",
+    "semantic_hash": "5b641ab5f85eff4b0b9acec3417ca9b5"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\App.tsx": {
+    "mtime": 1779817703.5410674,
+    "ast_hash": "0fde1a8939f7180d6290fde64a0dc4b7",
+    "semantic_hash": "0fde1a8939f7180d6290fde64a0dc4b7"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\main.tsx": {
+    "mtime": 1779275268.880492,
+    "ast_hash": "787e5a07efeb2bf6209d5937195f2f68",
+    "semantic_hash": "787e5a07efeb2bf6209d5937195f2f68"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\ApprovalsBanner.tsx": {
+    "mtime": 1779817703.54373,
+    "ast_hash": "fc2b729d73fdc1f76722896190588db4",
+    "semantic_hash": "fc2b729d73fdc1f76722896190588db4"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\ChatInterface.tsx": {
+    "mtime": 1779817703.54373,
+    "ast_hash": "ed4e370703399bf5feb36091c7ebd4d9",
+    "semantic_hash": "ed4e370703399bf5feb36091c7ebd4d9"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\Dashboard.tsx": {
+    "mtime": 1779820156.7688897,
+    "ast_hash": "17609d125c66aae311b95552bf438392",
+    "semantic_hash": "17609d125c66aae311b95552bf438392"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\EvolutionPanel.tsx": {
+    "mtime": 1779817703.544759,
+    "ast_hash": "148ed6a10491aa2eea38852e09a5370e",
+    "semantic_hash": "148ed6a10491aa2eea38852e09a5370e"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\KeyValues.tsx": {
+    "mtime": 1779817703.54576,
+    "ast_hash": "050fbcab25924bcf4d5f4f9ca8e0a911",
+    "semantic_hash": "050fbcab25924bcf4d5f4f9ca8e0a911"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\LogsPanel.tsx": {
+    "mtime": 1779817703.54576,
+    "ast_hash": "18f248c2d89b55c8521ed73d49553154",
+    "semantic_hash": "18f248c2d89b55c8521ed73d49553154"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\MemoryPanel.tsx": {
+    "mtime": 1779817703.547204,
+    "ast_hash": "bf812161de4ea63fff4cb9e16cb4f7f1",
+    "semantic_hash": "bf812161de4ea63fff4cb9e16cb4f7f1"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\OverviewPanel.tsx": {
+    "mtime": 1779820214.9421854,
+    "ast_hash": "74933db1078665964c30ab7467ff56cf",
+    "semantic_hash": "74933db1078665964c30ab7467ff56cf"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\PersonaPanel.tsx": {
+    "mtime": 1779817703.5482166,
+    "ast_hash": "7ac656693a43f17161f6d4b3826eb684",
+    "semantic_hash": "7ac656693a43f17161f6d4b3826eb684"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\SchedulePanel.tsx": {
+    "mtime": 1779817703.5492177,
+    "ast_hash": "38c8883929b2de98bf8b22ff2f8ea30c",
+    "semantic_hash": "38c8883929b2de98bf8b22ff2f8ea30c"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\SettingsPanel.tsx": {
+    "mtime": 1779817703.5502174,
+    "ast_hash": "3f70d2459228968f72d7a5295259faa7",
+    "semantic_hash": "3f70d2459228968f72d7a5295259faa7"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\SkillsPanel.tsx": {
+    "mtime": 1779817703.5502174,
+    "ast_hash": "fdc733a4f137568e4ac2b91221fa16d1",
+    "semantic_hash": "fdc733a4f137568e4ac2b91221fa16d1"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\TaskGraphPanel.tsx": {
+    "mtime": 1779820150.414532,
+    "ast_hash": "e852965aa999be1a2f73ca12da33a314",
+    "semantic_hash": "e852965aa999be1a2f73ca12da33a314"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\ToolBadge.tsx": {
+    "mtime": 1779275838.613156,
+    "ast_hash": "1ee5f2e9021567065e51b5362b7682fc",
+    "semantic_hash": "1ee5f2e9021567065e51b5362b7682fc"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\ToolsPanel.tsx": {
+    "mtime": 1779817703.5502174,
+    "ast_hash": "29515263232badec990af60a95cd7a60",
+    "semantic_hash": "29515263232badec990af60a95cd7a60"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\components\\useAgentStream.ts": {
+    "mtime": 1779880680.7071192,
+    "ast_hash": "6372a73ffc4372a3f478fa16309ef53d",
+    "semantic_hash": "6372a73ffc4372a3f478fa16309ef53d"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\lib\\api.ts": {
+    "mtime": 1779880664.4526813,
+    "ast_hash": "c72d40acf25a1449bf9c846ba6f5d610",
+    "semantic_hash": "c72d40acf25a1449bf9c846ba6f5d610"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\lib\\useCountUp.ts": {
+    "mtime": 1779817703.5518098,
+    "ast_hash": "3e926ae2ba578c51a4668a3a98275a47",
+    "semantic_hash": "3e926ae2ba578c51a4668a3a98275a47"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\lib\\distill-cli.js": {
+    "mtime": 1779889481.0549383,
+    "ast_hash": "7da311ed4825f3a0b116d37227ebf5ca",
+    "semantic_hash": "7da311ed4825f3a0b116d37227ebf5ca"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\scripts\\bootstrap.ps1": {
+    "mtime": 1779886927.5249448,
+    "ast_hash": "2716fc6f782e655f4237fe42d6dc32b7",
+    "semantic_hash": "2716fc6f782e655f4237fe42d6dc32b7"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\scripts\\bootstrap.sh": {
+    "mtime": 1779886927.653905,
+    "ast_hash": "6fe1de81d4518322234b319967441fe3",
+    "semantic_hash": "6fe1de81d4518322234b319967441fe3"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\scripts\\install.ps1": {
+    "mtime": 1779640732.8023584,
+    "ast_hash": "bcb4b074cb9a78db7c91b49781e4fe31",
+    "semantic_hash": "bcb4b074cb9a78db7c91b49781e4fe31"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\scripts\\install.sh": {
+    "mtime": 1779823849.957911,
+    "ast_hash": "4f2cde860ba057aae2a4d485cc166e0f",
+    "semantic_hash": "4f2cde860ba057aae2a4d485cc166e0f"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\scripts\\live_agent_smoke.py": {
+    "mtime": 1779626003.1048336,
+    "ast_hash": "adbe8ee3ecf2a7cf26f9fc8d8bf5178f",
+    "semantic_hash": "adbe8ee3ecf2a7cf26f9fc8d8bf5178f"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\agent.py": {
+    "mtime": 1779989643.3772418,
+    "ast_hash": "2b917141a43efa97bb9b7c8116663994",
+    "semantic_hash": "2b917141a43efa97bb9b7c8116663994"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\approvals.py": {
+    "mtime": 1779881114.3740509,
+    "ast_hash": "e5a3e181784338b350486b09fe7c9702",
+    "semantic_hash": "e5a3e181784338b350486b09fe7c9702"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\checkpointer.py": {
+    "mtime": 1779966371.114956,
+    "ast_hash": "2b467d34b963dee1c7e05270462784d8",
+    "semantic_hash": "2b467d34b963dee1c7e05270462784d8"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\contract.py": {
+    "mtime": 1779987916.5525167,
+    "ast_hash": "9330c6256c620ba5835b85d4aaa9e808",
+    "semantic_hash": "9330c6256c620ba5835b85d4aaa9e808"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\evaluator.py": {
+    "mtime": 1779988006.1650782,
+    "ast_hash": "87ce3fb8bfbaac7d80d0e79328e2ba5e",
+    "semantic_hash": "87ce3fb8bfbaac7d80d0e79328e2ba5e"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\eval_harness.py": {
+    "mtime": 1779881667.908996,
+    "ast_hash": "1b9a7fbffbb12eb84d95faf7e44e1717",
+    "semantic_hash": "1b9a7fbffbb12eb84d95faf7e44e1717"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\evolution.py": {
+    "mtime": 1779966395.5739393,
+    "ast_hash": "3e9d29444d6946f6e4e9a6b0f9d7423f",
+    "semantic_hash": "3e9d29444d6946f6e4e9a6b0f9d7423f"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\gateway.py": {
+    "mtime": 1779989601.1478095,
+    "ast_hash": "86ae71d0480221b6604ddab181d353b0",
+    "semantic_hash": "86ae71d0480221b6604ddab181d353b0"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\llm_utils.py": {
+    "mtime": 1779471434.1441264,
+    "ast_hash": "7b498beeebab0c2da4a299094eed76df",
+    "semantic_hash": "7b498beeebab0c2da4a299094eed76df"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\memory.py": {
+    "mtime": 1779645973.696974,
+    "ast_hash": "0c9a7ef6e28c10346eb7f693f2de2799",
+    "semantic_hash": "0c9a7ef6e28c10346eb7f693f2de2799"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\persona.py": {
+    "mtime": 1779628960.0708559,
+    "ast_hash": "c1d8a09b9c48bad93a36bebb8cac1182",
+    "semantic_hash": "c1d8a09b9c48bad93a36bebb8cac1182"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\planning.py": {
+    "mtime": 1779983361.6966288,
+    "ast_hash": "4e55c1394d6a602bc1cbb348d51587b8",
+    "semantic_hash": "4e55c1394d6a602bc1cbb348d51587b8"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\proxy_auth.py": {
+    "mtime": 1779989597.6589942,
+    "ast_hash": "ae0d99c8448f819e297bed456ca0c68b",
+    "semantic_hash": "ae0d99c8448f819e297bed456ca0c68b"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\scheduler.py": {
+    "mtime": 1779966381.1335368,
+    "ast_hash": "4107b12fb6ba47cfa62eadcd1b266c15",
+    "semantic_hash": "4107b12fb6ba47cfa62eadcd1b266c15"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\session_store.py": {
+    "mtime": 1779966364.767123,
+    "ast_hash": "62284328defc3ffb4d11e80bfaa476c4",
+    "semantic_hash": "62284328defc3ffb4d11e80bfaa476c4"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\skill_standard.py": {
+    "mtime": 1779720864.124442,
+    "ast_hash": "606aaf5988dd053d24695c5a678a3603",
+    "semantic_hash": "606aaf5988dd053d24695c5a678a3603"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\sqlite_migrations.py": {
+    "mtime": 1779966349.3765557,
+    "ast_hash": "49d704058fbbe9cebbc0469b091005cf",
+    "semantic_hash": "49d704058fbbe9cebbc0469b091005cf"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\task_graph.py": {
+    "mtime": 1779918670.3786669,
+    "ast_hash": "954a1713ef8fb66710ce6de9aeeb1cfd",
+    "semantic_hash": "954a1713ef8fb66710ce6de9aeeb1cfd"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\tools.py": {
+    "mtime": 1779989577.772328,
+    "ast_hash": "f539f9bec4a7a4f4920fda66376031f1",
+    "semantic_hash": "f539f9bec4a7a4f4920fda66376031f1"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\toolsets.py": {
+    "mtime": 1779819895.9311235,
+    "ast_hash": "5c9643de9b409b21d9f3d6e4e790df3b",
+    "semantic_hash": "5c9643de9b409b21d9f3d6e4e790df3b"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\tui.py": {
+    "mtime": 1779889551.2450433,
+    "ast_hash": "a3c2d7ac6c061ba7081080bbf3066f34",
+    "semantic_hash": "a3c2d7ac6c061ba7081080bbf3066f34"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\discord_bot.py": {
+    "mtime": 1779983542.6907516,
+    "ast_hash": "1018c38548887267d5939c1ff2951ea8",
+    "semantic_hash": "1018c38548887267d5939c1ff2951ea8"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\email_adapter.py": {
+    "mtime": 1779881076.3585591,
+    "ast_hash": "1b0499536dd5906e4c74bde42abc20e0",
+    "semantic_hash": "1b0499536dd5906e4c74bde42abc20e0"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\slack.py": {
+    "mtime": 1779983509.4806037,
+    "ast_hash": "7a21d991f4aec4fe8fc30c0b49e74c54",
+    "semantic_hash": "7a21d991f4aec4fe8fc30c0b49e74c54"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\telegram.py": {
+    "mtime": 1779983489.143226,
+    "ast_hash": "974465b40156603beaf405dae3b0359f",
+    "semantic_hash": "974465b40156603beaf405dae3b0359f"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\_commands.py": {
+    "mtime": 1779983455.6159365,
+    "ast_hash": "2e9f2e6aa59b1541f4e3b7bb26dcffc4",
+    "semantic_hash": "2e9f2e6aa59b1541f4e3b7bb26dcffc4"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\_progress.py": {
+    "mtime": 1779914514.9673808,
+    "ast_hash": "6b3590f3632726a36ad6fa59cd53d4ef",
+    "semantic_hash": "6b3590f3632726a36ad6fa59cd53d4ef"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\_telegram_format.py": {
+    "mtime": 1779817757.7164516,
+    "ast_hash": "2a066ac27d42dbf6ec2594a4347c324d",
+    "semantic_hash": "2a066ac27d42dbf6ec2594a4347c324d"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\adapters\\__init__.py": {
+    "mtime": 1779720864.1177275,
+    "ast_hash": "350b8b5907b7b2956285b66b1ad0df56",
+    "semantic_hash": "350b8b5907b7b2956285b66b1ad0df56"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\auth\\oauth.py": {
+    "mtime": 1779881104.3807833,
+    "ast_hash": "339f0eeb380a586760d686f19ca63d38",
+    "semantic_hash": "339f0eeb380a586760d686f19ca63d38"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\auth\\__init__.py": {
+    "mtime": 1779817703.5561006,
+    "ast_hash": "d8f2ed94e79d67f20af60f7168221202",
+    "semantic_hash": "d8f2ed94e79d67f20af60f7168221202"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\src\\auth\\__main__.py": {
+    "mtime": 1779817703.5571542,
+    "ast_hash": "5c2e1cfcc9cb49caba12c5b59c291820",
+    "semantic_hash": "5c2e1cfcc9cb49caba12c5b59c291820"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\conftest.py": {
+    "mtime": 1779472215.6308708,
+    "ast_hash": "024025613b5fa37dc39c42d824316479",
+    "semantic_hash": "024025613b5fa37dc39c42d824316479"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\installer-cli.test.js": {
+    "mtime": 1779889565.6176584,
+    "ast_hash": "2bf77cd033509a5e1fa75a54a6db7424",
+    "semantic_hash": "2bf77cd033509a5e1fa75a54a6db7424"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_adapter_commands.py": {
+    "mtime": 1779983575.7978613,
+    "ast_hash": "3480f5676ffb29514bbb0acbe540a364",
+    "semantic_hash": "3480f5676ffb29514bbb0acbe540a364"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_agent_ai_cli.py": {
+    "mtime": 1779880319.654318,
+    "ast_hash": "94577606e18ea76cea76bf4c5d8b5289",
+    "semantic_hash": "94577606e18ea76cea76bf4c5d8b5289"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_approvals.py": {
+    "mtime": 1779817703.564304,
+    "ast_hash": "9875d99c516b6b1ff03b9b300e8ac380",
+    "semantic_hash": "9875d99c516b6b1ff03b9b300e8ac380"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_browser_tools.py": {
+    "mtime": 1779528692.138503,
+    "ast_hash": "7ac1aad48a70ede43bdd7d6643eb2c46",
+    "semantic_hash": "7ac1aad48a70ede43bdd7d6643eb2c46"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_contract_planning.py": {
+    "mtime": 1779983687.8819652,
+    "ast_hash": "1d30e4e0e5cf367d6d28d778c7775962",
+    "semantic_hash": "1d30e4e0e5cf367d6d28d778c7775962"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_coverage_boost.py": {
+    "mtime": 1779987970.2215352,
+    "ast_hash": "1d131775e9a8335032518ccac05d8e1e",
+    "semantic_hash": "1d131775e9a8335032518ccac05d8e1e"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_cron_delivery.py": {
+    "mtime": 1779720864.1286423,
+    "ast_hash": "05613900f78180be1d3b212c078195fe",
+    "semantic_hash": "05613900f78180be1d3b212c078195fe"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_discord_adapter.py": {
+    "mtime": 1779720864.1286423,
+    "ast_hash": "efc25e98479b717c8e8b214b8eed538b",
+    "semantic_hash": "efc25e98479b717c8e8b214b8eed538b"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_distillation.py": {
+    "mtime": 1779987961.0497582,
+    "ast_hash": "5b4f0175e15fb8f0780f0c98a2a0bade",
+    "semantic_hash": "5b4f0175e15fb8f0780f0c98a2a0bade"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_email_adapter.py": {
+    "mtime": 1779817757.7164516,
+    "ast_hash": "8f5d59379d469ec3e05de21d50b7be7e",
+    "semantic_hash": "8f5d59379d469ec3e05de21d50b7be7e"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_end_to_end.py": {
+    "mtime": 1779646259.2845466,
+    "ast_hash": "8c372d8584658a18527cf60ec4bdb9d1",
+    "semantic_hash": "8c372d8584658a18527cf60ec4bdb9d1"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_eval_harness.py": {
+    "mtime": 1779472907.3668115,
+    "ast_hash": "e77603c28530ec5a34aae12dc40123e7",
+    "semantic_hash": "e77603c28530ec5a34aae12dc40123e7"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_evolution.py": {
+    "mtime": 1779817703.564304,
+    "ast_hash": "15a8e0f19384367b87c887bb3ec06849",
+    "semantic_hash": "15a8e0f19384367b87c887bb3ec06849"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_expose_local_http_service.py": {
+    "mtime": 1779989570.5166922,
+    "ast_hash": "34f5e81baec733f81dd7166e042be85c",
+    "semantic_hash": "34f5e81baec733f81dd7166e042be85c"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_gateway.py": {
+    "mtime": 1779221930.2354386,
+    "ast_hash": "bc29b6018865a3201fdf8dc23cac4d52",
+    "semantic_hash": "bc29b6018865a3201fdf8dc23cac4d52"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_gateway_auth.py": {
+    "mtime": 1779989721.300538,
+    "ast_hash": "c42276dc0129885865fb9175a97fe4a9",
+    "semantic_hash": "c42276dc0129885865fb9175a97fe4a9"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_gateway_unit.py": {
+    "mtime": 1779472887.8674648,
+    "ast_hash": "c522074ae593e424658ba1dac0e30ad6",
+    "semantic_hash": "c522074ae593e424658ba1dac0e30ad6"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_http_sandbox.py": {
+    "mtime": 1779720864.132413,
+    "ast_hash": "57235cde8fa0a66e1e43e1d1355f6e9b",
+    "semantic_hash": "57235cde8fa0a66e1e43e1d1355f6e9b"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_installers.py": {
+    "mtime": 1779720864.132413,
+    "ast_hash": "f5eba60c8d22e36669068e61d7039491",
+    "semantic_hash": "f5eba60c8d22e36669068e61d7039491"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_memory.py": {
+    "mtime": 1779472917.3919103,
+    "ast_hash": "d987ca4fe4b4226cb01745b2d00d85da",
+    "semantic_hash": "d987ca4fe4b4226cb01745b2d00d85da"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_node_react_scenario.py": {
+    "mtime": 1779534998.2244713,
+    "ast_hash": "f9bf9783770f07e01a5762194a926fb6",
+    "semantic_hash": "f9bf9783770f07e01a5762194a926fb6"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_oauth.py": {
+    "mtime": 1779817703.5653615,
+    "ast_hash": "8f0e4b761a44194d28de7c72b4ef7109",
+    "semantic_hash": "8f0e4b761a44194d28de7c72b4ef7109"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_persistence_infrastructure.py": {
+    "mtime": 1779966749.410819,
+    "ast_hash": "69e63726522c6d8168607b941fb3f38d",
+    "semantic_hash": "69e63726522c6d8168607b941fb3f38d"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_plan_contract_robustness.py": {
+    "mtime": 1779646107.5028896,
+    "ast_hash": "92efcb20958e2d119e8a46350d8c5672",
+    "semantic_hash": "92efcb20958e2d119e8a46350d8c5672"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_progress_format.py": {
+    "mtime": 1779914518.4901018,
+    "ast_hash": "3fad0300f7c18b67d63bd40f1cdf87fb",
+    "semantic_hash": "3fad0300f7c18b67d63bd40f1cdf87fb"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_property.py": {
+    "mtime": 1779882068.3056865,
+    "ast_hash": "147e94f05417cc38fbc559ee201483b6",
+    "semantic_hash": "147e94f05417cc38fbc559ee201483b6"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_sandbox_selfheal.py": {
+    "mtime": 1779720864.1337385,
+    "ast_hash": "267d4e6f71d121d47f226dafb993d175",
+    "semantic_hash": "267d4e6f71d121d47f226dafb993d175"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_scheduler.py": {
+    "mtime": 1779720864.1337385,
+    "ast_hash": "a6f642b39c9f3f95dcacf749809d9012",
+    "semantic_hash": "a6f642b39c9f3f95dcacf749809d9012"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_session_store.py": {
+    "mtime": 1779817703.56633,
+    "ast_hash": "7e8a411299357c5490a5d1ffbc475aaf",
+    "semantic_hash": "7e8a411299357c5490a5d1ffbc475aaf"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_shell_platform.py": {
+    "mtime": 1779918846.480186,
+    "ast_hash": "aa71355d9fd3ed9a61d8f6875e96dbdc",
+    "semantic_hash": "aa71355d9fd3ed9a61d8f6875e96dbdc"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_skill_evolution.py": {
+    "mtime": 1779987950.0059297,
+    "ast_hash": "95839c8ff2bc0e041b3f03f22ba6116f",
+    "semantic_hash": "95839c8ff2bc0e041b3f03f22ba6116f"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_skill_standard.py": {
+    "mtime": 1779720864.1337385,
+    "ast_hash": "6c153060d78e4f3aec9a311cdb312a72",
+    "semantic_hash": "6c153060d78e4f3aec9a311cdb312a72"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_slack_adapter.py": {
+    "mtime": 1779720864.1365743,
+    "ast_hash": "89585e67e0ee9a93aec7af6c2b640e39",
+    "semantic_hash": "89585e67e0ee9a93aec7af6c2b640e39"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_swarm.py": {
+    "mtime": 1779966765.268494,
+    "ast_hash": "475139b77b98e25e24b0045deb75980f",
+    "semantic_hash": "475139b77b98e25e24b0045deb75980f"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_task_contract_loop.py": {
+    "mtime": 1779989652.786632,
+    "ast_hash": "974066e506289abd74aa631d6fb508ec",
+    "semantic_hash": "974066e506289abd74aa631d6fb508ec"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_task_graph.py": {
+    "mtime": 1779918750.6547124,
+    "ast_hash": "4d1d562b4b4faf976202ef732eba68ca",
+    "semantic_hash": "4d1d562b4b4faf976202ef732eba68ca"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_telegram_adapter.py": {
+    "mtime": 1779817757.6842978,
+    "ast_hash": "5aa5248fe7fb0398015731662ed2626e",
+    "semantic_hash": "5aa5248fe7fb0398015731662ed2626e"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_telegram_format.py": {
+    "mtime": 1779817757.7164516,
+    "ast_hash": "d654feccc1efbe9dc267f633dd0ed6b6",
+    "semantic_hash": "d654feccc1efbe9dc267f633dd0ed6b6"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_tools.py": {
+    "mtime": 1779646259.1597643,
+    "ast_hash": "c735621d6c096cb0eb0310c2ae078abe",
+    "semantic_hash": "c735621d6c096cb0eb0310c2ae078abe"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_toolsets.py": {
+    "mtime": 1779528646.740476,
+    "ast_hash": "e445411325e03ebbcb36d18271001d7d",
+    "semantic_hash": "e445411325e03ebbcb36d18271001d7d"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\tests\\test_tui.py": {
+    "mtime": 1779889591.206002,
+    "ast_hash": "7605f383feb2e758517744ab894fd7bc",
+    "semantic_hash": "7605f383feb2e758517744ab894fd7bc"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\ARCHITECTURE.md": {
+    "mtime": 1779882940.5173361,
+    "ast_hash": "ca4389e62375d1205a65cd6073f36521",
+    "semantic_hash": "ca4389e62375d1205a65cd6073f36521"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\CHANGELOG.md": {
+    "mtime": 1779474033.761735,
+    "ast_hash": "fcbdd993ea7e353355dd1706c3da4839",
+    "semantic_hash": "fcbdd993ea7e353355dd1706c3da4839"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\docker-compose.yml": {
+    "mtime": 1779640789.0459647,
+    "ast_hash": "b3e4337ead942458416b7ea6b6000ff2",
+    "semantic_hash": "b3e4337ead942458416b7ea6b6000ff2"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\README.md": {
+    "mtime": 1779966793.9382086,
+    "ast_hash": "127693e6d93299e05b5a2364688abad5",
+    "semantic_hash": "127693e6d93299e05b5a2364688abad5"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\requirements.txt": {
+    "mtime": 1779720864.1157153,
+    "ast_hash": "c1bcfb6d45113c66fd3ce46592a1cd97",
+    "semantic_hash": "c1bcfb6d45113c66fd3ce46592a1cd97"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\.github\\workflows\\ci.yml": {
+    "mtime": 1779884685.2617455,
+    "ast_hash": "9152919d37f7d60963b1f8ea0dab86cf",
+    "semantic_hash": "9152919d37f7d60963b1f8ea0dab86cf"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\index.html": {
+    "mtime": 1779275270.4560957,
+    "ast_hash": "e500769b1fd1f6983e17f7e29bc80b9f",
+    "semantic_hash": "e500769b1fd1f6983e17f7e29bc80b9f"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\README.md": {
+    "mtime": 1779275268.7365232,
+    "ast_hash": "f6e3faf55d738cf2affe1b44195f27cf",
+    "semantic_hash": "f6e3faf55d738cf2affe1b44195f27cf"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\persona\\AGENTS.md": {
+    "mtime": 1779629017.9056642,
+    "ast_hash": "56251c79d05a7c3e97a3e38df462b9b7",
+    "semantic_hash": "56251c79d05a7c3e97a3e38df462b9b7"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\persona\\SOUL.md": {
+    "mtime": 1779903893.7081625,
+    "ast_hash": "6707cc6d32728908504c55c9d7f165fb",
+    "semantic_hash": "6707cc6d32728908504c55c9d7f165fb"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\public\\favicon.svg": {
+    "mtime": 1779275268.7879953,
+    "ast_hash": "7e840862161341271697daa99a40d76b",
+    "semantic_hash": "7e840862161341271697daa99a40d76b"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\public\\icons.svg": {
+    "mtime": 1779275268.8041823,
+    "ast_hash": "3b4fcfcf393eca4d264dca4a4663bc37",
+    "semantic_hash": "3b4fcfcf393eca4d264dca4a4663bc37"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\assets\\hero.png": {
+    "mtime": 1779275268.753607,
+    "ast_hash": "aead493361b27e7510691c5d7072dfc1",
+    "semantic_hash": "aead493361b27e7510691c5d7072dfc1"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\assets\\react.svg": {
+    "mtime": 1779275268.8205562,
+    "ast_hash": "f0402b67b6ce880f65666bb49e841696",
+    "semantic_hash": "f0402b67b6ce880f65666bb49e841696"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\control-panel\\src\\assets\\vite.svg": {
+    "mtime": 1779275268.8479135,
+    "ast_hash": "9960a24288958394ac50e57ff638b036",
+    "semantic_hash": "9960a24288958394ac50e57ff638b036"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\docs\\assets\\distill-terminal-banner.svg": {
+    "mtime": 1779894012.98465,
+    "ast_hash": "8e18bc500019d7d3cc452ec7f671ccba",
+    "semantic_hash": "8e18bc500019d7d3cc452ec7f671ccba"
+  },
+  "C:\\Users\\karim\\OneDrive\\Documents\\agent ai\\docs\\assets\\distill-tui.gif": {
+    "mtime": 1779893574.5617447,
+    "ast_hash": "936ea1533d1821d393f0c012d71a15de",
+    "semantic_hash": "936ea1533d1821d393f0c012d71a15de"
+  }
+}
