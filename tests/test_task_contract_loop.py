@@ -421,6 +421,23 @@ def test_empty_tool_call_content_is_sanitized_before_next_request() -> None:
     )
 
 
+def test_assistant_tool_call_serialization_preserves_json_safe_provider_fields() -> None:
+    message = SimpleNamespace(
+        content=None,
+        tool_calls=[_contract_tool("answer", ["none"])],
+        reasoning_content="provider reasoning metadata",
+        provider_payload={"trace": "kept"},
+        non_json=object(),
+    )
+
+    serialized = agent_module._serialise_assistant_msg(message)
+
+    assert serialized["content"] is None
+    assert serialized["reasoning_content"] == "provider reasoning metadata"
+    assert serialized["provider_payload"] == {"trace": "kept"}
+    assert "non_json" not in serialized
+
+
 def test_empty_rejected_final_text_does_not_poison_next_request() -> None:
     script = [
         _completion(tool_calls=[_contract_tool("execute", ["running_http_service"])]),

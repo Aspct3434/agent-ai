@@ -3557,7 +3557,42 @@ def _serialise_assistant_msg(msg: Any) -> dict[str, Any]:
         "role": "assistant",
         "content": content,
         "tool_calls": tool_calls,
+        **_json_safe_assistant_extras(msg),
     }
+
+
+def _json_safe_assistant_extras(msg: Any) -> dict[str, Any]:
+    """Preserve provider-returned assistant fields without provider branching."""
+    excluded = {"role", "content", "tool_calls", "function_call"}
+    raw: dict[str, Any] = {}
+    if isinstance(msg, dict):
+        raw = dict(msg)
+    elif hasattr(msg, "model_dump"):
+        dumped = msg.model_dump(exclude_none=True)
+        if isinstance(dumped, dict):
+            raw = dumped
+    elif hasattr(msg, "dict"):
+        dumped = msg.dict(exclude_none=True)
+        if isinstance(dumped, dict):
+            raw = dumped
+    else:
+        raw = {
+            key: value
+            for key, value in vars(msg).items()
+            if not key.startswith("_")
+        }
+
+    extras: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key in excluded or key.startswith("_") or value is None:
+            continue
+        try:
+            encoded = json.dumps(value)
+        except (TypeError, ValueError):
+            continue
+        if len(encoded) <= 16_000:
+            extras[key] = value
+    return extras
 
 
 def _extract_tool_text(result: CallToolResult) -> str:

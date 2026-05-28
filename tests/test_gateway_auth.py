@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -17,12 +18,14 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 import gateway
+from proxy_auth import signed_proxy_query
 
 
 def _make_request(
     path: str = "/api/status",
     method: str = "GET",
     headers: dict | None = None,
+    query: str = "",
     client: tuple[str, int] = ("203.0.113.10", 4242),
 ):
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
@@ -31,7 +34,7 @@ def _make_request(
         "method": method,
         "path": path,
         "headers": raw,
-        "query_string": b"",
+        "query_string": query.encode(),
         "client": client,
     }
     return Request(scope)
@@ -177,6 +180,56 @@ class TestAuthMiddleware:
         )
         assert resp.status_code == 200
         assert called["hit"] is True
+
+    @pytest.mark.asyncio
+    async def test_signed_proxy_url_bypasses_api_token_without_exposing_api(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+        monkeypatch.setattr(gateway, "_ALLOW_INSECURE_NO_AUTH", False)
+        query = signed_proxy_query(4321)
+        called = {"hit": False}
+
+        async def call_next(_req):
+            called["hit"] = True
+            return PlainTextResponse("ok")
+
+        resp = await gateway._auth_middleware(
+            _make_request(path="/proxy/4321/", query=query),
+            call_next,
+        )
+
+        parsed = parse_qs(query)
+        assert resp.status_code == 200
+        assert called["hit"] is True
+        assert "agent_proxy_4321=" in resp.headers.get("set-cookie", "")
+        assert parsed["proxy_token"][0] != "secret"
+
+        cookie = resp.headers["set-cookie"].split(";", 1)[0]
+        called["hit"] = False
+        asset_resp = await gateway._auth_middleware(
+            _make_request(
+                path="/proxy/4321/assets/app.css",
+                headers={"Cookie": cookie},
+            ),
+            call_next,
+        )
+        assert asset_resp.status_code == 200
+        assert called["hit"] is True
+
+    @pytest.mark.asyncio
+    async def test_signed_proxy_url_is_bound_to_port(self, monkeypatch):
+        monkeypatch.setattr(gateway, "_API_TOKEN", "secret")
+        monkeypatch.setattr(gateway, "_ALLOW_INSECURE_NO_AUTH", False)
+        query = signed_proxy_query(4321)
+
+        async def call_next(_req):  # pragma: no cover
+            raise AssertionError("wrong-port proxy signature must not authorize")
+
+        resp = await gateway._auth_middleware(
+            _make_request(path="/proxy/4322/", query=query),
+            call_next,
+        )
+
+        assert resp.status_code == 401
 
     @pytest.mark.asyncio
     async def test_wrong_token_returns_401(self, monkeypatch):

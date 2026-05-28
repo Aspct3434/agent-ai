@@ -9,10 +9,12 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from proxy_auth import verify_proxy_token  # noqa: E402
 from tools import ToolManager  # noqa: E402
 
 
@@ -44,7 +46,16 @@ def run_expose_local_http_service_test() -> None:
                 assert result["exposed"] is True
                 assert result["connectable"] is True
                 assert result["port"] == port
-                assert result["url"] == f"http://localhost:8000/proxy/{port}/"
+                split = urlsplit(result["url"])
+                query = parse_qs(split.query)
+                assert result["url"].startswith(f"http://localhost:8000/proxy/{port}/?")
+                assert "proxy_expires" in query
+                assert "proxy_token" in query
+                assert verify_proxy_token(
+                    port,
+                    query["proxy_expires"][0],
+                    query["proxy_token"][0],
+                )
                 print(json.dumps(result, indent=2))
                 print("EXPOSE LOCAL HTTP SERVICE CHECKS PASSED")
 

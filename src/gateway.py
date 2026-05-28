@@ -38,6 +38,15 @@ from evaluator import SkillDistiller, SkillRegistry
 from evolution import EvolutionEngine
 from memory import UserProfileStore
 from persona import PersonaLoader
+from proxy_auth import (
+    PROXY_EXPIRES_PARAM,
+    PROXY_TOKEN_PARAM,
+    proxy_cookie_name,
+    proxy_cookie_value,
+    strip_proxy_auth_params,
+    verify_proxy_cookie,
+    verify_proxy_token,
+)
 from scheduler import CronScheduler, _validate_schedule
 from sqlite_migrations import SQLiteMigration, apply_sqlite_migrations
 from tools import ToolManager
@@ -255,6 +264,41 @@ def _rate_limit_key_for_http(request: Request) -> str:
     if token:
         return f"token:{_hash_token(token)}"
     return f"ip:{_client_host(request.client)}"
+
+
+def _rate_limit_key_for_proxy(request: Request, port: int) -> str:
+    token = request.query_params.get(PROXY_TOKEN_PARAM)
+    if token:
+        return f"proxy:{port}:{_hash_token(token)}"
+    return f"proxy:{port}:ip:{_client_host(request.client)}"
+
+
+def _proxy_port_from_path(path: str) -> int | None:
+    parts = path.strip("/").split("/", 2)
+    if len(parts) < 2 or parts[0] != "proxy":
+        return None
+    try:
+        port = int(parts[1])
+    except ValueError:
+        return None
+    if port < 1 or port > 65535:
+        return None
+    return port
+
+
+def _signed_proxy_request_port(request: Request) -> int | None:
+    port = _proxy_port_from_path(request.url.path)
+    if port is None:
+        return None
+    if verify_proxy_token(
+        port,
+        request.query_params.get(PROXY_EXPIRES_PARAM),
+        request.query_params.get(PROXY_TOKEN_PARAM),
+    ):
+        return port
+    if verify_proxy_cookie(port, request.cookies.get(proxy_cookie_name(port))):
+        return port
+    return None
 
 
 def _rate_limit_key_for_websocket(websocket: WebSocket) -> str:
@@ -854,6 +898,27 @@ async def _auth_middleware(
 ) -> Response:
     if request.method == "OPTIONS" or request.url.path in _AUTH_OPEN_PATHS:
         return await call_next(request)
+    signed_proxy_port = _signed_proxy_request_port(request)
+    if signed_proxy_port is not None:
+        try:
+            await _rate_limiter.check(_rate_limit_key_for_proxy(request, signed_proxy_port))
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        response = await call_next(request)
+        expires = request.query_params.get(PROXY_EXPIRES_PARAM)
+        if expires and request.query_params.get(PROXY_TOKEN_PARAM):
+            try:
+                max_age = max(0, int(expires) - int(time.time()))
+            except ValueError:
+                max_age = None
+            response.set_cookie(
+                proxy_cookie_name(signed_proxy_port),
+                proxy_cookie_value(signed_proxy_port, int(expires)),
+                max_age=max_age,
+                httponly=True,
+                samesite="lax",
+            )
+        return response
     if not _auth_configured_or_explicitly_disabled():
         return JSONResponse(
             {
@@ -1160,9 +1225,10 @@ async def proxy_local_http_service(
     if port < 1 or port > 65535:
         raise HTTPException(status_code=400, detail="Port must be between 1 and 65535")
 
+    upstream_query = strip_proxy_auth_params(request.url.query)
     target_url = httpx.URL(
         f"http://127.0.0.1:{port}/{path}",
-        query=request.url.query.encode("utf-8"),
+        query=upstream_query.encode("utf-8"),
     )
     headers = {
         key: value
@@ -1177,7 +1243,7 @@ async def proxy_local_http_service(
                 tools.proxy_local_http_service,
                 port=port,
                 path=path,
-                query=request.url.query,
+                query=upstream_query,
                 method=request.method,
                 headers=headers,
                 body=await request.body(),

@@ -25,6 +25,8 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult, PaginatedRequestParams
 
+from proxy_auth import append_signed_proxy_query
+
 logger = logging.getLogger(__name__)
 
 # Project root is one level above this file (src/../)
@@ -2623,7 +2625,10 @@ class ToolManager:
             "name": name or f"local-http-{service_port}",
             "port": service_port,
             "path": suffix,
-            "url": f"{self.public_base_url}/proxy/{service_port}{suffix}",
+            "url": append_signed_proxy_query(
+                f"{self.public_base_url}/proxy/{service_port}{suffix}",
+                service_port,
+            ),
             "connectable": connectable,
             "scope": scope,
         }
@@ -3187,7 +3192,14 @@ class ToolManager:
         self._sessions.pop(name, None)
         self._tools_cache = None  # tool set changed; force a rebuild next call
         if stack:
-            await stack.aclose()
+            try:
+                await stack.aclose()
+            except asyncio.CancelledError as exc:
+                logger.warning("MCP server %s shutdown was cancelled: %s", name, exc)
+            except RuntimeError as exc:
+                if "cancel scope" not in str(exc):
+                    raise
+                logger.warning("MCP server %s shutdown hit cancel-scope cleanup race: %s", name, exc)
 
     def _resolve_file_path(self, raw_path: str) -> Path:
         """Resolve a host path for host-mode file tools."""
