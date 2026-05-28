@@ -4,8 +4,10 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import litellm
@@ -280,28 +282,6 @@ def _ensure_evidence_in_final_response(
         f"- {label}: {value}" for label, value in missing_items
     )
     return f"{prefix}\n\n{evidence_block}" if prefix else evidence_block
-
-
-def _uses_moonshot_provider(model: str) -> bool:
-    return model.startswith("moonshot/") or model.startswith("kimi-")
-
-
-def _moonshot_required_tool_instruction(tool_schemas: list[dict[str, Any]]) -> str:
-    names = [
-        str(tool.get("function", {}).get("name"))
-        for tool in tool_schemas
-        if tool.get("function", {}).get("name")
-    ]
-    if len(names) == 1:
-        return (
-            f"Call the `{names[0]}` tool now. Return a tool call only; do not "
-            "answer in prose, do not explain, and do not say the task is in progress."
-        )
-    return (
-        "Call exactly one of these tools now: "
-        f"{', '.join(f'`{name}`' for name in names)}. Return a tool call only; "
-        "do not answer in prose, do not explain, and do not say the task is in progress."
-    )
 
 
 def _preferred_recovery_tool_name(
@@ -815,6 +795,116 @@ _SUB_AGENT_DIRECTIVES: dict[str, str] = {
     ),
 }
 
+_SUB_AGENT_MAX_BATCH = max(1, int(os.getenv("AGENT_SUB_AGENT_MAX_BATCH", "8")))
+_SUB_AGENT_MAX_CONCURRENCY = max(
+    1, int(os.getenv("AGENT_SUB_AGENT_MAX_CONCURRENCY", "4"))
+)
+_SUB_AGENT_TIMEOUT_SECONDS = max(
+    1, int(os.getenv("AGENT_SUB_AGENT_TIMEOUT_SECONDS", "300"))
+)
+_SUB_AGENT_MAX_DEPTH = max(0, int(os.getenv("AGENT_SUB_AGENT_MAX_DEPTH", "2")))
+
+
+@dataclass(frozen=True)
+class SubAgentTask:
+    task_id: str
+    agent_type: str
+    task_description: str
+    context_payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SubAgentResult:
+    task_id: str
+    agent_type: str
+    task: str
+    result: str
+    error: str | None
+    duration_seconds: float
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "task_id": self.task_id,
+            "agent_type": self.agent_type,
+            "task": self.task[:160],
+            "result": self.result,
+            "duration_seconds": round(self.duration_seconds, 3),
+        }
+        if self.error:
+            payload["error"] = self.error
+        return payload
+
+
+class SubAgentOrchestrator:
+    """Run isolated sub-agent tasks with explicit ordering, limits, and timeouts."""
+
+    def __init__(
+        self,
+        runner: Any,
+        *,
+        max_concurrency: int,
+        timeout_seconds: int,
+    ) -> None:
+        self._runner = runner
+        self._max_concurrency = max(1, max_concurrency)
+        self._timeout_seconds = max(1, timeout_seconds)
+
+    async def run(
+        self,
+        tasks: list[SubAgentTask],
+        *,
+        mode: Literal["sequential", "parallel"],
+    ) -> list[SubAgentResult]:
+        if mode == "parallel":
+            semaphore = asyncio.Semaphore(self._max_concurrency)
+
+            async def run_limited(task: SubAgentTask) -> SubAgentResult:
+                async with semaphore:
+                    return await self._run_guarded(task)
+
+            return await asyncio.gather(*(run_limited(task) for task in tasks))
+
+        results: list[SubAgentResult] = []
+        for task in tasks:
+            results.append(await self._run_guarded(task))
+        return results
+
+    async def _run_guarded(self, task: SubAgentTask) -> SubAgentResult:
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                self._runner(task),
+                timeout=self._timeout_seconds,
+            )
+            return SubAgentResult(
+                task_id=task.task_id,
+                agent_type=task.agent_type,
+                task=task.task_description,
+                result=result,
+                error=None,
+                duration_seconds=time.monotonic() - started,
+            )
+        except TimeoutError:
+            message = f"sub-agent timed out after {self._timeout_seconds}s"
+            return SubAgentResult(
+                task_id=task.task_id,
+                agent_type=task.agent_type,
+                task=task.task_description,
+                result=f"[error] {message}",
+                error=message,
+                duration_seconds=time.monotonic() - started,
+            )
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            return SubAgentResult(
+                task_id=task.task_id,
+                agent_type=task.agent_type,
+                task=task.task_description,
+                result=f"[error] {message}",
+                error=message,
+                duration_seconds=time.monotonic() - started,
+            )
+
 
 class NormalizedMessage(BaseModel):
     session_id: str
@@ -859,15 +949,14 @@ class AgentEngine:
         session_store: Any = None,
         approval_gate: Any = None,
         evolution_engine: EvolutionEngine | None = None,
+        sub_agent_depth: int = 0,
     ) -> None:
         self._memory = memory
         self._tools = tools
         self._model = model
         self._fast_model = fast_model or model
         self._strong_model = strong_model or model
-        self._caching_enabled = _model_supports_caching(
-            self._fast_model
-        ) and _model_supports_caching(self._strong_model)
+        self._caching_enabled = _litellm_cache_control_enabled()
         self._distiller = distiller
         self._checkpointer = checkpointer
         base_directive = system_directive if system_directive is not None else SYSTEM_DIRECTIVE
@@ -882,6 +971,12 @@ class AgentEngine:
         self._session_store = session_store
         self._approval_gate = approval_gate
         self._evolution_engine = evolution_engine
+        self._sub_agent_depth = max(0, sub_agent_depth)
+        self._sub_agent_orchestrator = SubAgentOrchestrator(
+            self._run_single_delegate,
+            max_concurrency=_SUB_AGENT_MAX_CONCURRENCY,
+            timeout_seconds=_SUB_AGENT_TIMEOUT_SECONDS,
+        )
         self._task_graph = TaskGraphEngine()
         self._histories: dict[str, list[dict[str, Any]]] = {}
         self._session_steps: dict[str, list[ExecutionStep]] = {}
@@ -899,9 +994,7 @@ class AgentEngine:
             self._fast_model = fast_model
         if strong_model:
             self._strong_model = strong_model
-        self._caching_enabled = _model_supports_caching(
-            self._fast_model
-        ) and _model_supports_caching(self._strong_model)
+        self._caching_enabled = _litellm_cache_control_enabled()
 
     # ------------------------------------------------------------------
     # Public API
@@ -1219,8 +1312,8 @@ class AgentEngine:
         batch_start_done_graph_nodes = self._task_graph_done_count(messages)
         batch_start_successes = _count_successful_side_effects(steps)
         tool_schemas = _to_litellm_tools(all_tools)
-        # Cache the (large, stable) tool block. Anthropic caches every tool up to
-        # and including the one carrying cache_control, so marking the last covers all.
+        # Cache the large, stable tool block when the operator has enabled
+        # LiteLLM cache_control markers for a compatible provider.
         if tool_schemas and self._caching_enabled:
             tool_schemas[-1]["cache_control"] = {"type": "ephemeral"}
         tool_index: dict[str, str] = {t["name"]: t["server"] for t in all_tools}
@@ -1341,23 +1434,7 @@ class AgentEngine:
                 requires_tool_call = bool(
                     (must_set_contract or needs_execution) and request_tool_schemas
                 )
-                # Moonshot/Kimi does not natively support OpenAI's
-                # tool_choice="required". LiteLLM approximates it with a generic
-                # final user message; make that provider shim explicit and exact
-                # so contract-gated tasks do not drift through slow prose retries.
-                if requires_tool_call and _uses_moonshot_provider(active_model):
-                    request_messages = [
-                        *request_messages,
-                        {
-                            "role": "user",
-                            "content": _moonshot_required_tool_instruction(
-                                request_tool_schemas
-                            ),
-                        },
-                    ]
-                    completion_kwargs["messages"] = request_messages
-                    completion_kwargs.pop("tool_choice", None)
-                elif requires_tool_call:
+                if requires_tool_call:
                     completion_kwargs["tool_choice"] = "required"
                 else:
                     completion_kwargs.pop("tool_choice", None)
@@ -1674,10 +1751,9 @@ class AgentEngine:
                 ),
             }
             yield {"type": "status", "message": "Summarising progress..."}
-            # tools= must still be sent: the history contains tool_use/tool_result
-            # blocks and Anthropic rejects the request without it. tool_choice="none"
-            # forces the model to answer in text rather than call another tool, which
-            # keeps the original intent (a structured progress summary) intact.
+            # tools= must still be sent because the history contains tool-result
+            # blocks. tool_choice="none" forces text instead of another tool call,
+            # keeping the intent (a structured progress summary) intact.
             summary_kwargs: dict[str, Any] = {
                 "model": active_model,
                 "messages": _prepare_llm_request_messages(
@@ -2478,9 +2554,9 @@ class AgentEngine:
     def _directive_system_message(self) -> dict[str, Any]:
         """Build the durable system-directive message.
 
-        On Anthropic models the text is wrapped in a content block with a
-        ``cache_control`` breakpoint so this large, session-stable prefix is read
-        from cache on every iteration after the first instead of being re-billed.
+        When LiteLLM cache_control is explicitly enabled, wrap the text in a
+        cacheable content block so compatible providers can reuse this large,
+        session-stable prefix.
         """
         directive = self._effective_system_directive()
         if self._caching_enabled:
@@ -2631,7 +2707,7 @@ class AgentEngine:
         ])
 
     async def _execute_delegate_task(self, arguments: dict[str, Any]) -> str:
-        """Spin up one or more isolated sub-AgentEngines and run them.
+        """Run one or more isolated sub-AgentEngines through the orchestrator.
 
         Supports two calling forms:
         1. Single task (backward compat):
@@ -2639,41 +2715,64 @@ class AgentEngine:
         2. Parallel batch:
            {tasks: [{agent_type, task_description, context_payload},...], mode: "parallel"}
         """
-        # -- Parallel / batch form ----------------------------------------
-        if "tasks" in arguments:
-            tasks_list: list[dict[str, Any]] = arguments["tasks"]
-            mode = arguments.get("mode", "sequential")
-            if mode == "parallel":
-                results = await asyncio.gather(
-                    *(self._run_single_delegate(t) for t in tasks_list),
-                    return_exceptions=True,
-                )
-                return json.dumps(
-                    [
-                        {"task": t.get("task_description", "")[:80],
-                         "agent_type": t.get("agent_type"),
-                         "result": r if isinstance(r, str) else f"[error] {r}"}
-                        for t, r in zip(tasks_list, results, strict=False)
-                    ],
-                    indent=2,
-                )
-            else:
-                parts: list[str] = []
-                for task_args in tasks_list:
-                    result = await self._run_single_delegate(task_args)
-                    parts.append(f"[{task_args.get('agent_type')}] {result}")
-                return "\n\n".join(parts)
+        if self._sub_agent_depth >= _SUB_AGENT_MAX_DEPTH:
+            raise RuntimeError(
+                f"sub-agent recursion depth limit reached ({_SUB_AGENT_MAX_DEPTH})"
+            )
 
-        # -- Single task form (backward compat) ---------------------------
-        return await self._run_single_delegate(arguments)
+        batch_form = "tasks" in arguments
+        raw_tasks = arguments.get("tasks") if batch_form else [arguments]
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            raise ValueError("delegate_task requires a non-empty task or tasks list")
+        if len(raw_tasks) > _SUB_AGENT_MAX_BATCH:
+            raise ValueError(
+                f"delegate_task accepts at most {_SUB_AGENT_MAX_BATCH} tasks per batch"
+            )
 
-    async def _run_single_delegate(self, arguments: dict[str, Any]) -> str:
-        agent_type: str = arguments.get("agent_type", "researcher")
-        task_description: str = arguments.get("task_description", "")
-        context_payload: dict[str, Any] = arguments.get("context_payload") or {}
+        tasks = [self._coerce_sub_agent_task(raw) for raw in raw_tasks]
+        mode: Literal["sequential", "parallel"] = (
+            "parallel" if arguments.get("mode") == "parallel" else "sequential"
+        )
+        logger.debug(
+            "Delegating %d sub-agent task(s) in %s mode (depth=%d)",
+            len(tasks),
+            mode,
+            self._sub_agent_depth,
+        )
+        results = await self._sub_agent_orchestrator.run(tasks, mode=mode)
 
+        if not batch_form:
+            result = results[0]
+            if result.error:
+                raise RuntimeError(result.error)
+            return result.result
+
+        return json.dumps([result.as_dict() for result in results], indent=2)
+
+    def _coerce_sub_agent_task(self, arguments: Any) -> SubAgentTask:
+        if not isinstance(arguments, dict):
+            raise ValueError("each delegated task must be an object")
+        agent_type = str(arguments.get("agent_type", "researcher"))
         if agent_type not in _SUB_AGENT_DIRECTIVES:
             agent_type = "researcher"
+        task_description = str(arguments.get("task_description", "")).strip()
+        if not task_description:
+            raise ValueError("delegated task_description must be non-empty")
+        context_payload = arguments.get("context_payload") or {}
+        if not isinstance(context_payload, dict):
+            context_payload = {"value": context_payload}
+        return SubAgentTask(
+            task_id=str(arguments.get("task_id") or uuid.uuid4().hex[:12]),
+            agent_type=agent_type,
+            task_description=task_description,
+            context_payload=context_payload,
+        )
+
+    async def _run_single_delegate(self, task: SubAgentTask) -> str:
+        agent_type = task.agent_type
+        task_description = task.task_description
+        context_payload = task.context_payload
+
         directive = _SUB_AGENT_DIRECTIVES[agent_type]
 
         prompt = task_description
@@ -2699,6 +2798,13 @@ class AgentEngine:
             strong_model=self._strong_model,
             system_directive=directive,
             require_task_contract=False,
+            profile_store=None,
+            scheduler=self._scheduler,
+            skill_registry=self._skill_registry,
+            session_store=None,
+            approval_gate=self._approval_gate,
+            evolution_engine=None,
+            sub_agent_depth=self._sub_agent_depth + 1,
         )
 
         sub_message = NormalizedMessage(
@@ -2707,8 +2813,8 @@ class AgentEngine:
             content=prompt,
         )
         logger.debug(
-            "Delegating to %r sub-agent (session %s, prompt_len=%d)",
-            agent_type, sub_session_id, len(prompt),
+            "Delegating to %r sub-agent task %s (session %s, prompt_len=%d)",
+            agent_type, task.task_id, sub_session_id, len(prompt),
         )
         return await sub_agent.process_task(sub_message)
 
@@ -3104,34 +3210,36 @@ def _build_system_prompt(context: dict[str, Any]) -> str:
     )
 
 
-def _model_supports_caching(model: str) -> bool:
-    """Whether *model* accepts Anthropic ``cache_control`` breakpoints.
+def _litellm_cache_control_enabled() -> bool:
+    """Whether to send LiteLLM ``cache_control`` breakpoints.
 
-    Caching markers are Anthropic-specific; sending them to other providers
-    (e.g. the gpt-4o-mini default) can raise, so gate on the model string.
+    Cache-control support is provider dependent, so it is an explicit operator
+    setting instead of being inferred from a model name.
     """
-    m = model.lower()
-    return "claude" in m or "anthropic" in m
+    return os.getenv("AGENT_ENABLE_LITELLM_CACHE_CONTROL", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _mark_last_tool_result_cache_breakpoint(messages: list[dict[str, Any]]) -> None:
-    """Attach an Anthropic ``cache_control`` breakpoint to the most recent tool
+    """Attach a LiteLLM ``cache_control`` breakpoint to the most recent tool
     result, in place.
 
     Without this, only the system directive and the tool schema block are
     cached, so the entire (growing) conversation transcript is re-billed as
     fresh input on every ReAct iteration. litellm reads message-level
-    ``cache_control`` for ``tool``-role messages and applies it to the emitted
-    Anthropic ``tool_result`` block (see litellm prompt-template factory), so
+    ``cache_control`` for ``tool``-role messages on compatible providers, so
     marking the latest tool result turns everything up to and including it into
     a cacheable prefix.
 
     The marked result is byte-stable across iterations -- its compacted preview
     is deterministic -- so the next iteration's request matches it as a cache
-    read (~90% cheaper) rather than a rewrite. Only one result is marked, so the
-    total breakpoints (directive + tool schema + this) stay within Anthropic's
-    limit of 4. The element is replaced with a shallow copy so the caller's
-    durable history is never mutated.
+    read rather than a rewrite. Only one result is marked to keep provider
+    breakpoint counts low. The element is replaced with a shallow copy so the
+    caller's durable history is never mutated.
     """
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]

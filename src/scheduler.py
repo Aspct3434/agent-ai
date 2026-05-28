@@ -22,6 +22,8 @@ from typing import Any
 
 import aiosqlite
 
+from sqlite_migrations import SQLiteMigration, apply_async_sqlite_migrations
+
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
@@ -140,12 +142,20 @@ DeliveryFn = Callable[[str, str], Coroutine[Any, Any, None]]
 class CronScheduler:
     """Asyncio-native recurring job scheduler backed by SQLite."""
 
-    _SCHEMA = """
-    CREATE TABLE IF NOT EXISTS scheduled_jobs (
-        job_id  TEXT PRIMARY KEY,
-        data    TEXT NOT NULL
+    _MIGRATIONS = (
+        SQLiteMigration(
+            version=1,
+            name="create_scheduled_jobs",
+            statements=(
+                """
+                CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                    job_id  TEXT PRIMARY KEY,
+                    data    TEXT NOT NULL
+                )
+                """,
+            ),
+        ),
     )
-    """
 
     def __init__(self, db_path: str, runner: AgentRunner) -> None:
         self._db_path = db_path
@@ -168,7 +178,9 @@ class CronScheduler:
         if self._started:
             return
         async with aiosqlite.connect(self._db_path) as db:
-            await db.execute(self._SCHEMA)
+            await apply_async_sqlite_migrations(
+                db, "scheduler", self._MIGRATIONS
+            )
             await db.commit()
         await self._load_jobs()
         self._task = asyncio.create_task(self._loop(), name="cron-scheduler")

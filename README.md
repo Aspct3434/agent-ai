@@ -154,7 +154,10 @@ Distill is highly configurable via environment variables. Key settings in `an-ap
 | `AGENT_MODEL` | `moonshot/kimi-k2.5` | The primary LLM to use (supports any LiteLLM provider string). |
 | `AGENT_SANDBOX` | (blank) | Leave blank for Docker Compose. Set to `docker` to run Docker-in-Docker, or `http` for serverless. |
 | `AGENT_REQUIRE_APPROVAL`| `off` | Set to `risky` or `all` to require human-in-the-loop approval before executing shell commands. |
-| `AGENT_API_TOKEN` | (blank) | Secure the API/WebSockets with a Bearer token. |
+| `AGENT_API_TOKEN` | required | Bearer token for API/WebSocket access; agent endpoints return 503 until set. |
+| `AGENT_ALLOW_INSECURE_NO_AUTH` | `false` | Explicit local-only override for running without API auth. |
+| `GATEWAY_RATE_LIMIT_RPM` | `60` | Per-client request limit, keyed by API token or client IP. |
+| `AGENT_LOG_DB_PATH` | `./data/gateway_logs.db` | Persistent SQLite log store used by `/api/logs`. |
 
 ## 🔌 Integrations & Adapters
 

@@ -2,15 +2,17 @@
 import asyncio
 import base64
 import functools
+import hashlib
 import hmac
 import json
 import logging
 import os
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -36,53 +38,147 @@ from evolution import EvolutionEngine
 from memory import UserProfileStore
 from persona import PersonaLoader
 from scheduler import CronScheduler, _validate_schedule
+from sqlite_migrations import SQLiteMigration, apply_sqlite_migrations
 from tools import ToolManager
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# In-memory log ring buffer (powers the dashboard Logs panel)
+# Persistent log store (powers the dashboard Logs panel)
 # ---------------------------------------------------------------------------
 
 _LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
+_LOG_RETAIN = max(1, int(os.getenv("AGENT_LOG_RETAIN", "5000")))
+_LOG_DB_PATH = Path(
+    os.getenv(
+        "AGENT_LOG_DB_PATH",
+        str(Path(__file__).resolve().parent.parent / "data" / "gateway_logs.db"),
+    )
+)
 
 
-class _LogRingBuffer(logging.Handler):
-    """Keep the most recent log records in memory for the /api/logs endpoint."""
+_LOG_MIGRATIONS = (
+    SQLiteMigration(
+        version=1,
+        name="create_gateway_logs",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS gateway_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                time REAL NOT NULL,
+                level TEXT NOT NULL,
+                levelno INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                message TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_gateway_logs_level_id ON gateway_logs(levelno, id)",
+        ),
+    ),
+)
 
-    def __init__(self, capacity: int = 500) -> None:
+
+class _SQLiteLogStore(logging.Handler):
+    """Persist recent log records so /api/logs survives gateway restarts."""
+
+    def __init__(self, path: str | Path, capacity: int = _LOG_RETAIN) -> None:
         super().__init__()
-        self._records: deque[dict[str, Any]] = deque(maxlen=capacity)
+        self._path = Path(path)
+        self._capacity = max(1, capacity)
+        self._conn: sqlite3.Connection | None = None
+        self._lock = threading.Lock()
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self._path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            apply_sqlite_migrations(conn, "gateway_logs", _LOG_MIGRATIONS)
+            conn.commit()
+            self._conn = conn
+        return self._conn
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._records.append({
-                "time": record.created,
-                "level": record.levelname,
-                "name": record.name,
-                "message": record.getMessage(),
-            })
+            with self._lock:
+                conn = self._connect()
+                conn.execute(
+                    """
+                    INSERT INTO gateway_logs (time, level, levelno, name, message)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.created,
+                        record.levelname,
+                        int(record.levelno),
+                        record.name,
+                        record.getMessage(),
+                    ),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM gateway_logs
+                    WHERE id NOT IN (
+                        SELECT id FROM gateway_logs ORDER BY id DESC LIMIT ?
+                    )
+                    """,
+                    (self._capacity,),
+                )
+                conn.commit()
         except Exception:
             pass
 
     def snapshot(self, level: str = "ALL", limit: int = 200) -> list[dict[str, Any]]:
-        items = list(self._records)
-        if level and level != "ALL":
-            floor = _LOG_LEVELS.get(level.upper(), 0)
-            items = [r for r in items if _LOG_LEVELS.get(r["level"], 0) >= floor]
-        return items[-limit:]
+        capped = max(1, min(limit, self._capacity))
+        floor = _LOG_LEVELS.get(level.upper(), 0) if level and level != "ALL" else 0
+        with self._lock:
+            conn = self._connect()
+            rows = conn.execute(
+                """
+                SELECT time, level, name, message
+                FROM (
+                    SELECT id, time, level, name, message
+                    FROM gateway_logs
+                    WHERE levelno >= ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (floor, capped),
+            ).fetchall()
+        return [
+            {
+                "time": float(row[0]),
+                "level": str(row[1]),
+                "name": str(row[2]),
+                "message": str(row[3]),
+            }
+            for row in rows
+        ]
 
     def clear(self) -> None:
-        self._records.clear()
+        with self._lock:
+            conn = self._connect()
+            conn.execute("DELETE FROM gateway_logs")
+            conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+        super().close()
 
 
-# Attach once at import so the buffer captures startup logs too.
-_log_buffer = _LogRingBuffer()
-_log_buffer.setLevel(logging.INFO)
+# Attach once at import so startup logs are persisted too.
+_log_store = _SQLiteLogStore(_LOG_DB_PATH)
+_log_store.setLevel(logging.INFO)
 _root_logger = logging.getLogger()
 if _root_logger.level == 0 or _root_logger.level > logging.INFO:
     _root_logger.setLevel(logging.INFO)
-_root_logger.addHandler(_log_buffer)
+if not any(isinstance(handler, _SQLiteLogStore) for handler in _root_logger.handlers):
+    _root_logger.addHandler(_log_store)
 
 # ---------------------------------------------------------------------------
 # Rate limiting
@@ -93,7 +189,7 @@ _RATE_LIMIT_WINDOW = 60  # seconds
 
 
 class _SlidingWindowRateLimiter:
-    """Per-key sliding-window rate limiter (requests per 60-second window).
+    """Per-principal sliding-window rate limiter (requests per 60-second window).
 
     Safe for concurrent coroutines via an asyncio.Lock. Set
     ``GATEWAY_RATE_LIMIT_RPM=0`` to disable (unlimited).
@@ -117,7 +213,7 @@ class _SlidingWindowRateLimiter:
             if len(bucket) >= self._limit:
                 raise HTTPException(
                     status_code=429,
-                    detail=f"Rate limit exceeded: max {self._limit} requests/min per session.",
+                    detail=f"Rate limit exceeded: max {self._limit} requests/min per client.",
                 )
             bucket.append(now)
             self._windows[key] = bucket
@@ -142,6 +238,29 @@ class _SlidingWindowRateLimiter:
 
 
 _rate_limiter = _SlidingWindowRateLimiter(_RATE_LIMIT_RPM)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def _client_host(value: Any) -> str:
+    host = getattr(value, "host", None)
+    return str(host or "unknown")
+
+
+def _rate_limit_key_for_http(request: Request) -> str:
+    token = _http_token(request)
+    if token:
+        return f"token:{_hash_token(token)}"
+    return f"ip:{_client_host(request.client)}"
+
+
+def _rate_limit_key_for_websocket(websocket: WebSocket) -> str:
+    token = _ws_token(websocket)
+    if token:
+        return f"token:{_hash_token(token)}"
+    return f"ip:{_client_host(websocket.client)}"
 
 _STOP = object()
 
@@ -308,6 +427,7 @@ def _build_memory() -> Any:
     """
     if os.getenv("AGENT_USE_HYBRID_MEMORY", "true").lower() not in {"1", "true", "yes", "on"}:
         return _EmptyMemory()
+
     try:
         from memory import HybridMemory
 
@@ -330,18 +450,27 @@ def _find_sqlite_server() -> str:
     )
 
 
-def _ensure_sqlite_db(db_path: Path) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
+_APP_DB_MIGRATIONS = (
+    SQLiteMigration(
+        version=1,
+        name="create_demo_users",
+        statements=(
             """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE
             )
-            """
-        )
+            """,
+        ),
+    ),
+)
+
+
+def _ensure_sqlite_db(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        apply_sqlite_migrations(conn, "app_demo", _APP_DB_MIGRATIONS)
         conn.executemany(
             "INSERT OR IGNORE INTO users (id, name, email) VALUES (?, ?, ?)",
             [
@@ -600,11 +729,15 @@ async def lifespan(app: FastAPI):
 
     if _API_TOKEN:
         logger.info("API authentication ENABLED (AGENT_API_TOKEN set)")
-    else:
+    elif _ALLOW_INSECURE_NO_AUTH:
         logger.warning(
-            "API authentication DISABLED — every endpoint is open. This is fine "
-            "for localhost single-user use, but set AGENT_API_TOKEN before "
-            "exposing the gateway on any reachable network interface."
+            "API authentication explicitly DISABLED via "
+            "AGENT_ALLOW_INSECURE_NO_AUTH=true. Do not expose this gateway."
+        )
+    else:
+        logger.error(
+            "API authentication REQUIRED but AGENT_API_TOKEN is unset. Protected "
+            "agent endpoints will return 503 until a token is configured."
         )
 
     try:
@@ -629,6 +762,7 @@ async def lifespan(app: FastAPI):
         await scheduler.shutdown()
         await distiller.shutdown()
         await tools.close()
+        _log_store.close()
         if hasattr(memory, "close"):
             try:
                 memory.close()
@@ -640,11 +774,11 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# API authentication (opt-in bearer token) + CORS
+# API authentication (required bearer token) + CORS
 #
 # The agent can execute shell commands, so an exposed gateway is a real attack
-# surface. Set AGENT_API_TOKEN to require a token on every endpoint (HTTP and
-# WebSocket); leave it blank for the default localhost single-user dev mode.
+# surface. Set AGENT_API_TOKEN to enable every protected endpoint (HTTP and
+# WebSocket). Leaving it blank keeps /health open but blocks agent endpoints.
 # Either `Authorization: Bearer <token>` or `X-API-Key: <token>` is accepted on
 # HTTP; the WebSocket also accepts `?token=<token>` since browsers can't set
 # custom headers on a WS handshake.
@@ -653,21 +787,41 @@ app = FastAPI(lifespan=lifespan)
 # doctor` keep working without a token.
 # ---------------------------------------------------------------------------
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 _API_TOKEN = os.getenv("AGENT_API_TOKEN", "").strip()
+_ALLOW_INSECURE_NO_AUTH = _env_flag("AGENT_ALLOW_INSECURE_NO_AUTH", False)
 _AUTH_OPEN_PATHS = frozenset({"/health"})
 
 
 def _token_ok(provided: str | None) -> bool:
     """Constant-time check of a presented token against AGENT_API_TOKEN.
 
-    Returns True when auth is disabled (no token configured) so the default
-    local dev experience is unchanged.
+    A missing configured token never authenticates protected endpoints. Operators
+    must either set AGENT_API_TOKEN or explicitly opt into insecure no-auth mode.
     """
     if not _API_TOKEN:
-        return True
+        return False
     if not provided:
         return False
     return hmac.compare_digest(provided, _API_TOKEN)
+
+
+def _auth_configured_or_explicitly_disabled() -> bool:
+    return bool(_API_TOKEN or _ALLOW_INSECURE_NO_AUTH)
+
+
+def _request_authorized(request: Request) -> bool:
+    return _ALLOW_INSECURE_NO_AUTH or _token_ok(_http_token(request))
+
+
+def _websocket_authorized(websocket: WebSocket) -> bool:
+    return _ALLOW_INSECURE_NO_AUTH or _token_ok(_ws_token(websocket))
 
 
 def _bearer_or_api_key(authorization: str | None, api_key: str | None) -> str | None:
@@ -697,13 +851,24 @@ def _ws_token(websocket: WebSocket) -> str | None:
 async def _auth_middleware(
     request: Request, call_next: Callable[[Request], Awaitable[Response]]
 ) -> Response:
-    if (
-        not _API_TOKEN
-        or request.method == "OPTIONS"
-        or request.url.path in _AUTH_OPEN_PATHS
-    ):
+    if request.method == "OPTIONS" or request.url.path in _AUTH_OPEN_PATHS:
         return await call_next(request)
-    if _token_ok(_http_token(request)):
+    if not _auth_configured_or_explicitly_disabled():
+        return JSONResponse(
+            {
+                "detail": (
+                    "Gateway authentication is not configured. Set AGENT_API_TOKEN "
+                    "before using agent endpoints, or explicitly set "
+                    "AGENT_ALLOW_INSECURE_NO_AUTH=true for isolated local development."
+                )
+            },
+            status_code=503,
+        )
+    if _request_authorized(request):
+        try:
+            await _rate_limiter.check(_rate_limit_key_for_http(request))
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
         return await call_next(request)
     return JSONResponse(
         {"detail": "Unauthorized"},
@@ -816,13 +981,13 @@ async def list_tools() -> list[dict[str, Any]]:
 
 @app.get("/api/logs")
 async def get_logs(level: str = "ALL", limit: int = 200) -> list[dict[str, Any]]:
-    """Recent gateway/agent log records (in-memory ring buffer)."""
-    return _log_buffer.snapshot(level=level, limit=max(1, min(limit, 500)))
+    """Recent gateway/agent log records from the persistent SQLite log store."""
+    return _log_store.snapshot(level=level, limit=max(1, min(limit, 500)))
 
 
 @app.delete("/api/logs")
 async def clear_logs() -> dict[str, str]:
-    _log_buffer.clear()
+    _log_store.clear()
     return {"status": "cleared"}
 
 
@@ -1087,7 +1252,6 @@ def _rewrite_proxy_html(content: bytes, content_type: str, port: int) -> bytes:
 
 @app.post("/webhook", response_model=WebhookResponse)
 async def webhook(payload: WebhookPayload) -> WebhookResponse:
-    await _rate_limiter.check(payload.chat_id)
     result = await app.state.gateway.send(
         payload.chat_id,
         {
@@ -1145,13 +1309,14 @@ async def ws_stream(websocket: WebSocket) -> None:
       {"type": "tool_call", "tool": "...", "params": {...}}
       {"type": "text",      "content": "..."}
     """
-    if not _token_ok(_ws_token(websocket)):
+    if not _websocket_authorized(websocket):
         # 1008 = policy violation. Reject before accept so an unauthorized
         # client never gets an open socket.
         await websocket.close(code=1008)
         return
     await websocket.accept()
     current_task: asyncio.Task[None] | None = None
+    rate_limit_key = _rate_limit_key_for_websocket(websocket)
 
     async def stream_turn(msg: NormalizedMessage) -> None:
         try:
@@ -1199,7 +1364,7 @@ async def ws_stream(websocket: WebSocket) -> None:
                 continue
 
             try:
-                await _rate_limiter.check(session_id)
+                await _rate_limiter.check(rate_limit_key)
             except HTTPException as exc:
                 await websocket.send_text(json.dumps({"type": "error", "detail": exc.detail}))
                 continue

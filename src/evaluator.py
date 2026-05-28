@@ -40,12 +40,16 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset(
 )
 
 
-def _temperature_for_synthesis_model(model: str) -> float:
-    """Return a provider-compatible temperature for background skill synthesis."""
-    normalized = model.lower()
-    if normalized.startswith("moonshot/") or normalized.startswith("kimi-"):
-        return 1.0
-    return 0.2
+def _skill_synthesis_temperature() -> float:
+    """Return the configured synthesis temperature without provider branching."""
+    raw = os.getenv("AGENT_SKILL_SYNTHESIS_TEMPERATURE", "0.2").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid AGENT_SKILL_SYNTHESIS_TEMPERATURE=%r; using 0.2", raw
+        )
+        return 0.2
 
 _SKILL_SYNTHESIS_PROMPT = """\
 You are a skill synthesizer for an AI agent. An agent successfully completed this task:
@@ -197,7 +201,7 @@ class SkillDistiller:
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=900,
-                temperature=_temperature_for_synthesis_model(self._model),
+                temperature=_skill_synthesis_temperature(),
             )
             raw = (response.choices[0].message.content or "").strip()
         except Exception as exc:
@@ -772,7 +776,7 @@ class SkillRegistry:
                 model=self._model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=1200,
-                temperature=_temperature_for_synthesis_model(self._model),
+                temperature=_skill_synthesis_temperature(),
             )
             raw = (response.choices[0].message.content or "").strip()
         except Exception as exc:

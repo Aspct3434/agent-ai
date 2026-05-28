@@ -9,6 +9,8 @@ from typing import Any
 
 import aiosqlite
 
+from sqlite_migrations import SQLiteMigration, apply_async_sqlite_migrations
+
 DEFAULT_DB_PATH = Path("checkpoints.db")
 
 # Keep at most this many checkpoints per session; older ones are pruned on each
@@ -16,15 +18,27 @@ DEFAULT_DB_PATH = Path("checkpoints.db")
 _RETAIN_PER_SESSION = max(1, int(os.getenv("CHECKPOINT_RETAIN_PER_SESSION", "20")))
 
 
-CREATE_STATE_SNAPSHOTS_SQL = """
-CREATE TABLE IF NOT EXISTS state_snapshots (
-    checkpoint_id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    step_number INTEGER NOT NULL,
-    state_payload JSON NOT NULL CHECK (json_valid(state_payload)),
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+CHECKPOINT_MIGRATIONS = (
+    SQLiteMigration(
+        version=1,
+        name="create_state_snapshots",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS state_snapshots (
+                checkpoint_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                step_number INTEGER NOT NULL,
+                state_payload JSON NOT NULL CHECK (json_valid(state_payload)),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_state_snapshots_session_step
+            ON state_snapshots(session_id, step_number, created_at)
+            """,
+        ),
+    ),
 )
-"""
 
 
 class StateCheckpointer:
@@ -134,7 +148,9 @@ async def initialize_checkpoints_db(db_path: str | Path = DEFAULT_DB_PATH) -> Pa
         # frequent small writes this table receives. It is a persistent DB
         # property, so setting it once at init is sufficient.
         await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute(CREATE_STATE_SNAPSHOTS_SQL)
+        await apply_async_sqlite_migrations(
+            db, "checkpointer", CHECKPOINT_MIGRATIONS
+        )
         await db.commit()
 
     return path

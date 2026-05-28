@@ -17,9 +17,34 @@ import time
 from pathlib import Path
 from typing import Any
 
+from sqlite_migrations import SQLiteMigration, apply_sqlite_migrations
+
 logger = logging.getLogger(__name__)
 
 _MAX_CONTENT = 8000
+
+_SESSION_FTS_MIGRATIONS = (
+    SQLiteMigration(
+        version=1,
+        name="create_turns_fts",
+        statements=(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS turns USING fts5("
+            "session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, content)",
+        ),
+    ),
+)
+
+_SESSION_TABLE_MIGRATIONS = (
+    SQLiteMigration(
+        version=1,
+        name="create_turns_table",
+        statements=(
+            "CREATE TABLE IF NOT EXISTS turns "
+            "(session_id TEXT, role TEXT, ts REAL, content TEXT)",
+            "CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(ts)",
+        ),
+    ),
+)
 
 
 class SessionStore:
@@ -32,21 +57,26 @@ class SessionStore:
 
     def _init_schema(self) -> bool:
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as c:
+            existing = c.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'turns'"
+            ).fetchone()
+            if existing is not None:
+                ddl = str(existing[0] or "").upper()
+                if "VIRTUAL TABLE" in ddl and "FTS5" in ddl:
+                    apply_sqlite_migrations(c, "session_store_fts", _SESSION_FTS_MIGRATIONS)
+                    return True
+                apply_sqlite_migrations(c, "session_store_plain", _SESSION_TABLE_MIGRATIONS)
+                return False
+
         try:
             with self._connect() as c:
-                c.execute(
-                    "CREATE VIRTUAL TABLE IF NOT EXISTS turns USING fts5("
-                    "session_id UNINDEXED, role UNINDEXED, ts UNINDEXED, content)"
-                )
+                apply_sqlite_migrations(c, "session_store_fts", _SESSION_FTS_MIGRATIONS)
             return True
         except sqlite3.OperationalError as exc:
             logger.warning("SQLite FTS5 unavailable (%s); using LIKE search.", exc)
             with self._connect() as c:
-                c.execute(
-                    "CREATE TABLE IF NOT EXISTS turns "
-                    "(session_id TEXT, role TEXT, ts REAL, content TEXT)"
-                )
-                c.execute("CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(ts)")
+                apply_sqlite_migrations(c, "session_store_plain", _SESSION_TABLE_MIGRATIONS)
             return False
 
     def add_turn(self, session_id: str, role: str, content: str) -> None:

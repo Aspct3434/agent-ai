@@ -117,22 +117,23 @@ def test_skill_distiller_writes_parameterized_skill_from_model() -> None:
     asyncio.run(_distill_with_model())
 
 
-async def _distill_with_moonshot_model() -> None:
+async def _distill_with_configured_temperature() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         original_completion = evaluator_module.litellm.acompletion
         _fake_synthesis_completion.calls.clear()
         evaluator_module.litellm.acompletion = _fake_synthesis_completion
         try:
-            distiller = SkillDistiller(skills_dir=tmp, model="moonshot/kimi-k2.6")
+            distiller = SkillDistiller(skills_dir=tmp, model="any-litellm-model")
             await distiller._distill(_trajectory())
         finally:
             evaluator_module.litellm.acompletion = original_completion
 
-        assert _fake_synthesis_completion.calls[-1]["temperature"] == 1.0
+        assert _fake_synthesis_completion.calls[-1]["temperature"] == 0.7
 
 
-def test_skill_distiller_uses_moonshot_temperature() -> None:
-    asyncio.run(_distill_with_moonshot_model())
+def test_skill_distiller_uses_configured_temperature(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SKILL_SYNTHESIS_TEMPERATURE", "0.7")
+    asyncio.run(_distill_with_configured_temperature())
 
 
 if __name__ == "__main__":

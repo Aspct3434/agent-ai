@@ -31,8 +31,57 @@ from evaluator import (
     _slugify,
     _validate_python_syntax,
 )
+from sqlite_migrations import SQLiteMigration, apply_sqlite_migrations
 
 logger = logging.getLogger(__name__)
+
+_EVOLUTION_MIGRATIONS = (
+    SQLiteMigration(
+        version=1,
+        name="create_evolution_ledger",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS evolution_runs (
+                trace_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                final_output TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                trace_json TEXT NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS evolution_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                baseline_json TEXT NOT NULL,
+                source_trace_ids_json TEXT NOT NULL,
+                proof_json TEXT NOT NULL DEFAULT '{}',
+                rejection_reason TEXT NOT NULL DEFAULT '',
+                rollback_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                promoted_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS evolution_rollbacks (
+                rollback_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                rollback_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+        ),
+    ),
+)
 
 CandidateKind = Literal["skill", "prompt_policy", "toolset_policy"]
 CandidateStatus = Literal["staged", "promoted", "rejected", "rolled_back"]
@@ -92,51 +141,7 @@ class EvolutionLedger:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS evolution_runs (
-                    trace_id TEXT PRIMARY KEY,
-                    session_id TEXT NOT NULL,
-                    prompt TEXT NOT NULL,
-                    final_output TEXT NOT NULL,
-                    success INTEGER NOT NULL,
-                    trace_json TEXT NOT NULL,
-                    evidence_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS evolution_candidates (
-                    candidate_id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    baseline_json TEXT NOT NULL,
-                    source_trace_ids_json TEXT NOT NULL,
-                    proof_json TEXT NOT NULL DEFAULT '{}',
-                    rejection_reason TEXT NOT NULL DEFAULT '',
-                    rollback_json TEXT NOT NULL DEFAULT '{}',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    promoted_at TEXT
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS evolution_rollbacks (
-                    rollback_id TEXT PRIMARY KEY,
-                    candidate_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    rollback_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
+            apply_sqlite_migrations(conn, "evolution", _EVOLUTION_MIGRATIONS)
 
     def record_trajectory(self, trajectory: ExecutionTrajectory) -> str:
         trace_id = f"trace_{uuid.uuid4().hex[:12]}"

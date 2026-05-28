@@ -12,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import agent as agent_module  # noqa: E402
-from agent import NormalizedMessage, TypeSafeAgentEngine  # noqa: E402
+from agent import (  # noqa: E402
+    NormalizedMessage,
+    SubAgentOrchestrator,
+    SubAgentTask,
+    TypeSafeAgentEngine,
+)
 from tools import ToolManager  # noqa: E402
 
 PROMPT = (
@@ -221,6 +226,43 @@ async def run_swarm_test() -> None:
 
 def test_parent_agent_invokes_auditor_sub_agent() -> None:
     asyncio.run(run_swarm_test())
+
+
+async def _run_parallel_orchestrator_test() -> None:
+    active = 0
+    max_active = 0
+
+    async def runner(task: SubAgentTask) -> str:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return f"done:{task.task_id}"
+
+    orchestrator = SubAgentOrchestrator(
+        runner,
+        max_concurrency=2,
+        timeout_seconds=1,
+    )
+    tasks = [
+        SubAgentTask(
+            task_id=f"task-{i}",
+            agent_type="researcher",
+            task_description=f"task {i}",
+            context_payload={},
+        )
+        for i in range(2)
+    ]
+
+    results = await orchestrator.run(tasks, mode="parallel")
+
+    assert [result.result for result in results] == ["done:task-0", "done:task-1"]
+    assert max_active == 2
+
+
+def test_sub_agent_orchestrator_runs_parallel_tasks() -> None:
+    asyncio.run(_run_parallel_orchestrator_test())
 
 
 if __name__ == "__main__":
