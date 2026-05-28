@@ -753,6 +753,24 @@ class TaskGraphEngine:
             if not verifier.get("passed"):
                 allowed.update(RECOVERY_DIAGNOSTIC_TOOLS)
                 allowed.add(REPAIR_TASK_GRAPH_TOOL_NAME)
+                # Every node is terminal but the proof gate has not passed.
+                # Without the failing nodes' work tools the agent can only
+                # loop verify/repair/inspect and never produce fresh evidence,
+                # so re-grant those tools to let it regenerate proof.
+                failing_ids = {
+                    str(item["node_id"])
+                    for item in verifier.get("proof_report", [])
+                    if not item.get("passed")
+                }
+                for node in graph["nodes"]:
+                    if str(node["id"]) not in failing_ids:
+                        continue
+                    node_allowed = node.get("allowed_tools") or sorted(
+                        DEFAULT_ALLOWED_TOOLS_BY_KIND.get(
+                            str(node.get("kind")), frozenset()
+                        )
+                    )
+                    allowed.update(str(tool) for tool in node_allowed)
             return allowed
         active_allowed = active.get("allowed_tools") or sorted(
             DEFAULT_ALLOWED_TOOLS_BY_KIND.get(str(active.get("kind")), frozenset())
@@ -783,6 +801,25 @@ class TaskGraphEngine:
         ready = ", ".join(node["id"] for node in status.get("ready_nodes", [])) or "none"
         blocked = ", ".join(status.get("blocked_nodes", [])) or "none"
         proof = status.get("verifier", {})
+        if not active and "task_graph_proof" in status.get("missing", []):
+            failing = [
+                str(item["node_id"])
+                for item in proof.get("proof_report", [])
+                if not item.get("passed")
+            ]
+            failing_label = ", ".join(failing) or "unknown"
+            return (
+                "TASK GRAPH STATUS:\n"
+                f"Source: {status.get('source')}\n"
+                "All nodes are terminal but the proof gate has NOT passed for: "
+                f"{failing_label}.\n"
+                "Do not loop on verify/inspect/repair. Re-run the real work for "
+                "each failing node using that node's tools (e.g. re-write the "
+                "artifact, restart and re-expose the service), then call "
+                "update_task_node with the node_id and the new successful "
+                "tool_call_id in evidence_refs. If a requirement is genuinely "
+                "impossible, mark the node failed with a concrete failure_reason."
+            )
         return (
             "TASK GRAPH STATUS:\n"
             f"Source: {status.get('source')}\n"

@@ -356,6 +356,9 @@ def test_failed_proof_with_no_active_node_allows_recovery_diagnostics() -> None:
     assert "update_task_node" in allowed
     assert "repair_task_graph" in allowed
     assert "execute_terminal_command" in allowed
+    # The failing node's own work tools must be re-granted so the agent can
+    # regenerate evidence instead of looping on verify/repair/inspect.
+    assert "write_text_file" in allowed
 
 
 @pytest.mark.asyncio
