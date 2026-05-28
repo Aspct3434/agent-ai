@@ -22,6 +22,7 @@ ENV/
 *.db
 *.db-shm
 *.db-wal
+data/proxy_signing_secret
 chroma_data/
 neo4j_data/
 neo4j_logs/

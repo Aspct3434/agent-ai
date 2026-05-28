@@ -5,9 +5,50 @@ import os
 import secrets
 import time
 from hashlib import sha256
+from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-_PROCESS_PROXY_SECRET = secrets.token_urlsafe(32)
+
+def _fallback_secret_path() -> Path:
+    root = Path(__file__).resolve().parent.parent
+    data_dir = Path(os.getenv("AGENT_DATA_DIR", str(root / "data")))
+    return data_dir / "proxy_signing_secret"
+
+
+def _load_or_create_fallback_secret() -> str:
+    """Return a signing secret that survives restarts, uvicorn --reload, and
+    extra workers.
+
+    The fallback used to be re-randomised on every module import. That meant
+    any signed /proxy/<port>/ URL (and the cookie minted from it) was
+    invalidated the instant the process re-imported this module — and under a
+    ``uvicorn --reload`` dev watch, the agent merely *writing a file* (a skill,
+    or the very index.html it just served) rotated the secret mid-session and
+    turned every proxied request into a 401. Persisting it to the data dir
+    keeps signatures verifiable across reloads and across any helper process
+    that imports this module. If the filesystem is unavailable we fall back to
+    a process-local secret (still consistent within this process).
+    """
+    path = _fallback_secret_path()
+    secret = secrets.token_urlsafe(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(secret, encoding="utf-8")
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+        # Re-read so concurrent creators converge on whatever landed on disk.
+        on_disk = path.read_text(encoding="utf-8").strip()
+        return on_disk or secret
+    except OSError:
+        return secret
+
+
+_FALLBACK_PROXY_SECRET = _load_or_create_fallback_secret()
 _DEFAULT_TTL_SECONDS = max(60, int(os.getenv("AGENT_PROXY_URL_TTL_SECONDS", "86400")))
 
 PROXY_EXPIRES_PARAM = "proxy_expires"
@@ -19,7 +60,7 @@ def _proxy_secret() -> str:
     return (
         os.getenv("AGENT_PROXY_SIGNING_SECRET", "").strip()
         or os.getenv("AGENT_API_TOKEN", "").strip()
-        or _PROCESS_PROXY_SECRET
+        or _FALLBACK_PROXY_SECRET
     )
 
 
