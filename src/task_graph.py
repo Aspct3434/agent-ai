@@ -13,6 +13,7 @@ from typing import Any
 
 from contract import (
     _plan_steps_from_args,
+    evidence_producing_tools,
     evidence_requirement_satisfied_by_steps,
 )
 from evaluator import ExecutionStep
@@ -192,6 +193,22 @@ def _normalise_node(raw: Any, index: int) -> tuple[dict[str, Any] | None, str | 
     evidence_refs, err = _as_str_list(raw.get("evidence_refs", []), field="evidence_refs")
     if err:
         return None, f"node {node_id!r}: {err}"
+
+    # Invariant: a node must be able to run (and have the verifier credit) the
+    # tools that produce its declared proof. Otherwise the runtime tool gate
+    # blocks the only evidence-producing tools and the node can never pass,
+    # stalling the whole graph — exactly the failure where a "service" node
+    # requires running_http_service but its allowed_tools omits
+    # get_filesystem_process_evidence / wait_for_port. Fold the producing tools
+    # in here, the single place both the gate and the verifier read.
+    proof_tools: set[str] = set()
+    for requirement in proof_requirements:
+        proof_tools.update(evidence_producing_tools(requirement))
+    if proof_tools:
+        base = allowed_tools or sorted(
+            DEFAULT_ALLOWED_TOOLS_BY_KIND.get(kind, frozenset())
+        )
+        allowed_tools = list(dict.fromkeys([*base, *sorted(proof_tools)]))
 
     retry_count = raw.get("retry_count", 0)
     try:

@@ -101,6 +101,16 @@ _CONTRACT_EVIDENCE_TOOLS: dict[str, frozenset[str]] = {
     ),
 }
 
+
+def evidence_producing_tools(requirement: str) -> frozenset[str]:
+    """Tools whose successful output can satisfy a proof/evidence requirement.
+
+    A node that requires evidence it is structurally forbidden from producing
+    can never pass — so callers use this to keep a node's allowed tools and its
+    proof requirements consistent.
+    """
+    return _CONTRACT_EVIDENCE_TOOLS.get(requirement, frozenset())
+
 # ---------------------------------------------------------------------------
 # Shared message-history helpers
 # ---------------------------------------------------------------------------

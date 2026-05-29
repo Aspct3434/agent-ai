@@ -386,6 +386,28 @@ def _recent_tool_failures(steps: list[ExecutionStep], limit: int = 3) -> list[Ex
     return list(reversed(failures))
 
 
+def _recent_tool_result_digests(steps: list[ExecutionStep], limit: int = 4) -> str:
+    """Short snippets of the most recent tool *results* (success or failure).
+
+    The no-progress and obstacle-recovery paths used to surface only tool
+    *names*, leaving the model blind to *why* it was stuck — a proxied 401, a
+    500, an ``{"open": false}`` probe, a negative evidence finding, a timeout.
+    Feeding the actual output back makes recovery work for any obstacle class
+    instead of needing a bespoke guard per failure mode.
+    """
+    digests: list[str] = []
+    for step in reversed(steps):
+        if step.kind != "tool_result":
+            continue
+        tool_name = str(step.metadata.get("tool_name") or "unknown_tool")
+        _, text = _classify_tool_result(tool_name, step.content)
+        snippet = " ".join(text.split())[:240]
+        digests.append(f"- {tool_name}: {snippet or '(no output)'}")
+        if len(digests) >= limit:
+            break
+    return "\n".join(reversed(digests))
+
+
 def _build_self_repair_instruction(steps: list[ExecutionStep]) -> str:
     failures = _recent_tool_failures(steps)
     lines = []
@@ -1445,6 +1467,77 @@ class AgentEngine:
             "different recovery route tied to the missing evidence above."
         )
 
+    async def _synthesize_stall_report(
+        self,
+        *,
+        original_prompt: str,
+        status: dict[str, Any],
+        steps: list[ExecutionStep],
+        messages: list[dict[str, Any]],
+        active_model: str,
+        tool_schemas: list[dict[str, Any]] | None,
+        stalled_iterations: int,
+    ) -> str:
+        """Final graceful-degradation turn when a task has stalled for good.
+
+        Instead of dead-ending with a canned "still missing X" message, run one
+        tools-disabled model turn that delivers any partial result and diagnoses
+        the real blocker from the actual tool output. This is generic across
+        obstacle types — a 401, a crashed service, a missing runtime, a timeout
+        all flow through the same path. Falls back to the canned pause message if
+        the synthesis call itself fails.
+        """
+        digests = _recent_tool_result_digests(steps) or "(no tool output captured)"
+        missing = (
+            ", ".join(str(item) for item in status.get("missing") or [])
+            or "the remaining evidence"
+        )
+        instruction = {
+            "role": "system",
+            "content": (
+                "SYSTEM: You have stalled — repeated tool calls stopped producing "
+                f"new progress while working on: {original_prompt[:200]}. Still "
+                f"missing: {missing}. Do NOT call any more tools. Write the final "
+                "answer for the user now, and make it genuinely useful:\n"
+                "1. Deliver every partial result you DID produce (files written, "
+                "services started, commands that succeeded) with concrete references.\n"
+                "2. Name the specific blocker that stopped you, citing the actual "
+                "tool output below as evidence — never a generic 'I could not do it'.\n"
+                "3. Give the user the single most useful next action or alternative.\n\n"
+                f"Recent tool output (the real obstacle):\n{digests}"
+            ),
+        }
+        kwargs: dict[str, Any] = {
+            "model": active_model,
+            "messages": _prepare_llm_request_messages(
+                self._compact_context_window([*messages, instruction]),
+                original_prompt,
+            ),
+            "max_tokens": _LLM_FINAL_MAX_TOKENS,
+        }
+        if tool_schemas:
+            # tools= must still be sent because history holds tool-result blocks;
+            # tool_choice="none" forces prose instead of another tool call.
+            kwargs["tools"] = tool_schemas
+            kwargs["tool_choice"] = "none"
+        try:
+            result = await _acompletion_stream_with_retry(**kwargs)
+            if _is_async_iterable(result):
+                chunks: list[Any] = []
+                async for chunk in result:
+                    chunks.append(chunk)
+                built = litellm.stream_chunk_builder(chunks, messages=kwargs["messages"])
+            else:
+                built = result
+            text = _llm_first_choice(built).message.content or ""
+            if text.strip():
+                return text
+        except Exception as exc:
+            logger.warning("Stall report synthesis failed, using canned message: %s", exc)
+        return self._build_no_progress_pause_message(
+            original_prompt, status, steps, stalled_iterations
+        )
+
     def _build_obstacle_recovery_instruction(
         self,
         status: dict[str, Any],
@@ -1462,15 +1555,24 @@ class AgentEngine:
             if len(recent_tools) >= 5:
                 break
         recent_text = ", ".join(reversed(recent_tools)) or "none"
+        digests = _recent_tool_result_digests(steps)
+        evidence_block = (
+            f"\nActual recent tool output (read this — it is the real obstacle):\n{digests}\n"
+            if digests
+            else ""
+        )
         return (
             "OBSTACLE RECOVERY MODE: recent tool use has not advanced the task "
-            f"contract. Still missing: {missing_text}. Recent tools: {recent_text}.\n"
-            "Do not answer with a generic refusal or an 'I can't' statement. Work "
+            f"contract. Still missing: {missing_text}. Recent tools: {recent_text}."
+            f"{evidence_block}"
+            "Do not answer with a generic refusal or an 'I can't' statement. Read the "
+            "actual tool output above, work out what specifically went wrong, and work "
             "through the obstacle using evidence. On the next turn, do one of these "
             "concrete recovery moves:\n"
             "1. Use a diagnostic tool that can reveal a new fact about the blocker.\n"
             "2. Take a different state-changing route that satisfies the same missing "
-            "evidence while respecting the user's requested constraints.\n"
+            "evidence while respecting the user's requested constraints (e.g. change a "
+            "parameter, port, path, or command that the output shows is failing).\n"
             "3. Repair the plan or task graph if the current path is invalid.\n"
             "Only report a blocker after diagnostics show there is no viable route; "
             "then name the exact blocker, cite the evidence, and give the next "
@@ -1867,11 +1969,15 @@ class AgentEngine:
                         progress_status, messages
                     )
                     if no_progress_tracker.observe(progress_before, progress_after):
-                        final_response = self._build_no_progress_pause_message(
-                            original_prompt,
-                            progress_status,
-                            steps,
-                            no_progress_tracker.stalled_iterations,
+                        yield {"type": "status", "message": "Summarising progress..."}
+                        final_response = await self._synthesize_stall_report(
+                            original_prompt=original_prompt,
+                            status=progress_status,
+                            steps=steps,
+                            messages=messages,
+                            active_model=active_model,
+                            tool_schemas=tool_schemas,
+                            stalled_iterations=no_progress_tracker.stalled_iterations,
                         )
                         tools_attempted = sorted({
                             step.metadata["tool_name"]
