@@ -210,7 +210,8 @@ prompt_value() {
 }
 
 prompt_secret() {
-  local env_name="$1" label="$2" current="${!env_name:-}" answer=""
+  local env_name="$1" label="$2" answer=""
+  local current="${!env_name:-}"
   if [[ -n "$current" ]]; then printf '%s' "$current"; return; fi
   if [[ "$DRY_RUN" -eq 1 ]]; then printf ''; return; fi
   read -r -s -p "$label: " answer
@@ -267,6 +268,40 @@ EOF
   esac
 }
 
+choose_model() {
+  # $1 = title; remaining args = models (first is the default). DRY_RUN keeps
+  # the default so automated provider checks stay stable.
+  local title="$1"; shift
+  local models=("$@")
+  if [[ "$DRY_RUN" -eq 1 ]]; then printf '%s' "${models[0]}"; return; fi
+  printf 'Choose model for %s:\n' "$title" >&2
+  local i
+  for i in "${!models[@]}"; do printf '  %d) %s\n' "$((i + 1))" "${models[$i]}" >&2; done
+  printf '  %d) Other (enter a model string manually)\n' "$(( ${#models[@]} + 1 ))" >&2
+  local answer; read -r -p "Model [1]: " answer
+  if [[ -z "$answer" ]]; then printf '%s' "${models[0]}"; return; fi
+  if [[ "$answer" =~ ^[0-9]+$ ]]; then
+    if (( answer >= 1 && answer <= ${#models[@]} )); then printf '%s' "${models[$((answer - 1))]}"; return; fi
+    if (( answer == ${#models[@]} + 1 )); then local custom; read -r -p "Model string (LiteLLM format): " custom; printf '%s' "$custom"; return; fi
+  fi
+  echo "Invalid model choice: $answer" >&2; exit 2
+}
+
+choose_openai_auth() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then printf 'apikey'; return; fi
+  cat >&2 <<'EOF'
+How should the agent authenticate to OpenAI?
+  1) Paste an OpenAI API key
+  2) Sign in with ChatGPT (Codex OAuth) - no key; sign in after setup
+EOF
+  local answer; read -r -p "Auth [1]: " answer
+  case "${answer:-1}" in
+    1|apikey) printf 'apikey' ;;
+    2|oauth) printf 'oauth' ;;
+    *) echo "Invalid auth choice: $answer" >&2; exit 2 ;;
+  esac
+}
+
 env_line() {
   local key="$1" value="${2:-}"
   value="${value//$'\r'/}"
@@ -282,36 +317,36 @@ messaging="$(choose_messaging)"
 
 agent_model=""; fast_model=""; strong_model=""
 moonshot_key=""; moonshot_base=""; openrouter_key=""; openai_key=""; openai_base=""
-anthropic_key=""; gemini_key=""; ollama_base=""
+anthropic_key=""; gemini_key=""; ollama_base=""; openai_auth_method="apikey"
 
 case "$provider" in
   kimi|moonshot)
-    agent_model="$(prompt_value 'Agent model' 'moonshot/kimi-k2.6')"
-    fast_model="$(prompt_value 'Fast model' "$agent_model")"
-    strong_model="$(prompt_value 'Strong model' "$agent_model")"
+    agent_model="$(choose_model 'Kimi / Moonshot' 'moonshot/kimi-k2.6' 'moonshot/kimi-k2.5')"
+    fast_model="$agent_model"; strong_model="$agent_model"
     moonshot_key="$(prompt_secret MOONSHOT_API_KEY 'Moonshot API key')"
     moonshot_base="$(prompt_value 'Moonshot API base' 'https://api.moonshot.ai/v1')"
     ;;
   ollama)
-    agent_model="$(prompt_value 'Ollama model' 'ollama/llama3.2')"; fast_model="$agent_model"; strong_model="$agent_model"
+    agent_model="$(choose_model 'Ollama' 'ollama/llama3.2' 'ollama/llama3.3:70b' 'ollama/qwen2.5:14b')"; fast_model="$agent_model"; strong_model="$agent_model"
     ollama_base="$(prompt_value 'Ollama API base, blank for default' '')"
     ;;
   openrouter)
-    agent_model="$(prompt_value 'OpenRouter model' 'openrouter/meta-llama/llama-3.3-70b-instruct')"
-    fast_model="$(prompt_value 'Fast model' 'openrouter/meta-llama/llama-3.1-8b-instruct')"
-    strong_model="$(prompt_value 'Strong model' "$agent_model")"
+    agent_model="$(choose_model 'OpenRouter' 'openrouter/meta-llama/llama-3.3-70b-instruct' 'openrouter/anthropic/claude-sonnet-4-5' 'openrouter/openai/gpt-4o')"; fast_model="$agent_model"; strong_model="$agent_model"
     openrouter_key="$(prompt_secret OPENROUTER_API_KEY 'OpenRouter API key')"
     ;;
   openai)
-    agent_model="$(prompt_value 'OpenAI model' 'gpt-4o')"; fast_model="$agent_model"; strong_model="$agent_model"
-    openai_key="$(prompt_secret OPENAI_API_KEY 'OpenAI API key')"
+    agent_model="$(choose_model 'OpenAI' 'gpt-4o' 'gpt-4o-mini' 'gpt-4.1' 'o3-mini')"; fast_model="$agent_model"; strong_model="$agent_model"
+    openai_auth_method="$(choose_openai_auth)"
+    if [[ "$openai_auth_method" == "apikey" ]]; then
+      openai_key="$(prompt_secret OPENAI_API_KEY 'OpenAI API key')"
+    fi
     ;;
   anthropic)
-    agent_model="$(prompt_value 'Anthropic model' 'claude-sonnet-4-5')"; fast_model="$agent_model"; strong_model="$agent_model"
+    agent_model="$(choose_model 'Anthropic' 'claude-sonnet-4-5' 'claude-opus-4-1' 'claude-3-5-haiku-latest')"; fast_model="$agent_model"; strong_model="$agent_model"
     anthropic_key="$(prompt_secret ANTHROPIC_API_KEY 'Anthropic API key')"
     ;;
   gemini)
-    agent_model="$(prompt_value 'Gemini model' 'gemini/gemini-2.0-flash')"; fast_model="$agent_model"; strong_model="$agent_model"
+    agent_model="$(choose_model 'Gemini' 'gemini/gemini-2.0-flash' 'gemini/gemini-2.5-pro' 'gemini/gemini-2.0-flash-lite')"; fast_model="$agent_model"; strong_model="$agent_model"
     gemini_key="$(prompt_secret GEMINI_API_KEY 'Gemini API key')"
     ;;
   vllm)
@@ -392,3 +427,15 @@ fi
 echo "Agent AI setup complete."
 echo "Control panel: http://localhost:5173"
 echo "API health:    http://localhost:8000/health"
+
+if [[ "$openai_auth_method" == "oauth" ]]; then
+  echo ""
+  echo "Finish Codex OAuth sign-in (sign in once; the token is stored and refreshed):"
+  echo "  - Control panel: Settings -> Authentication -> Sign in with ChatGPT"
+  if [[ "$sandbox" == "off" ]]; then
+    echo "  - Command line: (cd \"$ROOT_DIR\" && PYTHONPATH=src .run-venv/bin/python -m auth login)"
+  else
+    echo "  - Command line: docker compose exec -e PYTHONPATH=src agent_core python -m auth login"
+    echo "    (In Docker mode the control-panel sign-in is the simplest route.)"
+  fi
+fi

@@ -106,6 +106,41 @@ function Choose-Messaging {
     }
 }
 
+function Choose-Model([string]$Title, [string[]]$Models) {
+    # $Models[0] is the default. In DryRun (non-interactive) keep the default so
+    # automated provider checks stay stable.
+    if ($DryRun) { return $Models[0] }
+    Write-Host "Choose model for ${Title}:"
+    for ($i = 0; $i -lt $Models.Count; $i++) {
+        Write-Host ("  {0}) {1}" -f ($i + 1), $Models[$i])
+    }
+    Write-Host ("  {0}) Other (enter a model string manually)" -f ($Models.Count + 1))
+    $answer = Read-Host "Model [1]"
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $Models[0] }
+    $idx = 0
+    if ([int]::TryParse($answer, [ref]$idx)) {
+        if ($idx -ge 1 -and $idx -le $Models.Count) { return $Models[$idx - 1] }
+        if ($idx -eq ($Models.Count + 1)) { return (Read-Host "Model string (LiteLLM format)") }
+    }
+    throw "Invalid model choice: $answer"
+}
+
+function Choose-OpenAIAuth {
+    if ($DryRun) { return "apikey" }
+    Write-Host "How should the agent authenticate to OpenAI?"
+    Write-Host "  1) Paste an OpenAI API key"
+    Write-Host "  2) Sign in with ChatGPT (Codex OAuth) - no key; sign in after setup"
+    $answer = Read-Host "Auth [1]"
+    if ([string]::IsNullOrWhiteSpace($answer)) { $answer = "1" }
+    switch ($answer.ToLowerInvariant()) {
+        "1" { return "apikey" }
+        "apikey" { return "apikey" }
+        "2" { return "oauth" }
+        "oauth" { return "oauth" }
+        default { throw "Invalid auth choice: $answer" }
+    }
+}
+
 function Env-Line([string]$Key, [string]$Value = "") {
     if ([string]::IsNullOrEmpty($Value)) { return "$Key=" }
     $escaped = $Value.Replace("\", "\\").Replace('"', '\"').Replace("`r", "").Replace("`n", "")
@@ -127,41 +162,45 @@ $OpenAIBase = ""
 $AnthropicKey = ""
 $GeminiKey = ""
 $OllamaBase = ""
+$OpenAIAuthMethod = "apikey"
 
 switch ($ProviderChoice) {
     { $_ -in @("kimi", "moonshot") } {
-        $AgentModel = Prompt-Value "Agent model" "moonshot/kimi-k2.6"
-        $FastModel = Prompt-Value "Fast model" $AgentModel
-        $StrongModel = Prompt-Value "Strong model" $AgentModel
+        $AgentModel = Choose-Model "Kimi / Moonshot" @("moonshot/kimi-k2.6", "moonshot/kimi-k2.5")
+        $FastModel = $AgentModel
+        $StrongModel = $AgentModel
         $MoonshotKey = Prompt-Secret "MOONSHOT_API_KEY" "Moonshot API key"
         $MoonshotBase = Prompt-Value "Moonshot API base" "https://api.moonshot.ai/v1"
     }
     "ollama" {
-        $AgentModel = Prompt-Value "Ollama model" "ollama/llama3.2"
+        $AgentModel = Choose-Model "Ollama" @("ollama/llama3.2", "ollama/llama3.3:70b", "ollama/qwen2.5:14b")
         $FastModel = $AgentModel
         $StrongModel = $AgentModel
         $OllamaBase = Prompt-Value "Ollama API base, blank for default" ""
     }
     "openrouter" {
-        $AgentModel = Prompt-Value "OpenRouter model" "openrouter/meta-llama/llama-3.3-70b-instruct"
-        $FastModel = Prompt-Value "Fast model" "openrouter/meta-llama/llama-3.1-8b-instruct"
-        $StrongModel = Prompt-Value "Strong model" $AgentModel
+        $AgentModel = Choose-Model "OpenRouter" @("openrouter/meta-llama/llama-3.3-70b-instruct", "openrouter/anthropic/claude-sonnet-4-5", "openrouter/openai/gpt-4o")
+        $FastModel = $AgentModel
+        $StrongModel = $AgentModel
         $OpenRouterKey = Prompt-Secret "OPENROUTER_API_KEY" "OpenRouter API key"
     }
     "openai" {
-        $AgentModel = Prompt-Value "OpenAI model" "gpt-4o"
+        $AgentModel = Choose-Model "OpenAI" @("gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3-mini")
         $FastModel = $AgentModel
         $StrongModel = $AgentModel
-        $OpenAIKey = Prompt-Secret "OPENAI_API_KEY" "OpenAI API key"
+        $OpenAIAuthMethod = Choose-OpenAIAuth
+        if ($OpenAIAuthMethod -eq "apikey") {
+            $OpenAIKey = Prompt-Secret "OPENAI_API_KEY" "OpenAI API key"
+        }
     }
     "anthropic" {
-        $AgentModel = Prompt-Value "Anthropic model" "claude-sonnet-4-5"
+        $AgentModel = Choose-Model "Anthropic" @("claude-sonnet-4-5", "claude-opus-4-1", "claude-3-5-haiku-latest")
         $FastModel = $AgentModel
         $StrongModel = $AgentModel
         $AnthropicKey = Prompt-Secret "ANTHROPIC_API_KEY" "Anthropic API key"
     }
     "gemini" {
-        $AgentModel = Prompt-Value "Gemini model" "gemini/gemini-2.0-flash"
+        $AgentModel = Choose-Model "Gemini" @("gemini/gemini-2.0-flash", "gemini/gemini-2.5-pro", "gemini/gemini-2.0-flash-lite")
         $FastModel = $AgentModel
         $StrongModel = $AgentModel
         $GeminiKey = Prompt-Secret "GEMINI_API_KEY" "Gemini API key"
@@ -278,3 +317,16 @@ if (-not $NoStart) {
 Write-Host "Agent AI setup complete."
 Write-Host "Control panel: http://localhost:5173"
 Write-Host "API health:    http://localhost:8000/health"
+
+if ($OpenAIAuthMethod -eq "oauth") {
+    Write-Host ""
+    Write-Host "Finish Codex OAuth sign-in (sign in once; the token is stored and refreshed):"
+    Write-Host "  - Control panel: Settings -> Authentication -> Sign in with ChatGPT"
+    if ($SandboxChoice -eq "off") {
+        Write-Host "  - Command line: `$env:PYTHONPATH='src'; .run-venv\Scripts\python.exe -m auth login"
+    }
+    else {
+        Write-Host "  - Command line: docker compose exec -e PYTHONPATH=src agent_core python -m auth login"
+        Write-Host "    (In Docker mode the control-panel sign-in is the simplest route.)"
+    }
+}
