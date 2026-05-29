@@ -361,6 +361,85 @@ def test_failed_proof_with_no_active_node_allows_recovery_diagnostics() -> None:
     assert "write_text_file" in allowed
 
 
+def test_node_allowed_tools_always_include_proof_producing_tools() -> None:
+    # A node that declares a proof requirement but omits the tools that produce
+    # that evidence used to be unsatisfiable: the runtime gate blocked the only
+    # evidence-producing tool, so the node could never pass and the graph
+    # stalled forever. Normalisation must fold the producing tools in.
+    nodes, error = normalise_task_graph(
+        [
+            {
+                "id": "start-server",
+                "title": "Start and expose HTTP server",
+                "kind": "service",
+                "status": "in_progress",
+                "allowed_tools": ["execute_background_service", "execute_terminal_command"],
+                "proof_requirements": ["running_http_service"],
+            }
+        ]
+    )
+    assert error is None
+    allowed = set(nodes[0]["allowed_tools"])
+    # Original tools preserved, plus every producing tool folded in.
+    assert {"execute_background_service", "execute_terminal_command"} <= allowed
+    assert {"expose_local_http_service", "get_filesystem_process_evidence"} <= allowed
+
+
+def _service_node(status: str) -> dict:
+    return {
+        "id": "start-server",
+        "title": "Start and expose HTTP server",
+        "kind": "service",
+        "status": status,
+        # Deliberately omits the evidence-producing tool, the exact mistake
+        # that stalled the live website run.
+        "allowed_tools": ["execute_background_service"],
+        "proof_requirements": ["running_http_service"],
+    }
+
+
+def test_proof_producing_tool_is_not_gated_while_node_active() -> None:
+    # While the node is the active one, the runtime gate must grant the tool
+    # that produces its proof instead of blocking it (the live "[task_graph
+    # blocked] get_filesystem_process_evidence is not allowed" failure).
+    engine = TaskGraphEngine()
+    messages = [
+        {"role": "user", "content": "host a website"},
+        _assistant_tool("set_task_graph", {"nodes": [_service_node("in_progress")]}),
+    ]
+
+    allowed = engine.allowed_tools_for_next(messages, [])
+    assert "expose_local_http_service" in allowed
+    assert "get_filesystem_process_evidence" in allowed
+
+
+def test_completed_node_proof_passes_by_inference() -> None:
+    # Once the producing tool yields positive evidence, the completed node's
+    # proof passes by inference even though the model never listed it in
+    # evidence_refs — because the producing tool is now in allowed_tools.
+    engine = TaskGraphEngine()
+    messages = [
+        {"role": "user", "content": "host a website"},
+        _assistant_tool("set_task_graph", {"nodes": [_service_node("done")]}),
+    ]
+    steps = [
+        _tool_step(
+            "expose_local_http_service",
+            "call_expose",
+            {
+                "exposed": True,
+                "connectable": True,
+                "url": "http://localhost:8000/proxy/8080/index.html",
+                "port": 8080,
+            },
+        )
+    ]
+    verifier = engine.verify(messages, steps)
+    report = {item["node_id"]: item for item in verifier["proof_report"]}
+    assert report["start-server"]["passed"] is True
+    assert verifier["passed"] is True
+
+
 @pytest.mark.asyncio
 async def test_gateway_task_graph_endpoints_use_engine() -> None:
     from gateway import app, get_task_graph, verify_task_graph

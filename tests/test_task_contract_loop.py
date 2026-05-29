@@ -1094,7 +1094,13 @@ def test_no_progress_guard_pauses_varied_tool_loop(monkeypatch: pytest.MonkeyPat
                 )
             ]
         ),
-        _completion(content="This should not be reached."),
+        # Final turn: tools are disabled, so the model writes the stall report.
+        _completion(
+            content=(
+                "I wrote index.html but could not verify the live site; the probe "
+                "kept returning no progress. Next, free port 8000 or serve on 8080."
+            )
+        ),
     ]
 
     events, tools, model = asyncio.run(_run_engine_with_model(script))
@@ -1102,10 +1108,19 @@ def test_no_progress_guard_pauses_varied_tool_loop(monkeypatch: pytest.MonkeyPat
     final_events = [event for event in events if event.get("type") == "final_answer"]
     assert final_events
     assert final_events[-1]["reason"] == "no_progress"
-    assert "no-progress loop" in final_events[-1]["content"]
-    assert "filesystem_artifact" in final_events[-1]["content"]
+    # The pause is now a synthesized graceful-degradation report (one tools-disabled
+    # turn), not a canned "still missing X" message.
+    assert "serve on 8080" in final_events[-1]["content"]
+    assert model.request_tool_choices[-1] == "none"
+    # Obstacle recovery still fires, and now carries the *actual* tool output so the
+    # model can diagnose the real blocker rather than guess from tool names alone.
     assert any(
         "OBSTACLE RECOVERY MODE" in str(message.get("content", ""))
+        for request in model.request_messages
+        for message in request
+    )
+    assert any(
+        "Actual recent tool output" in str(message.get("content", ""))
         for request in model.request_messages
         for message in request
     )
