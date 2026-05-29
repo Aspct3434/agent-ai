@@ -9,6 +9,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
@@ -84,6 +86,14 @@ async def run_memory_test() -> None:
         neo4j_password="",
         chroma_path=str(chroma_path),
     )
+
+    if memory._neo4j is None:
+        memory.close()
+        shutil.rmtree(chroma_path, ignore_errors=True)
+        pytest.skip(
+            "Neo4j unavailable at bolt://localhost:7687; "
+            "this integration test requires a live graph backend"
+        )
 
     try:
         print("Storing test memory in vector and graph backends...")

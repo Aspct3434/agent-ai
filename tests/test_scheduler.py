@@ -3,11 +3,17 @@
 These cover the pure scheduling math (field matching, next-run computation,
 validation) without needing the SQLite-backed CronScheduler or a live runner.
 """
+import asyncio
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 from scheduler import (
+    CronScheduler,
     ScheduledJob,
     _cron_next_run,
     _matches_field,
@@ -102,6 +108,75 @@ class TestComputeNextRun:
         after = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
         nxt = job.compute_next_run(after)
         assert nxt is not None and nxt.tzinfo is not None
+
+
+class TestRestoreOverdueJobs:
+    """_load_jobs must not silently drop one-shot jobs missed during downtime."""
+
+    async def _runner(self, session_id: str, prompt: str) -> str:
+        return "ok"
+
+    def _make_db(self, tmp_path) -> str:
+        return str(tmp_path / "scheduler.db")
+
+    def test_missed_one_shot_runs_on_restart(self, tmp_path):
+        async def scenario() -> None:
+            db = self._make_db(tmp_path)
+            sched = CronScheduler(db, self._runner)
+            await sched.start()
+            await sched.shutdown()  # creates the table, stops the loop
+
+            # A one-shot whose fire time elapsed while the server was down.
+            job = ScheduledJob(
+                "missed-1",
+                "once",
+                "2020-01-01T00:00:00+00:00",
+                "ping",
+                "s",
+                next_run=datetime(2020, 1, 1, tzinfo=UTC),
+                enabled=True,
+            )
+            await sched._persist(job)
+
+            fresh = CronScheduler(db, self._runner)
+            await fresh._load_jobs()
+            restored = fresh._jobs["missed-1"]
+
+            # Regression: previously next_run became None and the loop's
+            # `j.next_run and ...` due-filter never selected it -> dropped.
+            assert restored.enabled is True
+            assert restored.next_run is not None
+            assert restored.next_run <= datetime.now(UTC)
+
+        asyncio.run(scenario())
+
+    def test_overdue_interval_skips_missed_ticks(self, tmp_path):
+        async def scenario() -> None:
+            db = self._make_db(tmp_path)
+            sched = CronScheduler(db, self._runner)
+            await sched.start()
+            await sched.shutdown()
+
+            job = ScheduledJob(
+                "interval-1",
+                "interval",
+                "300",
+                "tick",
+                "s",
+                next_run=datetime(2020, 1, 1, tzinfo=UTC),
+                enabled=True,
+            )
+            await sched._persist(job)
+
+            fresh = CronScheduler(db, self._runner)
+            await fresh._load_jobs()
+            restored = fresh._jobs["interval-1"]
+
+            # Overdue interval is rescheduled forward, not replayed from 2020.
+            assert restored.next_run is not None
+            assert restored.next_run > datetime.now(UTC)
+
+        asyncio.run(scenario())
 
 
 class TestValidateSchedule:

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CLI = PROJECT_ROOT / "bin" / "agent-ai.js"
+CLI = PROJECT_ROOT / "bin" / "distill.js"
 
 
 def _node() -> str:
@@ -27,6 +27,8 @@ def _run_cli(args: list[str], *, input_text: str = "") -> subprocess.CompletedPr
         env=env,
         input=input_text,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         check=False,
     )
@@ -51,8 +53,8 @@ def test_npm_cli_quickstart_dry_run(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "AGENT AI" in result.stdout
-    assert "Security warning - please read." in result.stdout
+    assert "DISTILL" in result.stdout
+    assert "Please read before continuing." in result.stdout
     assert "git clone --branch master https://github.com/Aspct3434/agent-ai.git" in result.stdout
     assert 'AGENT_MODEL="gpt-4o"' in result.stdout
     assert 'AGENT_SANDBOX_HOST_FALLBACK="false"' in result.stdout
@@ -74,7 +76,7 @@ def test_npm_cli_manual_dry_run_messaging_and_sandbox(tmp_path: Path) -> None:
             "--sandbox",
             "off",
             "--messaging",
-            "both",
+            "all",
         ]
     )
 
@@ -98,5 +100,5 @@ def test_npm_cli_security_acknowledgement_blocks_install(tmp_path: Path) -> None
 def test_root_package_exposes_agent_ai_bin() -> None:
     package = (PROJECT_ROOT / "package.json").read_text(encoding="utf-8")
 
-    assert '"name": "@aspct3434/agent-ai"' in package
-    assert '"agent-ai": "bin/agent-ai.js"' in package
+    assert '"name": "@aspct3434/distill-agent"' in package
+    assert '"distill": "bin/distill.js"' in package

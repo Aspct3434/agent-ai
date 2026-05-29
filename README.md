@@ -125,24 +125,52 @@ docker compose up -d --build
 
 ### CLI Installation
 
-You can also install Distill globally using `npm` to get the robust interactive CLI installer and TUI:
+#### Empty machine (no Node, no Python)?
+
+The bootstrap scripts install the prerequisites for you, then hand off to the
+interactive installer. They are the recommended path on a fresh PC.
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.ps1 | iex
+```
+
+**macOS / Linux (bash):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/Aspct3434/agent-ai/master/scripts/bootstrap.sh | bash
+```
+
+You can also clone the repo first and run `scripts/bootstrap.ps1` (Windows) or
+`scripts/bootstrap.sh` (macOS/Linux) directly.
+
+#### Already have Node?
+
+Run the interactive installer with `npx` (no global install required):
 
 ```powershell
 npx @aspct3434/distill-agent install
 ```
 
+Prefer pinning to the exact GitHub revision? Use the repo form:
+
+```bash
+npx --yes github:Aspct3434/agent-ai install
+```
+
 After installation, use the CLI to manage the agent:
 ```bash
-npm install -g @aspct3434/distill-agent
+npm i -g @aspct3434/distill-agent
 distill                           # Open the interactive terminal UI
 distill start                     # Start the backend and control panel
 distill logs                      # View running logs
 distill update                    # Pull the latest changes
+distill doctor                    # Diagnose the install and environment
 
 # npx works too if you prefer not to install globally:
 npx @aspct3434/distill-agent start    # Start the backend and control panel
 npx @aspct3434/distill-agent logs     # View running logs
 npx @aspct3434/distill-agent update   # Pull the latest changes
+npx @aspct3434/distill-agent doctor   # Diagnose the install and environment
 ```
 
 ## ⚙️ Configuration

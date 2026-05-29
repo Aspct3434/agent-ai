@@ -347,9 +347,17 @@ class CronScheduler:
                 last_result=d.get("last_result", ""),
                 enabled=d.get("enabled", True),
             )
-            # Recompute overdue next_run on restore
+            # Recompute overdue next_run on restore so we don't replay every
+            # interval/cron tick the server slept through. A one-shot job whose
+            # fire time elapsed during downtime has compute_next_run() == None;
+            # without the fallback below it would be silently dropped (left
+            # enabled with next_run=None, which the loop never selects). Run it
+            # immediately instead so missed reminders survive a restart.
             if job.enabled and (job.next_run is None or job.next_run < now):
-                job.next_run = job.compute_next_run()
+                recomputed = job.compute_next_run()
+                if recomputed is None and job.schedule_type == "once":
+                    recomputed = now
+                job.next_run = recomputed
             self._jobs[job.job_id] = job
 
 
