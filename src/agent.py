@@ -15,6 +15,7 @@ import litellm
 from mcp.types import CallToolResult
 from pydantic import BaseModel
 
+from artifacts import ArtifactLedger
 from checkpointer import StateCheckpointer
 from contract import (
     GENERIC_CAP_SKIP_TOOLS,
@@ -197,39 +198,6 @@ def _evidence_items_from_payload(
     return items
 
 
-def _successful_evidence_items(
-    steps: list[ExecutionStep],
-    messages: list[dict[str, Any]],
-) -> list[tuple[str, str]]:
-    items: list[tuple[str, str]] = []
-
-    for step in steps:
-        if step.kind != "tool_result" or step.metadata.get("is_error"):
-            continue
-        for item in _evidence_items_from_payload(
-            step.content,
-            tool_name=str(step.metadata.get("tool_name") or ""),
-            arguments=step.metadata.get("arguments") or {},
-        ):
-            if item not in items:
-                items.append(item)
-
-    # Follow-up turns start with a fresh ExecutionStep list, but durable session
-    # history still contains prior tool outputs. Recover concrete evidence from
-    # those tool messages so "give me the URL/path/output" can be answered literally.
-    for message in messages:
-        if message.get("role") != "tool":
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        for item in _evidence_items_from_payload(content):
-            if item not in items:
-                items.append(item)
-
-    return items
-
-
 def _compact_evidence_items(
     items: list[tuple[str, str]],
     original_prompt: str,
@@ -388,15 +356,6 @@ def _is_last_url_request(text: str) -> bool:
     )
 
 
-def _latest_service_url_from_history(
-    messages: list[dict[str, Any]],
-) -> str | None:
-    for label, value in reversed(_successful_evidence_items([], messages)):
-        if label == "Service URL":
-            return value
-    return None
-
-
 def _profile_update_signal(text: str) -> bool:
     normalized = _normalized_user_text(text)
     return any(
@@ -418,6 +377,86 @@ def _profile_update_signal(text: str) -> bool:
     )
 
 
+# Vocabulary per evidence *kind*. This table is keyed on the fixed evidence
+# taxonomy (URL/File/Port/…), not on open-ended user phrasings, so new ways of
+# asking ("where'd that page go", "send the link") are covered without edits as
+# long as they use a word tied to the kind being recalled.
+_EVIDENCE_KIND_VOCAB: dict[str, frozenset[str]] = {
+    "Service URL": frozenset(
+        {"url", "link", "site", "website", "address", "endpoint", "page"}
+    ),
+    "Port": frozenset({"port"}),
+    "File": frozenset(
+        {"file", "files", "path", "wrote", "written", "saved", "document", "script"}
+    ),
+    "Path": frozenset({"file", "files", "path", "paths", "directory", "folder"}),
+    "Process": frozenset({"process", "pid", "service", "server", "running"}),
+    "Log": frozenset({"log", "logs"}),
+    "Command": frozenset({"command", "ran"}),
+    "Command output": frozenset({"output", "result", "stdout", "stderr"}),
+}
+
+# Every word that names *some* evidence kind. Used as the single, taxonomy-driven
+# gate for "does this request even ask about an artifact" -- so the gate and the
+# recall logic can never drift apart into two separate keyword lists.
+_ALL_EVIDENCE_KIND_WORDS: frozenset[str] = frozenset().union(
+    *_EVIDENCE_KIND_VOCAB.values()
+)
+
+# Files and paths accumulate across a session and carry meaningful names, so a
+# qualified request ("the *config* file") must match the artifact. Singular
+# session resources -- a served URL, a running process -- are recalled by kind
+# alone, since there is normally just one to mean.
+_NAME_BEARING_KINDS: frozenset[str] = frozenset({"File", "Path", "Log"})
+
+# Function words that never qualify *which* artifact the user means.
+_RECALL_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "me", "my", "you", "your", "give", "show", "send",
+        "get", "what", "whats", "where", "wheres", "again", "last", "previous",
+        "earlier", "before", "that", "this", "is", "was", "of", "to", "for",
+        "please", "it", "i", "do", "have", "any", "tell", "which", "and", "on",
+    }
+)
+
+
+def _request_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", _normalized_user_text(text)))
+
+
+def _recover_relevant_evidence(
+    request: str,
+    candidates: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Filter history-recovered evidence down to artifacts the *request* refers to.
+
+    Relevance is structural, not phrase-matched: the request must name an
+    evidence *kind* (via :data:`_EVIDENCE_KIND_VOCAB`). For name-bearing kinds
+    (files, paths, logs) a specific qualifier in the request must also overlap
+    the artifact's own content. This keeps "give me the url" → the served URL
+    while stopping "show me the release notes file" from surfacing an unrelated
+    ``next_prime.py`` left in history.
+    """
+    tokens = _request_tokens(request)
+    referenced_kinds = {
+        label for label, vocab in _EVIDENCE_KIND_VOCAB.items() if tokens & vocab
+    }
+    if not referenced_kinds:
+        return []
+    kind_words = set().union(*(_EVIDENCE_KIND_VOCAB[k] for k in referenced_kinds))
+    qualifiers = tokens - _RECALL_STOPWORDS - kind_words
+    recovered: list[tuple[str, str]] = []
+    for label, value in candidates:
+        if label not in referenced_kinds:
+            continue
+        if qualifiers and label in _NAME_BEARING_KINDS:
+            value_tokens = set(re.findall(r"[a-z0-9]+", value.lower()))
+            if not (qualifiers & value_tokens):
+                continue
+        recovered.append((label, value))
+    return recovered
+
+
 def _should_include_evidence_summary(
     contract: dict[str, Any] | None,
     original_prompt: str,
@@ -425,44 +464,32 @@ def _should_include_evidence_summary(
     evidence = set((contract or {}).get("evidence_requirements") or [])
     if evidence - {"none"}:
         return True
-
-    text = original_prompt.lower()
-    return any(
-        token in text
-        for token in (
-            "url",
-            "link",
-            "served",
-            "site",
-            "website",
-            "open",
-            "view",
-            "file",
-            "path",
-            "where",
-            "output",
-            "result",
-            "service",
-            "port",
-        )
-    )
+    return bool(_request_tokens(original_prompt) & _ALL_EVIDENCE_KIND_WORDS)
 
 
-def _ensure_evidence_in_final_response(
+def _build_evidence_block(
     final_response: str,
     *,
     contract: dict[str, Any] | None,
     original_prompt: str,
-    steps: list[ExecutionStep],
-    messages: list[dict[str, Any]],
+    current_items: list[tuple[str, str]],
+    recent_items: list[tuple[str, str]],
 ) -> str:
+    """Append an evidence block built from typed artifact records.
+
+    *current_items* are artifacts the current turn produced; *recent_items* is
+    the whole session's artifacts, most-recent-first. Prefer the current turn's
+    work; only when it produced nothing is this a genuine recall, and then we
+    surface just the earlier artifacts the request refers to (see
+    :func:`_recover_relevant_evidence`) -- never everything in history.
+    """
     if not _should_include_evidence_summary(contract, original_prompt):
         return final_response
 
+    items = current_items or _recover_relevant_evidence(original_prompt, recent_items)
+
     missing_items = [
-        (label, value)
-        for label, value in _successful_evidence_items(steps, messages)
-        if value not in final_response
+        (label, value) for label, value in items if value not in final_response
     ]
     missing_items = _compact_evidence_items(missing_items, original_prompt)
     if not missing_items:
@@ -473,6 +500,22 @@ def _ensure_evidence_in_final_response(
         f"- {label}: {value}" for label, value in missing_items
     )
     return f"{prefix}\n\n{evidence_block}" if prefix else evidence_block
+
+
+def _ensure_evidence_in_final_response(
+    final_response: str,
+    *,
+    contract: dict[str, Any] | None,
+    original_prompt: str,
+    ledger: ArtifactLedger,
+) -> str:
+    return _build_evidence_block(
+        final_response,
+        contract=contract,
+        original_prompt=original_prompt,
+        current_items=ledger.current_turn_items(),
+        recent_items=ledger.recent_first(),
+    )
 
 
 def _preferred_recovery_tool_name(
@@ -1360,6 +1403,14 @@ class AgentEngine:
         self._task_graph = TaskGraphEngine()
         self._histories: dict[str, list[dict[str, Any]]] = {}
         self._session_steps: dict[str, list[ExecutionStep]] = {}
+        self._artifact_ledgers: dict[str, ArtifactLedger] = {}
+
+    def _artifact_ledger(self, session_id: str) -> ArtifactLedger:
+        ledger = self._artifact_ledgers.get(session_id)
+        if ledger is None:
+            ledger = ArtifactLedger()
+            self._artifact_ledgers[session_id] = ledger
+        return ledger
 
     def update_models(
         self,
@@ -1411,10 +1462,11 @@ class AgentEngine:
                 {"role": "system", "content": _build_system_prompt(context)},
                 self._build_host_environment_message(),
             ]
-            # Inject user profile if available — gives the agent personalization context.
-            user_ctx = self._build_user_profile_message()
-            if user_ctx:
-                messages.append(user_ctx)
+            # The user profile is NOT injected here: this prefix is the cacheable
+            # part of every request, and the profile changes mid-session (e.g. the
+            # user sets a "short answers" preference). It is injected live in the
+            # volatile tail by _compact_context_window instead, so updates take
+            # effect on the next turn without invalidating the cached prefix.
             if _BOOTSTRAP_SESSIONS:
                 all_tools = await self._tools.list_all_tools()
                 tool_index = {t["name"]: t["server"] for t in all_tools}
@@ -1427,10 +1479,12 @@ class AgentEngine:
         # and tool turns it produces persist into the next turn automatically.
         messages.append({"role": message.role, "content": message.content})
         self._session_steps[message.session_id] = []
+        ledger = self._artifact_ledger(message.session_id)
+        ledger.begin_turn()
         self._record_turn(message.session_id, "user", message.content)
 
         if message.role == "user":
-            fast_response = await self._try_fast_path_response(message.content, messages)
+            fast_response = await self._try_fast_path_response(message.content, ledger)
             if fast_response is not None:
                 messages.append({"role": "assistant", "content": fast_response})
                 self._record_turn(message.session_id, "assistant", fast_response)
@@ -2196,8 +2250,7 @@ class AgentEngine:
                         final_response,
                         contract=latest_task_contract(messages),
                         original_prompt=original_prompt,
-                        steps=steps,
-                        messages=messages,
+                        ledger=self._artifact_ledger(session_id),
                     )
                     if buffered_tokens and not emitted_tokens:
                         yield {"type": "token", "content": final_response}
@@ -2759,6 +2812,16 @@ class AgentEngine:
                     metadata=result_metadata,
                 )
             )
+            if not is_error:
+                # Record concrete artifacts into the session ledger the moment
+                # they are produced, so recall queries read typed state rather
+                # than re-scanning the transcript.
+                self._artifact_ledger(session_id).record(
+                    _evidence_items_from_payload(
+                        content, tool_name=tool_name, arguments=arguments
+                    ),
+                    tool_name,
+                )
             messages.append({"role": "tool", "tool_call_id": tc_id, "content": content})
             tool_result_events.append(
                 _make_tool_result_event(
@@ -3040,7 +3103,7 @@ class AgentEngine:
     async def _try_fast_path_response(
         self,
         user_text: str,
-        messages: list[dict[str, Any]],
+        ledger: ArtifactLedger,
     ) -> str | None:
         """Answer cheap read-only requests without entering the ReAct/LLM loop."""
         if _is_simple_environment_request(user_text):
@@ -3054,7 +3117,7 @@ class AgentEngine:
             return f"Current working directory: `{cwd}`"
 
         if _is_last_url_request(user_text):
-            url = _latest_service_url_from_history(messages)
+            url = ledger.latest("Service URL")
             if url:
                 return f"Last service URL: {url}"
 
@@ -3468,10 +3531,16 @@ class AgentEngine:
             # one that actually ships, and before the volatile executive summary
             # so the cached prefix stays stable across iterations.
             _mark_last_tool_result_cache_breakpoint(compacted)
-        return _sanitize_messages_for_llm([
-            *compacted,
-            {"role": "system", "content": executive_summary},
-        ])
+        # Volatile tail (after the cache breakpoint): the live user profile and the
+        # executive summary. Injecting the profile here rather than in the prefix
+        # lets preference updates apply on the very next turn while keeping the
+        # cached prefix byte-stable.
+        tail: list[dict[str, Any]] = []
+        profile_msg = self._build_user_profile_message()
+        if profile_msg is not None:
+            tail.append(profile_msg)
+        tail.append({"role": "system", "content": executive_summary})
+        return _sanitize_messages_for_llm([*compacted, *tail])
 
     async def _execute_delegate_task(self, arguments: dict[str, Any]) -> str:
         """Run one or more isolated sub-AgentEngines through the orchestrator.
@@ -3593,6 +3662,7 @@ class AgentEngine:
         """
         existed = self._histories.pop(session_id, None) is not None
         self._session_steps.pop(session_id, None)
+        self._artifact_ledgers.pop(session_id, None)
         return existed
 
     def task_graph_snapshot(self, session_id: str) -> dict[str, Any] | None:
@@ -3636,6 +3706,7 @@ class AgentEngine:
             oldest = next(iter(self._histories))
             self._histories.pop(oldest, None)
             self._session_steps.pop(oldest, None)
+            self._artifact_ledgers.pop(oldest, None)
 
     async def _fetch_context(self, query: str) -> dict[str, Any]:
         try:

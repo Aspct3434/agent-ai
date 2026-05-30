@@ -1010,86 +1010,127 @@ def test_completed_static_site_final_answer_includes_literal_url() -> None:
     assert "Port: 8765" in final_texts[-1]
 
 
-def test_url_followup_recovers_served_url_from_history() -> None:
-    messages = [
-        {"role": "user", "content": "create a website"},
-        {
-            "role": "tool",
-            "tool_call_id": "call_serve",
-            "content": json.dumps(
-                {
-                    "exposed": True,
-                    "connectable": True,
-                    "port": 8765,
-                    "url": "http://localhost:8000/proxy/8765/",
-                }
-            ),
-        },
-        {"role": "assistant", "content": "I served the website."},
-        {"role": "user", "content": "give me the url"},
-    ]
-
-    final = agent_module._ensure_evidence_in_final_response(
-        "The URL is: Importance of Sleep.",
-        contract={"mode": "answer", "evidence_requirements": ["none"]},
-        original_prompt="give me the url",
-        steps=[],
-        messages=messages,
-    )
-
-    assert "Service URL: http://localhost:8000/proxy/8765/" in final
+_ANSWER_CONTRACT = {"mode": "answer", "evidence_requirements": ["none"]}
 
 
-def test_final_answer_appends_general_evidence_literals() -> None:
-    steps = [
-        ExecutionStep(
-            kind="tool_result",
-            content=json.dumps(
-                {
-                    "written": True,
-                    "path": "/tmp/report.txt",
-                    "exists": True,
-                    "size_bytes": 2,
-                }
-            ),
-            metadata={
-                "tool_name": "write_text_file",
-                "is_error": False,
-                "arguments": {"path": "/tmp/report.txt"},
-            },
-        ),
-        ExecutionStep(
-            kind="tool_result",
-            content=json.dumps(
-                {
-                    "exit_code": 0,
-                    "stdout": "installed ok\n",
-                    "stderr": "",
-                    "current_working_directory": "/tmp",
-                }
-            ),
-            metadata={
-                "tool_name": "execute_terminal_command",
-                "is_error": False,
-                "arguments": {"command": "echo installed ok"},
-            },
-        ),
-    ]
-
-    final = agent_module._ensure_evidence_in_final_response(
+def test_final_answer_appends_current_turn_evidence() -> None:
+    final = agent_module._build_evidence_block(
         "Done.",
         contract={
             "mode": "execute",
             "evidence_requirements": ["filesystem_artifact", "command_output"],
         },
         original_prompt="create the file and show command output",
-        steps=steps,
-        messages=[],
+        current_items=[
+            ("File", "/tmp/report.txt"),
+            ("Command", "echo installed ok"),
+            ("Command output", "installed ok"),
+        ],
+        recent_items=[],
     )
 
     assert "File: /tmp/report.txt" in final
     assert "Command: echo installed ok" in final
     assert "Command output: installed ok" in final
+
+
+def test_url_followup_recovers_served_url_from_ledger() -> None:
+    # No current-turn artifacts; the served URL is recalled from earlier records.
+    final = agent_module._build_evidence_block(
+        "The URL is: Importance of Sleep.",
+        contract=_ANSWER_CONTRACT,
+        original_prompt="give me the url",
+        current_items=[],
+        recent_items=[
+            ("Service URL", "http://localhost:8000/proxy/8765/"),
+            ("Port", "8765"),
+        ],
+    )
+
+    assert "Service URL: http://localhost:8000/proxy/8765/" in final
+
+
+def test_fresh_task_does_not_inherit_prior_turn_artifacts() -> None:
+    # An earlier turn wrote next_prime.py; the current turn is an unrelated task
+    # that produced no evidence of its own. The stale file must not be glued on.
+    final = agent_module._build_evidence_block(
+        "Release notes generated.",
+        contract=_ANSWER_CONTRACT,
+        original_prompt="show me the release notes file",
+        current_items=[],
+        recent_items=[("File", "/tmp/next_prime.py")],
+    )
+
+    assert "next_prime.py" not in final
+    assert "Evidence:" not in final
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "send me the link",          # never in the old keyword list
+        "where did that page go",    # no recall keyword at all
+        "what was the address",
+    ],
+)
+def test_recall_generalises_beyond_keyword_list(prompt: str) -> None:
+    final = agent_module._build_evidence_block(
+        "Here it is.",
+        contract=_ANSWER_CONTRACT,
+        original_prompt=prompt,
+        current_items=[],
+        recent_items=[("Service URL", "http://localhost:8000/proxy/8765/")],
+    )
+    assert "http://localhost:8000/proxy/8765/" in final
+
+
+def test_recall_relevance_excludes_mismatched_artifact() -> None:
+    # "the file" names the File kind, but "config" doesn't match next_prime.py,
+    # so the unrelated artifact must not be surfaced.
+    final = agent_module._build_evidence_block(
+        "No config file was created.",
+        contract=_ANSWER_CONTRACT,
+        original_prompt="show me the config file",
+        current_items=[],
+        recent_items=[("File", "/tmp/next_prime.py")],
+    )
+    assert "next_prime.py" not in final
+
+
+def test_live_profile_injected_in_volatile_tail(tmp_path) -> None:
+    # A preference set mid-session must reach the model on the next turn, and it
+    # must sit in the volatile tail (last message) so it never busts the cached
+    # prefix.
+    from memory import UserProfileStore
+
+    store = UserProfileStore(profile_dir=tmp_path)
+    tools = _FakeTools()
+    engine = AgentEngine(
+        memory=_EmptyMemory(),
+        tools=tools,
+        model="test-model",
+        profile_store=store,
+    )
+
+    messages = [
+        {"role": "system", "content": "directive"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+
+    # No profile yet -> no injection.
+    before = engine._compact_context_window(messages)
+    assert not any("User context:" in str(m.get("content", "")) for m in before)
+
+    # User sets a preference mid-session.
+    store.update({"communication_style": "short, compact answers"})
+
+    after = engine._compact_context_window(messages)
+    profile_msgs = [m for m in after if "User context:" in str(m.get("content", ""))]
+    assert profile_msgs, "live profile should be injected once present"
+    assert "short, compact answers" in profile_msgs[0]["content"]
+    # Volatile tail, not the cacheable prefix.
+    assert after.index(profile_msgs[0]) >= len(after) - 2
 
 
 def test_contract_recovery_forces_command_tool_for_command_output_evidence() -> None:
