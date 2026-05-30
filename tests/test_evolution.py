@@ -160,6 +160,57 @@ def test_failed_trace_stages_policy_candidates(tmp_path: Path) -> None:
     assert {candidate["kind"] for candidate in staged} == {"prompt_policy", "toolset_policy"}
 
 
+def test_sql_injection_input_is_stored_as_data_not_executed(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    injection = "Robert'); DROP TABLE evolution_candidates;--"
+
+    trajectory = ExecutionTrajectory(
+        prompt=injection,
+        steps=[
+            ExecutionStep(
+                kind="tool_result",
+                content="ok",
+                metadata={"tool_name": "noop", "is_error": False},
+            )
+        ],
+        final_output=injection,
+        metadata={"session_id": injection},
+    )
+    trace_id = engine.record_trajectory(trajectory)
+
+    candidate = engine.stage_skill_candidate(
+        name="greet",
+        code=_GOOD,
+        source_trace_ids=[trace_id],
+    )
+
+    # The candidate row survived (table was not dropped) and the payload
+    # round-trips the injection string verbatim as data.
+    stored = engine.inspect_candidate(candidate["candidate_id"])
+    assert stored is not None
+
+    # Tables still exist and the injection string is retrievable verbatim.
+    conn = engine.ledger._connect()
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        assert {"evolution_runs", "evolution_candidates", "evolution_rollbacks"} <= tables
+
+        run = conn.execute(
+            "SELECT prompt, final_output, session_id FROM evolution_runs WHERE trace_id = ?",
+            (trace_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert run["prompt"] == injection
+    assert run["final_output"] == injection
+    assert run["session_id"] == injection
+
+
 @pytest.mark.asyncio
 async def test_gateway_evolution_endpoints_use_engine(tmp_path: Path) -> None:
     from gateway import (
