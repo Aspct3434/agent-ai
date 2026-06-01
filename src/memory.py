@@ -8,10 +8,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import chromadb
-from neo4j import GraphDatabase
-from sentence_transformers import SentenceTransformer
-
 
 def _safe_identifier(value: str) -> str:
     """Strip characters that are illegal in Cypher labels / relationship types."""
@@ -56,6 +52,13 @@ class HybridMemory:
         neo4j_password: str,
         chroma_path: str = "./chroma_db",
     ) -> None:
+        # Imported lazily so the lightweight install (no ML extra) can still
+        # import this module for UserProfileStore. These backends are only
+        # needed when AGENT_USE_HYBRID_MEMORY is enabled.
+        import chromadb
+        from neo4j import GraphDatabase
+        from sentence_transformers import SentenceTransformer
+
         self._encoder = SentenceTransformer(self._EMBED_MODEL)
 
         self._chroma = chromadb.PersistentClient(path=chroma_path)

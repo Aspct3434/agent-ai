@@ -1,0 +1,31 @@
+# Heavy ML / local-embedding stack for AGENT_USE_HYBRID_MEMORY (ChromaDB +
+# Neo4j + sentence-transformers). Installed on top of requirements.txt only
+# when the "hybrid" memory mode is selected. Skipping it keeps the default
+# install small and fast; gateway.py falls back to empty memory if absent.
+#
+# Pull torch from the CPU wheel index (~200 MB) instead of the default CUDA
+# build (~2.5 GB). torch==2.12.0 resolves to 2.12.0+cpu here; harmless on
+# macOS/Windows where the default wheel is already CPU-only. With uv, pass
+# --index-strategy unsafe-best-match so this index is considered for torch.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+chromadb==1.5.9
+flatbuffers==25.12.19
+hf-xet==1.5.0
+huggingface_hub==1.15.0
+joblib==1.5.3
+mmh3==5.2.1
+mpmath==1.3.0
+neo4j==6.2.0
+networkx==3.6.1
+onnxruntime==1.26.0
+PyPika==0.51.1
+safetensors==0.7.0
+scikit-learn==1.8.0
+scipy==1.17.1
+sentence-transformers==5.5.0
+sympy==1.14.0
+threadpoolctl==3.6.0
+torch==2.12.0
+transformers==5.8.1
+</content>

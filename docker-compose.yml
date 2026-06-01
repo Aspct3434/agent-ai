@@ -2,6 +2,8 @@ services:
   agent_core:
     build:
       context: .
+      args:
+        INSTALL_ML: ${INSTALL_ML:-false}
     env_file:
       - ${AGENT_ENV_FILE:-an-api.env}
     ports:
@@ -28,7 +30,7 @@ services:
       AGENT_RATE_LIMIT_RETRIES: ${AGENT_RATE_LIMIT_RETRIES:-2}
       AGENT_RATE_LIMIT_BASE_DELAY: ${AGENT_RATE_LIMIT_BASE_DELAY:-15}
       AGENT_BOOTSTRAP_SESSION: ${AGENT_BOOTSTRAP_SESSION:-false}
-      AGENT_USE_HYBRID_MEMORY: ${AGENT_USE_HYBRID_MEMORY:-true}
+      AGENT_USE_HYBRID_MEMORY: ${AGENT_USE_HYBRID_MEMORY:-false}
     volumes:
       - agent_data:/app/data
       - agent_skills:/app/skills

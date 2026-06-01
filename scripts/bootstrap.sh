@@ -8,6 +8,7 @@ INSTALL_DIR="${AGENT_BOOTSTRAP_INSTALL_DIR:-$HOME/distill}"
 PROVIDER="${AGENT_INSTALL_PROVIDER:-}"
 SANDBOX="${AGENT_INSTALL_SANDBOX:-}"
 MESSAGING="${AGENT_INSTALL_MESSAGING:-}"
+MEMORY="${AGENT_INSTALL_MEMORY:-}"
 DRY_RUN=0
 NO_START=0
 NO_UPDATE=0
@@ -23,6 +24,7 @@ Options:
   --provider NAME
   --sandbox on|off
   --messaging none|telegram|discord|both
+  --memory lite|hybrid
   --dry-run
   --no-start
   --no-update
@@ -37,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --provider) PROVIDER="${2:-}"; shift 2 ;;
     --sandbox) SANDBOX="${2:-}"; shift 2 ;;
     --messaging) MESSAGING="${2:-}"; shift 2 ;;
+    --memory) MEMORY="${2:-}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --no-start) NO_START=1; shift ;;
     --no-update) NO_UPDATE=1; shift ;;
@@ -107,7 +110,7 @@ ensure_repo() {
   else
     run_cmd "Create install parent directory" mkdir -p "$(dirname "$INSTALL_DIR")"
   fi
-  run_cmd "Clone Agent AI repository" git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+  run_cmd "Clone Agent AI repository" git clone --depth 1 --single-branch --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
 }
 
 run_installer() {
@@ -116,6 +119,7 @@ run_installer() {
   [[ -n "$PROVIDER" ]] && args+=(--provider "$PROVIDER")
   [[ -n "$SANDBOX" ]] && args+=(--sandbox "$SANDBOX")
   [[ -n "$MESSAGING" ]] && args+=(--messaging "$MESSAGING")
+  [[ -n "$MEMORY" ]] && args+=(--memory "$MEMORY")
   [[ "$DRY_RUN" -eq 1 ]] && args+=(--dry-run)
   [[ "$NO_START" -eq 1 ]] && args+=(--no-start)
   run_cmd "Run Agent AI installer" bash "$installer" "${args[@]}"

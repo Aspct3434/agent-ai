@@ -62,13 +62,14 @@ function assertIncludes(text, expected) {
   assert.strictEqual(result.status, 0, result.stderr);
   assertIncludes(result.stdout, "DISTILL");
   assertIncludes(result.stdout, "Security Notice");
-  assertIncludes(result.stdout, "[dry-run] git clone --branch master https://github.com/Aspct3434/agent-ai.git");
+  assertIncludes(result.stdout, "[dry-run] git clone --depth 1 --single-branch --branch master https://github.com/Aspct3434/agent-ai.git");
   assertIncludes(result.stdout, 'AGENT_MODEL="gpt-4o"');
   assertIncludes(result.stdout, 'AGENT_MAX_TOKENS="2048"');
   assertIncludes(result.stdout, 'AGENT_PLANNING_MAX_TOKENS="1024"');
   assertIncludes(result.stdout, 'AGENT_ARTIFACT_MAX_TOKENS="20000"');
   assertIncludes(result.stdout, 'AGENT_FINAL_MAX_TOKENS="1536"');
   assertIncludes(result.stdout, 'AGENT_SANDBOX_HOST_FALLBACK="false"');
+  assertIncludes(result.stdout, 'AGENT_USE_HYBRID_MEMORY="false"');
   assertIncludes(result.stdout, "Start later with: npx @aspct3434/distill-agent start");
   assertIncludes(result.stdout, "Installation Summary");
   assertIncludes(result.stdout, "missing");
@@ -130,9 +131,32 @@ function assertIncludes(text, expected) {
 }
 
 {
+  const installDir = tempInstallDir("hybrid-memory");
+  const result = run([
+    "install",
+    "--dry-run",
+    "--yes",
+    "--no-start",
+    "--install-dir",
+    installDir,
+    "--provider",
+    "openai",
+    "--sandbox",
+    "on",
+    "--messaging",
+    "none",
+    "--memory",
+    "hybrid"
+  ]);
+  assert.strictEqual(result.status, 0, result.stderr);
+  assertIncludes(result.stdout, 'AGENT_USE_HYBRID_MEMORY="true"');
+}
+
+{
   const result = run(["help"]);
   assert.strictEqual(result.status, 0, result.stderr);
   assertIncludes(result.stdout, "distill install");
+  assertIncludes(result.stdout, "--memory lite|hybrid");
   assertIncludes(result.stdout, "distill                         Launch the interactive Terminal UI");
   assertIncludes(result.stdout, "npx @aspct3434/distill-agent install");
   assertIncludes(result.stdout, "npx @aspct3434/distill-agent doctor");

@@ -2,6 +2,7 @@ param(
     [string]$Provider = $env:AGENT_INSTALL_PROVIDER,
     [string]$Sandbox = $env:AGENT_INSTALL_SANDBOX,
     [string]$Messaging = $env:AGENT_INSTALL_MESSAGING,
+    [string]$Memory = $env:AGENT_INSTALL_MEMORY,
     [string]$EnvFile = $env:AGENT_INSTALL_ENV_FILE,
     [switch]$DryRun,
     [switch]$NoStart
@@ -106,6 +107,24 @@ function Choose-Messaging {
     }
 }
 
+function Choose-Memory {
+    $value = Normalize $Memory
+    if (@("lite", "hybrid") -contains $value) { return $value }
+    if ($DryRun) { return "lite" }
+    Write-Host "Enable local hybrid memory (ChromaDB + Neo4j + embeddings)?"
+    Write-Host "  1) Lite    - fast install, no ML deps (recommended)"
+    Write-Host "  2) Hybrid  - installs torch/transformers/chromadb (~hundreds of MB)"
+    $answer = Read-Host "Memory [1]"
+    if ([string]::IsNullOrWhiteSpace($answer)) { $answer = "1" }
+    switch ($answer.ToLowerInvariant()) {
+        "1" { return "lite" }
+        "lite" { return "lite" }
+        "2" { return "hybrid" }
+        "hybrid" { return "hybrid" }
+        default { throw "Invalid memory choice: $answer" }
+    }
+}
+
 function Choose-Model([string]$Title, [string[]]$Models) {
     # $Models[0] is the default. In DryRun (non-interactive) keep the default so
     # automated provider checks stay stable.
@@ -150,6 +169,7 @@ function Env-Line([string]$Key, [string]$Value = "") {
 $ProviderChoice = Choose-Provider
 $SandboxChoice = Choose-Sandbox
 $MessagingChoice = Choose-Messaging
+$MemoryChoice = Choose-Memory
 
 $AgentModel = ""
 $FastModel = ""
@@ -230,6 +250,8 @@ if (@("discord", "both") -contains $MessagingChoice) {
 $AgentSandbox = ""
 $SandboxFallback = "false"
 if ($SandboxChoice -eq "off") { $SandboxFallback = "true" }
+$UseHybrid = "false"
+if ($MemoryChoice -eq "hybrid") { $UseHybrid = "true" }
 
 function Generated-Env {
     @(
@@ -248,7 +270,7 @@ function Generated-Env {
         (Env-Line "AGENT_SANDBOX" $AgentSandbox),
         (Env-Line "AGENT_SANDBOX_HOST_FALLBACK" $SandboxFallback),
         (Env-Line "PUBLIC_BASE_URL" "http://localhost:8000"),
-        (Env-Line "AGENT_USE_HYBRID_MEMORY" "true"),
+        (Env-Line "AGENT_USE_HYBRID_MEMORY" $UseHybrid),
         (Env-Line "MOONSHOT_API_KEY" $MoonshotKey),
         (Env-Line "MOONSHOT_API_BASE" $MoonshotBase),
         (Env-Line "OPENROUTER_API_KEY" $OpenRouterKey),
@@ -293,6 +315,8 @@ Write-Host "Wrote $EnvFile"
 if (-not $NoStart) {
     if ($SandboxChoice -eq "on") {
         Push-Location $RootDir
+        $env:INSTALL_ML = $UseHybrid
+        $env:AGENT_USE_HYBRID_MEMORY = $UseHybrid
         try { docker compose up -d --build } finally { Pop-Location }
     }
     else {
@@ -302,10 +326,15 @@ if (-not $NoStart) {
         try {
             py -3 -m venv .run-venv
             $venvPython = Join-Path $RootDir ".run-venv\Scripts\python.exe"
+            # The heavy ML stack (requirements-ml.txt) is only installed for hybrid
+            # memory mode. --index-strategy unsafe-best-match lets uv pick torch's
+            # CPU wheel from the extra index declared in requirements-ml.txt.
+            $ReqArgs = @("-r", "requirements.txt")
+            if ($MemoryChoice -eq "hybrid") { $ReqArgs += @("-r", "requirements-ml.txt") }
             if (Get-Command uv -ErrorAction SilentlyContinue) {
                 # uv resolves and downloads in parallel with a global cache; far
-                # faster than pip for the heavy ML wheels (torch, transformers, etc.).
-                & uv pip install -r requirements.txt --python $venvPython
+                # faster than pip.
+                & uv pip install --index-strategy unsafe-best-match @ReqArgs --python $venvPython
             }
             else {
                 # No system uv: bootstrap it into the venv (tiny wheel) so a fresh
@@ -314,16 +343,16 @@ if (-not $NoStart) {
                 & $venvPython -m pip install --upgrade pip
                 & $venvPython -m pip install uv
                 if ($LASTEXITCODE -eq 0) {
-                    & $venvPython -m uv pip install -r requirements.txt --python $venvPython
+                    & $venvPython -m uv pip install --index-strategy unsafe-best-match @ReqArgs --python $venvPython
                 }
                 else {
-                    & $venvPython -m pip install -r requirements.txt
+                    & $venvPython -m pip install @ReqArgs
                 }
             }
             Start-Process -FilePath $venvPython -ArgumentList @("-m", "uvicorn", "gateway:app", "--app-dir", "src", "--host", "127.0.0.1", "--port", "8000") -WorkingDirectory $RootDir -RedirectStandardOutput (Join-Path $logs "backend-local.stdout.log") -RedirectStandardError (Join-Path $logs "backend-local.stderr.log") -WindowStyle Hidden
             Push-Location (Join-Path $RootDir "control-panel")
             try {
-                npm ci
+                npm ci --no-audit --no-fund
                 Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "npm run dev -- --host 127.0.0.1 --port 5173") -WorkingDirectory (Join-Path $RootDir "control-panel") -RedirectStandardOutput (Join-Path $logs "control-panel-dev.stdout.log") -RedirectStandardError (Join-Path $logs "control-panel-dev.stderr.log") -WindowStyle Hidden
             }
             finally { Pop-Location }

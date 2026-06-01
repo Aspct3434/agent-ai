@@ -5,6 +5,7 @@ param(
     [string]$Provider = $env:AGENT_INSTALL_PROVIDER,
     [string]$Sandbox = $env:AGENT_INSTALL_SANDBOX,
     [string]$Messaging = $env:AGENT_INSTALL_MESSAGING,
+    [string]$Memory = $env:AGENT_INSTALL_MEMORY,
     [switch]$DryRun,
     [switch]$NoStart,
     [switch]$NoUpdate
@@ -83,7 +84,7 @@ function Ensure-Repo {
         if ($DryRun) { Write-Host "[dry-run] New-Item -ItemType Directory -Force -Path $parent" }
         else { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
     }
-    Run-Cmd "Clone Distill repository" "git" @("clone", "--branch", $Branch, $RepoUrl, $InstallDir)
+    Run-Cmd "Clone Distill repository" "git" @("clone", "--depth", "1", "--single-branch", "--branch", $Branch, $RepoUrl, $InstallDir)
 }
 
 function Run-Installer {
@@ -93,6 +94,7 @@ function Run-Installer {
     if ($Provider) { $args.Add("-Provider"); $args.Add($Provider) }
     if ($Sandbox) { $args.Add("-Sandbox"); $args.Add($Sandbox) }
     if ($Messaging) { $args.Add("-Messaging"); $args.Add($Messaging) }
+    if ($Memory) { $args.Add("-Memory"); $args.Add($Memory) }
     if ($DryRun) { $args.Add("-DryRun") }
     if ($NoStart) { $args.Add("-NoStart") }
     Run-Cmd "Run Distill installer" "powershell" $args.ToArray()

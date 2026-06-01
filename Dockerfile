@@ -10,10 +10,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# Heavy ML stack (torch/transformers/chromadb) is installed only when
+# INSTALL_ML=true (hybrid memory mode). requirements-ml.txt pins torch to the
+# CPU wheel index, so the default build stays small.
+ARG INSTALL_ML=false
+
+COPY requirements.txt requirements-ml.txt ./
 RUN grep -iv "^pywin32" requirements.txt > requirements_linux.txt \
     && pip install --no-cache-dir --prefix=/install -r requirements_linux.txt \
-    && pip install --no-cache-dir --prefix=/install mcp-server-sqlite
+    && pip install --no-cache-dir --prefix=/install mcp-server-sqlite \
+    && if [ "$INSTALL_ML" = "true" ]; then \
+         pip install --no-cache-dir --prefix=/install -r requirements-ml.txt; \
+       fi
 
 FROM python:3.12-slim AS runtime
 
